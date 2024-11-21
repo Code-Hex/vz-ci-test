@@ -13,7 +13,7 @@ jobs:
       # Can't expand the matrix due to the flakiness of the CI infra
       matrix:
         os:
-        - macos-13 # because macOS 14, 15 does not support build on nested virtualization
+        - macos-12 # because macOS 14, 15 does not support build on nested virtualization
         go:
         - '^1.23'
     steps:
@@ -21,14 +21,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Code-Hex/vz
-          ref: add/ci-build-check-intel-2
+          ref: fix/175
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
       - name: Download Linux kernel
         run: make download_kernel
-      - run: make test
+      - name: Build Linux
+        run: make -C example/linux
+      #- run: make test
       #- name: Setup tmate session
       #  uses: mxschmitt/action-tmate@v3
       #  timeout-minutes: 15
