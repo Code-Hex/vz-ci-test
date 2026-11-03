@@ -1,0 +1,407 @@
+diff --git a/diagnostic_idle.go b/diagnostic_idle.go
+new file mode 100644
+--- /dev/null
++++ b/diagnostic_idle.go
+@@ -0,0 +1,61 @@
++package vz
++
++import (
++	"fmt"
++	"strings"
++)
++
++func diagnosticIdleCommandLine(mode, original string) (string, error) {
++	switch mode {
++	case "baseline", "poll", "halt":
++	default:
++		return "", fmt.Errorf("invalid diagnostic idle mode %q", mode)
++	}
++	for _, token := range strings.Fields(original) {
++		if strings.HasPrefix(token, "idle=") || token == "nohlt" || token == "hlt" || token == "--" {
++			return "", fmt.Errorf("ambiguous diagnostic command line token %q", token)
++		}
++	}
++	if mode == "baseline" {
++		return original, nil
++	}
++	if original == "" {
++		return "idle=" + mode, nil
++	}
++	return original + " idle=" + mode, nil
++}
++
++func diagnosticValidateIdleGuest(mode, line string, port int) error {
++	expected, err := diagnosticIdleCommandLine(mode, "")
++	if err != nil {
++		return err
++	}
++	console, socket, idle := 0, 0, 0
++	for _, token := range strings.Fields(line) {
++		switch {
++		case strings.HasPrefix(token, "console="):
++			if token != "console=hvc0" {
++				return fmt.Errorf("unexpected guest console %q", token)
++			}
++			console++
++		case strings.HasPrefix(token, "vsock_port="):
++			if token != fmt.Sprintf("vsock_port=%d", port) {
++				return fmt.Errorf("unexpected guest port %q", token)
++			}
++			socket++
++		case strings.HasPrefix(token, "idle=") || token == "nohlt" || token == "hlt":
++			if expected == "" || token != expected {
++				return fmt.Errorf("unexpected guest idle token %q for mode %s", token, mode)
++			}
++			idle++
++		}
++	}
++	wantIdle := 0
++	if mode != "baseline" {
++		wantIdle = 1
++	}
++	if console != 1 || socket != 1 || idle != wantIdle {
++		return fmt.Errorf("guest command line counts console=%d port=%d idle=%d, want 1, 1, %d", console, socket, idle, wantIdle)
++	}
++	return nil
++}
+diff --git a/diagnostic_idle_test.go b/diagnostic_idle_test.go
+new file mode 100644
+--- /dev/null
++++ b/diagnostic_idle_test.go
+@@ -0,0 +1,63 @@
++package vz
++
++import "testing"
++
++func TestDiagnosticIdleCommandLine(t *testing.T) {
++	for _, tc := range []struct {
++		name, mode, original, want string
++	}{
++		{"baseline preserves bytes", "baseline", " console=hvc0  vsock_port=2222 ", " console=hvc0  vsock_port=2222 "},
++		{"baseline empty", "baseline", "", ""},
++		{"poll", "poll", "console=hvc0 vsock_port=2222", "console=hvc0 vsock_port=2222 idle=poll"},
++		{"halt", "halt", "console=hvc0 vsock_port=2222", "console=hvc0 vsock_port=2222 idle=halt"},
++		{"poll empty", "poll", "", "idle=poll"},
++		{"unrelated parameter", "poll", "custom_idle=poll", "custom_idle=poll idle=poll"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := diagnosticIdleCommandLine(tc.mode, tc.original)
++			if err != nil || got != tc.want {
++				t.Fatalf("command line = %q, %v, want %q", got, err, tc.want)
++			}
++		})
++	}
++}
++
++func TestDiagnosticIdleRejectsAmbiguousInput(t *testing.T) {
++	for _, mode := range []string{"", "other", "poll ", " poll", "poll\nhalt", "$(true)"} {
++		if _, err := diagnosticIdleCommandLine(mode, "console=hvc0"); err == nil {
++			t.Errorf("accepted mode %q", mode)
++		}
++	}
++	for _, line := range []string{"idle=poll", "console=hvc0 idle=halt", "nohlt", "hlt", "console=hvc0 -- idle=poll"} {
++		if _, err := diagnosticIdleCommandLine("poll", line); err == nil {
++			t.Errorf("accepted existing idle control %q", line)
++		}
++	}
++}
++
++func TestDiagnosticIdleGuestCommandLine(t *testing.T) {
++	for _, tc := range []struct {
++		mode, line string
++		valid      bool
++	}{
++		{"baseline", "console=hvc0 vsock_port=2222", true},
++		{"poll", "console=hvc0 vsock_port=2222 idle=poll", true},
++		{"halt", "console=hvc0 vsock_port=2222 idle=halt", true},
++		{"poll", "console=hvc0 vsock_port=2222", false},
++		{"poll", "console=hvc0 vsock_port=2222 idle=pollution", false},
++		{"poll", "console=hvc0 vsock_port=2222 idle=poll idle=poll", false},
++		{"poll", "console=hvc0 vsock_port=2223 idle=poll", false},
++		{"poll", "console=ttyS0 vsock_port=2222 idle=poll", false},
++		{"baseline", "console=hvc0 vsock_port=2222 idle=poll", false},
++		{"halt", "", false},
++	} {
++		err := diagnosticValidateIdleGuest(tc.mode, tc.line, 2222)
++		if (err == nil) != tc.valid {
++			t.Errorf("mode %q guest %q error = %v, valid = %t", tc.mode, tc.line, err, tc.valid)
++		}
++	}
++}
++
++func DiagnosticValidateIdleGuest(mode, line string, port int) error {
++	return diagnosticValidateIdleGuest(mode, line, port)
++}
+diff --git a/diagnostic_idle_darwin.go b/diagnostic_idle_darwin.go
+new file mode 100644
+--- /dev/null
++++ b/diagnostic_idle_darwin.go
+@@ -0,0 +1,116 @@
++package vz
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"time"
++
++	"github.com/Code-Hex/vz/v4/internal/objc"
++	"github.com/Code-Hex/vz/v4/internal/objcutil"
++	"github.com/Code-Hex/vz/v4/internal/vzbridge"
++)
++
++var diagnosticIdleStarted = time.Now()
++
++func diagnosticIdleEvent(phase string, machine objc.NSObject, fields map[string]any) {
++	mode := os.Getenv("VZ_DIAGNOSTIC_IDLE")
++	if mode == "" {
++		return
++	}
++	fields["phase"] = phase
++	fields["idleMode"] = mode
++	fields["vm"] = fmt.Sprintf("%p", objc.Ptr(machine))
++	fields["monotonicDuration"] = time.Since(diagnosticIdleStarted).Seconds()
++	data, err := json.Marshal(fields)
++	if err != nil {
++		panic(err)
++	}
++	fmt.Fprintln(os.Stderr, string(data))
++}
++
++func diagnosticIdleConfiguration(config *VirtualMachineConfiguration) (result *objc.Pointer, err error) {
++	mode := os.Getenv("VZ_DIAGNOSTIC_IDLE")
++	if mode == "" {
++		return nil, nil
++	}
++	if _, err := diagnosticIdleCommandLine(mode, ""); err != nil {
++		return nil, err
++	}
++	loader, kind := vzbridge.DiagnosticBootLoader(config)
++	if loader != nil {
++		defer objc.Release(loader)
++	}
++	if kind != "linux" {
++		diagnosticIdleEvent("idle.configuration.unmodified", nil, map[string]any{"bootType": kind, "config": fmt.Sprintf("%p", objc.Ptr(config))})
++		return nil, nil
++	}
++	value := vzbridge.VZLinuxBootLoader_CommandLine(loader)
++	original := objcutil.String(value)
++	if value != nil {
++		objc.Release(value)
++	}
++	commandLine, err := diagnosticIdleCommandLine(mode, original)
++	if err != nil {
++		return nil, err
++	}
++	copiedConfig := vzbridge.NSObject_Copy(config)
++	if copiedConfig == nil {
++		return nil, fmt.Errorf("diagnostic configuration copy returned nil")
++	}
++	defer func() {
++		if err != nil {
++			objc.Release(copiedConfig)
++		}
++	}()
++	copiedLoader := vzbridge.NSObject_Copy(loader)
++	if copiedLoader == nil {
++		return nil, fmt.Errorf("diagnostic boot loader copy returned nil")
++	}
++	defer objc.Release(copiedLoader)
++	if objc.Ptr(copiedConfig) == objc.Ptr(config) || objc.Ptr(copiedLoader) == objc.Ptr(loader) {
++		return nil, fmt.Errorf("diagnostic configuration and boot loader must have independent copies")
++	}
++	text := vzbridge.NSString_StringWithUTF8String(commandLine)
++	if text == nil {
++		return nil, fmt.Errorf("diagnostic command line string returned nil")
++	}
++	vzbridge.VZLinuxBootLoader_SetCommandLine(copiedLoader, text)
++	objc.Release(text)
++	vzbridge.VZVirtualMachineConfiguration_SetBootLoader(copiedConfig, copiedLoader)
++	readback := vzbridge.VZLinuxBootLoader_CommandLine(copiedLoader)
++	if readback == nil {
++		return nil, fmt.Errorf("diagnostic command line readback returned nil")
++	}
++	actual := objcutil.String(readback)
++	objc.Release(readback)
++	unchanged := vzbridge.VZLinuxBootLoader_CommandLine(loader)
++	actualOriginal := objcutil.String(unchanged)
++	if unchanged != nil {
++		objc.Release(unchanged)
++	}
++	if actual != commandLine || actualOriginal != original {
++		return nil, fmt.Errorf("diagnostic command line readback copy=%q want=%q original=%q want=%q", actual, commandLine, actualOriginal, original)
++	}
++	diagnosticIdleEvent("idle.configuration.readback", nil, map[string]any{
++		"bootType": "linux", "config": fmt.Sprintf("%p", objc.Ptr(config)),
++		"originalCommandLine": original, "nativeCommandLine": actual,
++		"guestReadback": false,
++	})
++	return copiedConfig, nil
++}
++
++func diagnosticIdleStart(phase string, vm *VirtualMachine, err error) {
++	if os.Getenv("VZ_DIAGNOSTIC_IDLE") == "" {
++		return
++	}
++	loader, kind := vzbridge.DiagnosticBootLoader(vm.config)
++	if loader != nil {
++		objc.Release(loader)
++	}
++	fields := map[string]any{"bootType": kind, "config": fmt.Sprintf("%p", objc.Ptr(vm.config))}
++	if err != nil {
++		fields["error"] = err.Error()
++	}
++	diagnosticIdleEvent(phase, vm, fields)
++}
+diff --git a/internal/vzbridge/diagnostic_idle.go b/internal/vzbridge/diagnostic_idle.go
+new file mode 100644
+--- /dev/null
++++ b/internal/vzbridge/diagnostic_idle.go
+@@ -0,0 +1,19 @@
++//go:build darwin
++
++package vzbridge
++
++import "github.com/Code-Hex/vz/v4/internal/objc"
++
++func DiagnosticBootLoader(config objc.NSObject) (*objc.Pointer, string) {
++	loader := VZVirtualMachineConfiguration_BootLoader(config)
++	if loader == nil {
++		return nil, "none"
++	}
++	if NSObject_IsKindOfClass(loader, directGetClass("VZLinuxBootLoader")) {
++		return loader, "linux"
++	}
++	if NSObject_IsKindOfClass(loader, directGetClass("VZEFIBootLoader")) {
++		return loader, "efi"
++	}
++	return loader, "other"
++}
+diff --git a/diagnostic_test.go b/diagnostic_test.go
+--- a/diagnostic_test.go
++++ b/diagnostic_test.go
+@@ -5,8 +5,12 @@
+ 	"fmt"
+ 	"os"
+ 	"strconv"
++	"strings"
+ 	"testing"
+ 	"time"
++
++	"github.com/Code-Hex/vz/v4"
++	"golang.org/x/crypto/ssh"
+ )
+ 
+ var diagnosticStarted = time.Now()
+@@ -47,3 +51,35 @@
+ 	}
+ 	return string(data)
+ }
++
++func diagnosticIdleGuestReadback(t *testing.T, client *ssh.Client, port int) error {
++	t.Helper()
++	mode := os.Getenv("VZ_DIAGNOSTIC_IDLE")
++	if mode == "" {
++		return nil
++	}
++	diagnosticPhase(t, "idle.guest.readback.begin port=%d mode=%s", port, mode)
++	session, err := client.NewSession()
++	if err != nil {
++		return fmt.Errorf("diagnostic guest session: %w", err)
++	}
++	defer session.Close()
++	output, err := session.Output("cat /proc/cmdline && uname -r")
++	if err != nil {
++		return fmt.Errorf("diagnostic guest command: %w", err)
++	}
++	lines := strings.Split(strings.TrimSuffix(string(output), "\n"), "\n")
++	if len(lines) != 2 || strings.TrimSpace(lines[1]) == "" {
++		return fmt.Errorf("diagnostic guest readback requires command line and kernel release, got %q", output)
++	}
++	data, err := json.Marshal(map[string]any{
++		"phase": "idle.guest.readback", "target": t.Name(), "idleMode": mode,
++		"port": port, "commandLine": lines[0], "kernelRelease": lines[1],
++		"monotonicDuration": time.Since(diagnosticStarted).Seconds(), "guestReadback": true,
++	})
++	if err != nil {
++		return err
++	}
++	fmt.Fprintln(os.Stderr, string(data))
++	return vz.DiagnosticValidateIdleGuest(mode, lines[0], port)
++}
+diff --git a/virtualization.go b/virtualization.go
+--- a/virtualization.go
++++ b/virtualization.go
+@@ -7,6 +7,7 @@
+ 	"sync"
+ 	"unsafe"
+ 
++	"github.com/Code-Hex/vz/v4/internal/objc"
+ 	"github.com/Code-Hex/vz/v4/internal/objcutil"
+ 	"github.com/Code-Hex/vz/v4/internal/sliceutil"
+ 	"github.com/Code-Hex/vz/v4/internal/vzbridge"
+@@ -125,6 +126,15 @@
+ func NewVirtualMachine(config *VirtualMachineConfiguration) (*VirtualMachine, error) {
+ 	if err := macOSAvailable(11); err != nil {
+ 		return nil, err
++	}
++	diagnosticConfig, err := diagnosticIdleConfiguration(config)
++	if err != nil {
++		return nil, err
++	}
++	var nativeConfig objc.NSObject = config
++	if diagnosticConfig != nil {
++		defer objc.Release(diagnosticConfig)
++		nativeConfig = diagnosticConfig
+ 	}
+ 	if !vzbridge.ClaimCustomVirtioProviders(config) {
+ 		return nil, fmt.Errorf("custom Virtio delegate provider must be used by only one device")
+@@ -176,7 +186,7 @@
+ 		})
+ 		return 0
+ 	})
+-	object := vzbridge.NewVZVirtualMachineWithDispatchQueue(config, stateHandle, disconnectedHandle)
++	object := vzbridge.NewVZVirtualMachineWithDispatchQueue(nativeConfig, stateHandle, disconnectedHandle)
+ 	if object == nil {
+ 		unregisterNativeCallback(stateHandle)
+ 		unregisterNativeCallback(disconnectedHandle)
+@@ -323,6 +333,7 @@
+ 
+ 	handle, errCh := nativeCompletion()
+ 
++	diagnosticIdleStart("idle.vm.start.begin", v, nil)
+ 	if o.macOSVirtualMachineStartOptionsPtr != nil {
+ 		vzbridge.StartWithOptionsCompletionHandler(
+ 			v,
+@@ -332,7 +343,9 @@
+ 	} else {
+ 		vzbridge.StartWithCompletionHandler(v, handle)
+ 	}
+-	return <-errCh
++	err := <-errCh
++	diagnosticIdleStart("idle.vm.start.end", v, err)
++	return err
+ }
+ 
+ // Pause a virtual machine that is in Running state.
+diff --git a/virtualization_test.go b/virtualization_test.go
+--- a/virtualization_test.go
++++ b/virtualization_test.go
+@@ -280,6 +280,17 @@
+ 			t.Fatalf("failed to create a new ssh client: %v", err)
+ 		}
+ 
++		if err := diagnosticIdleGuestReadback(t, sshClient, port); err != nil {
++			conn.Close()
++			sshClient.Close()
++			if vm.CanStop() {
++				if stopErr := vm.Stop(); stopErr != nil {
++					t.Errorf("diagnostic guest cleanup: %v", stopErr)
++				}
++			}
++			t.Fatal(err)
++		}
++
+ 		t.Cleanup(func() {
+ 			sshClient.Close()
+ 		})
