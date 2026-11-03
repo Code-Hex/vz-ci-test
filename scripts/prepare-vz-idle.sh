@@ -78,6 +78,7 @@ phase=selector-tests
 go test diagnostic_idle.go diagnostic_idle_test.go
 
 phase=compile
+rm -f "$binary"
 go test -c -o "$binary" .
 phase=startup
 go run ./cmd/codesign "$binary" '-test.run=^$' -test.timeout=2m -test.v
