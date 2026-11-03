@@ -1,0 +1,282 @@
+diff --git a/diagnostic_guest_halt_test.go b/diagnostic_guest_halt_test.go
+new file mode 100644
+--- /dev/null
++++ b/diagnostic_guest_halt_test.go
+@@ -0,0 +1,277 @@
++package vz_test
++
++import (
++	"bufio"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"runtime"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/Code-Hex/vz/v4"
++	"github.com/Code-Hex/vz/v4/internal/objc"
++	"golang.org/x/crypto/ssh"
++)
++
++// Invalid controller input must not let GC destroy the VM before observation ends.
++var diagnosticGuestRetained *Container
++
++func diagnosticGuestFact(api string, fields map[string]any) {
++	fields["api"] = api
++	fields["edge"] = "fact"
++	fields["pid"] = os.Getpid()
++	fields["action"] = os.Getenv("VZ_DIAGNOSTIC_GUEST_ACTION")
++	fields["monotonicDuration"] = time.Since(diagnosticStarted).Seconds()
++	data, err := json.Marshal(fields)
++	if err != nil {
++		panic(err)
++	}
++	fmt.Fprintln(os.Stderr, string(data))
++}
++
++func diagnosticGuestReadGate(reader io.Reader) error {
++	var token [1]byte
++	if _, err := io.ReadFull(reader, token[:]); err != nil {
++		return err
++	}
++	if token[0] != 'G' {
++		return fmt.Errorf("expected controller G, got %q", token[0])
++	}
++	return nil
++}
++
++func diagnosticGuestGate(api string) {
++	if err := diagnosticGuestReadGate(os.Stdin); err != nil {
++		diagnosticGuestFact(api, map[string]any{"error": err.Error(), "cleanupReleased": false})
++		select {}
++	}
++}
++
++type diagnosticGuestStderr struct{}
++
++type diagnosticGuestActionResult struct {
++	marker bool
++	err    error
++}
++
++func (diagnosticGuestStderr) Write(data []byte) (int, error) {
++	diagnosticGuestFact("guest_stderr", map[string]any{"output": string(data)})
++	return len(data), nil
++}
++
++func TestDiagnosticGuestHalt(t *testing.T) { diagnosticGuestAction(t, "halt") }
++
++func TestDiagnosticGuestNoop(t *testing.T) { diagnosticGuestAction(t, "noop") }
++
++func diagnosticGuestAction(t *testing.T, action string) {
++	t.Helper()
++	if runtime.GOARCH != "amd64" || os.Getenv("VZ_DIAGNOSTIC_IDLE") != "poll" || os.Getenv("VZ_DIAGNOSTIC_GUEST_ACTION") != action {
++		t.Fatal("requires Intel, VZ_DIAGNOSTIC_IDLE=poll, and matching explicit VZ_DIAGNOSTIC_GUEST_ACTION")
++	}
++	container := newVirtualizationMachine(t)
++	diagnosticGuestRetained = container
++	defer func() { runtime.KeepAlive(container) }()
++	if err := container.conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	readback, err := container.Client.NewSession()
++	if err != nil {
++		t.Fatal(err)
++	}
++	output, err := readback.Output("id -u && uname -r && cat /proc/sys/kernel/random/boot_id && cat /proc/cmdline && grep '^CapEff:' /proc/self/status && /bin/busybox --list")
++	readback.Close()
++	if err != nil {
++		t.Fatalf("guest preflight: %v", err)
++	}
++	lines := strings.Split(strings.TrimSuffix(string(output), "\n"), "\n")
++	if len(lines) < 6 || lines[0] != "0" || lines[1] == "" || len(lines[2]) != 36 {
++		t.Fatalf("invalid guest identity readback %q", output)
++	}
++	capability := strings.Fields(lines[4])
++	if len(capability) != 2 || capability[0] != "CapEff:" {
++		t.Fatalf("invalid guest capabilities %q", lines[4])
++	}
++	bits, err := strconv.ParseUint(capability[1], 16, 64)
++	if err != nil || bits&(1<<22) == 0 {
++		t.Fatalf("guest lacks CAP_SYS_BOOT: %q, %v", lines[4], err)
++	}
++	connection, ok := container.conn.(*vz.VirtioSocketConnection)
++	if !ok {
++		t.Fatal("guest connection is not a virtio socket connection")
++	}
++	if err := vz.DiagnosticValidateIdleGuest("poll", lines[3], int(connection.DestinationPort())); err != nil {
++		t.Fatal(err)
++	}
++	applets := "\n" + strings.Join(lines[5:], "\n") + "\n"
++	for _, applet := range []string{"halt", "true", "sh"} {
++		if !strings.Contains(applets, "\n"+applet+"\n") {
++			t.Fatalf("guest busybox lacks %s", applet)
++		}
++	}
++	session, err := container.Client.NewSession()
++	if err != nil {
++		t.Fatal(err)
++	}
++	input, err := session.StdinPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	stdout, err := session.StdoutPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	session.Stderr = diagnosticGuestStderr{}
++	armed, started := make(chan struct{}, 1), make(chan struct{}, 1)
++	go func() {
++		scanner := bufio.NewScanner(stdout)
++		for scanner.Scan() {
++			line := scanner.Text()
++			diagnosticGuestFact("guest_stdout", map[string]any{"output": line})
++			switch line {
++			case "VZ_GUEST_ARMED":
++				armed <- struct{}{}
++			case "VZ_GUEST_ACTION_BEGIN":
++				started <- struct{}{}
++			}
++		}
++		if err := scanner.Err(); err != nil {
++			diagnosticGuestFact("guest_stdout_return", map[string]any{"error": err.Error()})
++		}
++	}()
++	command := "/bin/busybox true"
++	if action == "halt" {
++		command = "/bin/busybox halt -f"
++	}
++	script := "printf 'VZ_GUEST_ARMED\\n'; read -r token; [ \"$token\" = G ] || exit 64; printf 'VZ_GUEST_ACTION_BEGIN\\n'; read -r token; [ \"$token\" = H ] || exit 64; exec " + command
++	if err := session.Start(script); err != nil {
++		t.Fatalf("guest action session start: %v", err)
++	}
++	done := make(chan error, 1)
++	go func() {
++		err := session.Wait()
++		fields := map[string]any{"returned": true}
++		if err == nil {
++			fields["exitStatus"] = 0
++		} else {
++			fields["error"] = err.Error()
++			var exit *ssh.ExitError
++			if errors.As(err, &exit) {
++				fields["exitStatus"] = exit.ExitStatus()
++			}
++		}
++		diagnosticGuestFact("guest_command_return", fields)
++		done <- err
++	}()
++	select {
++	case <-armed:
++	case <-time.After(5 * time.Second):
++		t.Fatal("guest action session did not arm")
++	}
++	if err := container.conn.SetDeadline(time.Time{}); err != nil {
++		t.Fatal(err)
++	}
++	diagnosticGuestFact("guest_ready", map[string]any{
++		"guestID": lines[2], "uid": lines[0], "kernelRelease": lines[1], "commandLine": lines[3],
++		"capEff": capability[1], "busyboxHalt": true, "busyboxTrue": true,
++		"sessionExecAccepted": true, "vm": fmt.Sprintf("%p", objc.Ptr(container.VirtualMachine)), "command": command,
++	})
++	diagnosticGuestGate("guest_ready_gate_error")
++	actionDone := make(chan diagnosticGuestActionResult, 1)
++	go func() {
++		result := diagnosticGuestActionResult{}
++		_, result.err = io.WriteString(input, "G\n")
++		if result.err == nil {
++			select {
++			case <-started:
++				result.marker = true
++				_, result.err = io.WriteString(input, "H\n")
++			case <-time.After(5 * time.Second):
++				result.err = fmt.Errorf("guest action marker not received")
++			}
++		}
++		fields := map[string]any{"guestActionMarkerObserved": result.marker, "actionInputWritten": result.err == nil}
++		if result.err != nil {
++			fields["error"] = result.err.Error()
++		}
++		diagnosticGuestFact("guest_action_input_return", fields)
++		actionDone <- result
++	}()
++	result := diagnosticGuestActionResult{}
++	select {
++	case result = <-actionDone:
++	case <-time.After(10 * time.Second):
++		result.err = fmt.Errorf("guest action input completion not observed")
++	}
++	observation := map[string]any{"guestActionMarkerObserved": result.marker, "actionInputWritten": result.err == nil, "cleanupReleased": false}
++	if result.err != nil {
++		observation["error"] = result.err.Error()
++	}
++	diagnosticGuestFact("guest_action_observe", observation)
++	diagnosticGuestGate("guest_post_action_gate_error")
++	runtime.KeepAlive(container)
++	commandReturned := false
++	var commandErr error
++	select {
++	case commandErr = <-done:
++		commandReturned = true
++	default:
++	}
++	if action == "noop" && !commandReturned {
++		select {
++		case commandErr = <-done:
++			commandReturned = true
++		case <-time.After(time.Second):
++		}
++	}
++	diagnosticGuestFact("guest_cleanup_begin", map[string]any{"cleanupReleased": true})
++	canStop := container.CanStop()
++	if canStop {
++		if err := container.Stop(); err != nil {
++			t.Errorf("post-observation VM.Stop: %v", err)
++		}
++	} else if action == "noop" {
++		t.Error("guest noop VM cannot be stopped after observation")
++	}
++	container.Client.Close()
++	diagnosticGuestFact("guest_cleanup_end", map[string]any{"stopAttempted": canStop})
++	diagnosticGuestRetained = nil
++	if result.err != nil {
++		t.Fatal(result.err)
++	}
++	if action == "noop" {
++		if !commandReturned {
++			t.Fatal("guest noop did not finish before cleanup")
++		}
++		if commandErr != nil {
++			t.Fatal(commandErr)
++		}
++	} else if commandReturned {
++		var exit *ssh.ExitError
++		if errors.As(commandErr, &exit) {
++			t.Fatalf("guest halt command failed before cleanup: %v", commandErr)
++		}
++	}
++}
++
++func TestDiagnosticGuestGateProtocol(t *testing.T) {
++	for _, tc := range []struct {
++		input string
++		valid bool
++	}{{"G", true}, {"", false}, {"X", false}, {"\n", false}} {
++		err := diagnosticGuestReadGate(strings.NewReader(tc.input))
++		if (err == nil) != tc.valid {
++			t.Errorf("gate input %q error = %v, valid = %t", tc.input, err, tc.valid)
++		}
++	}
++	reader := strings.NewReader("GG")
++	for range 2 {
++		if err := diagnosticGuestReadGate(reader); err != nil {
++			t.Fatal(err)
++		}
++	}
++}
