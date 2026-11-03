@@ -9,6 +9,7 @@
 #include <Hypervisor/hv_vmx.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <libproc.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <signal.h>
@@ -24,6 +25,7 @@
 enum { PAGE_BYTES = 4096, CODE = 0x100, SENTINEL = 0x800, TAG = 0xa5 };
 
 enum guest_kind { GUEST_HLT, GUEST_CPUID, GUEST_SPIN };
+enum observer_kind { OBSERVER_NONE, OBSERVER_SENTINEL, OBSERVER_THREADINFO };
 
 struct guest_case {
   uint8_t tail[2];
@@ -53,7 +55,8 @@ static const struct guest_case guests[] = {
 struct phase_case {
   const char *name;
   enum guest_kind guest;
-  bool armed, control, watch, forever;
+  enum observer_kind observer;
+  bool armed, control, forever;
 };
 
 struct observer {
@@ -61,6 +64,8 @@ struct observer {
   const char *phase;
   const uint8_t *memory;
   hv_vcpuid_t vcpu;
+  enum observer_kind kind;
+  uint64_t owner_tid;
 };
 
 struct probe {
@@ -79,6 +84,57 @@ struct probe {
 static uint64_t observer_now(const struct observer *o) {
   return (uint64_t)((__uint128_t)mach_absolute_time() * o->timebase.numer /
                     o->timebase.denom);
+}
+
+static int observe_thread_info(const struct observer *o, size_t sample) {
+  flockfile(stderr);
+  int written = fprintf(
+      stderr,
+      "{\"actor\":\"threadinfo-observer\",\"monotonic_ns\":%" PRIu64
+      ",\"pid\":%d,\"seq\":%zu,\"phase\":\"%s\","
+      "\"api\":\"proc_pidinfo\",\"edge\":\"before\",\"result\":null,"
+      "\"sourcehash\":\"%s\",\"owner_tid\":%" PRIu64 ",\"flavor\":%d}\n",
+      observer_now(o), getpid(), sample * 2 + 1, o->phase, PROBE_SOURCE_SHA,
+      o->owner_tid, PROC_PIDTHREADID64INFO);
+  int flushed = fflush(stderr);
+  funlockfile(stderr);
+  if (written < 0 || flushed != 0)
+    return 74;
+
+  // Flavor 15 selects the kernel thread ID; flavor 5 selects cthread_self.
+  // XNU proc_info.c and bsd_kern.c at ac9718fb1af618d5ce8678d0dc6e8a58f252216f.
+  // This call takes kernel locks and can block even without suspending threads.
+  struct proc_threadinfo info = {0};
+  errno = 0;
+  int bytes = proc_pidinfo(getpid(), PROC_PIDTHREADID64INFO, o->owner_tid,
+                           &info, sizeof(info));
+  int error = bytes <= 0 ? errno : 0;
+  bool valid = bytes == sizeof(info);
+  char values[160];
+  if (valid)
+    snprintf(values, sizeof(values),
+             "\"run_state\":%d,\"user_time_ns\":%" PRIu64
+             ",\"system_time_ns\":%" PRIu64,
+             info.pth_run_state, info.pth_user_time, info.pth_system_time);
+  else
+    strcpy(values, "\"run_state\":null,\"user_time_ns\":null,"
+                   "\"system_time_ns\":null");
+  flockfile(stderr);
+  written = fprintf(
+      stderr,
+      "{\"actor\":\"threadinfo-observer\",\"monotonic_ns\":%" PRIu64
+      ",\"pid\":%d,\"seq\":%zu,\"phase\":\"%s\","
+      "\"api\":\"proc_pidinfo\",\"edge\":\"return\",\"result\":%d,"
+      "\"sourcehash\":\"%s\",\"owner_tid\":%" PRIu64
+      ",\"flavor\":%d,\"expected_bytes\":%zu,\"error\":%d,\"valid\":%s,%s}\n",
+      observer_now(o), getpid(), sample * 2 + 2, o->phase, bytes,
+      PROBE_SOURCE_SHA, o->owner_tid, PROC_PIDTHREADID64INFO, sizeof(info),
+      error, valid ? "true" : "false", values);
+  flushed = fflush(stderr);
+  funlockfile(stderr);
+  if (written < 0 || flushed != 0)
+    return 74;
+  return valid ? 0 : 71;
 }
 
 static void *observe_sentinel(void *argument) {
@@ -123,6 +179,11 @@ static void *observe_sentinel(void *argument) {
       return (void *)(uintptr_t)74;
     if (error != 0)
       return (void *)(uintptr_t)71;
+    if (o->kind == OBSERVER_THREADINFO) {
+      int result = observe_thread_info(o, i);
+      if (result != 0)
+        return (void *)(uintptr_t)result;
+    }
   }
   return NULL;
 }
@@ -429,10 +490,21 @@ static int run_once(struct probe *p, const struct phase_case *spec) {
 }
 
 static int watched_run(struct probe *p, const struct phase_case *spec) {
+  uint64_t owner_tid = 0;
+  if (spec->observer == OBSERVER_THREADINFO) {
+    if (!before(p, "pthread_threadid_np", 0, 0, 0))
+      return 74;
+    int error = pthread_threadid_np(NULL, &owner_tid);
+    fact(p, "pthread_threadid_np", "return", error, owner_tid, 0, 0);
+    if (error != 0)
+      return 71;
+  }
   p->observer = (struct observer){.timebase = p->timebase,
                                   .phase = spec->name,
                                   .memory = p->memory,
-                                  .vcpu = p->vcpu};
+                                  .vcpu = p->vcpu,
+                                  .kind = spec->observer,
+                                  .owner_tid = owner_tid};
   pthread_t thread;
   if (!before(p, "pthread_create", 0, 0, 0))
     return 74;
@@ -501,7 +573,8 @@ static int execute(struct probe *p, int target, const struct phase_case *spec) {
     return 0;
   p->phase = spec->name;
   TRY(prepare_run(p, spec->armed));
-  return spec->watch ? watched_run(p, spec) : run_once(p, spec);
+  return spec->observer != OBSERVER_NONE ? watched_run(p, spec)
+                                         : run_once(p, spec);
 }
 
 static int cleanup(struct probe *p) {
@@ -558,8 +631,15 @@ int main(int argc, char **argv) {
       {.name = "armed-run", .armed = true},
       {.name = "armed-cpuid", .guest = GUEST_CPUID, .armed = true},
       {.name = "armed-spin", .guest = GUEST_SPIN, .armed = true},
-      {.name = "armed-hlt-watch", .armed = true, .watch = true},
+      {.name = "armed-hlt-watch", .armed = true, .observer = OBSERVER_SENTINEL},
       {.name = "armed-hlt-forever", .armed = true, .forever = true},
+      {.name = "armed-hlt-threadinfo",
+       .armed = true,
+       .observer = OBSERVER_THREADINFO},
+      {.name = "armed-cpuid-threadinfo",
+       .guest = GUEST_CPUID,
+       .armed = true,
+       .observer = OBSERVER_THREADINFO},
   };
   int target = -1;
   if (argc == 2)
@@ -570,7 +650,8 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "usage: %s "
             "capabilities|vm|vcpu|configure|run|armed-control|armed-run|"
-            "armed-cpuid|armed-spin|armed-hlt-watch|armed-hlt-forever\n",
+            "armed-cpuid|armed-spin|armed-hlt-watch|armed-hlt-forever|"
+            "armed-hlt-threadinfo|armed-cpuid-threadinfo\n",
             argv[0]);
     return 64;
   }
