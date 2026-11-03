@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <mach/mach_time.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -17,6 +18,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
+#include <time.h>
 #include <unistd.h>
 
 enum { PAGE_BYTES = 4096, CODE = 0x100, SENTINEL = 0x800, TAG = 0xa5 };
@@ -51,7 +53,14 @@ static const struct guest_case guests[] = {
 struct phase_case {
   const char *name;
   enum guest_kind guest;
-  bool armed, control;
+  bool armed, control, watch, forever;
+};
+
+struct observer {
+  mach_timebase_info_data_t timebase;
+  const char *phase;
+  const uint8_t *memory;
+  hv_vcpuid_t vcpu;
 };
 
 struct probe {
@@ -62,8 +71,61 @@ struct probe {
   uint64_t cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1;
   hv_vcpuid_t vcpu;
   uint8_t *memory;
+  struct observer observer;
   bool vm_created, mapped, cpu_created, cleaning, output_failed, guest_verified;
+  bool observer_active;
 };
+
+static uint64_t observer_now(const struct observer *o) {
+  return (uint64_t)((__uint128_t)mach_absolute_time() * o->timebase.numer /
+                    o->timebase.denom);
+}
+
+static void *observe_sentinel(void *argument) {
+  const struct observer *o = argument;
+  uint64_t started = observer_now(o), first_tag_ns = 0;
+  const uint64_t samples[] = {100000000, 500000000};
+  bool seen = false;
+  for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+    int error = 0;
+    uint64_t now;
+    uint8_t actual;
+    do {
+      now = observer_now(o);
+      actual = *(const volatile uint8_t *)(o->memory + SENTINEL);
+      if (actual == TAG && !seen) {
+        seen = true;
+        first_tag_ns = now - started;
+      }
+      if (now - started >= samples[i])
+        break;
+      struct timespec delay = {.tv_nsec = 5000000};
+      if (nanosleep(&delay, NULL) != 0 && errno != EINTR)
+        error = errno;
+    } while (error == 0);
+    // This helper owns only its immutable observer state and stderr records.
+    // It never accesses the main probe's sequence or stdout state.
+    flockfile(stderr);
+    int written =
+        fprintf(stderr,
+                "{\"actor\":\"hlt-observer\",\"monotonic_ns\":%" PRIu64
+                ",\"pid\":%d,\"seq\":%zu,\"phase\":\"%s\","
+                "\"api\":\"sentinel_sample\",\"edge\":\"fact\",\"result\":%d,"
+                "\"sourcehash\":\"%s\",\"vcpu\":%u,\"scheduled_ns\":%" PRIu64
+                ",\"elapsed_ns\":%" PRIu64 ",\"sentinel\":%u,\"tag_seen\":%s,"
+                "\"first_tag_ns\":%" PRIu64 "}\n",
+                now, getpid(), i + 1, o->phase, error, PROBE_SOURCE_SHA,
+                o->vcpu, samples[i], now - started, actual,
+                seen ? "true" : "false", first_tag_ns);
+    int flushed = fflush(stderr);
+    funlockfile(stderr);
+    if (written < 0 || flushed != 0)
+      return (void *)(uintptr_t)74;
+    if (error != 0)
+      return (void *)(uintptr_t)71;
+  }
+  return NULL;
+}
 
 static bool fact(struct probe *p, const char *api, const char *edge,
                  int64_t result, uint64_t arg0, uint64_t arg1, uint64_t arg2) {
@@ -317,23 +379,27 @@ static int prepare_run(struct probe *p, bool armed) {
   return result;
 }
 
-static int run_once(struct probe *p, bool control, bool armed) {
+static int run_once(struct probe *p, const struct phase_case *spec) {
   uint64_t ticks =
       (uint64_t)((__uint128_t)20000000 * p->timebase.denom / p->timebase.numer);
   // Apple hv_vcpu_run_until: absolute mach time, finite VMX preemption timer.
   // https://developer.apple.com/documentation/hypervisor/hv_vcpu_run_until(_:_:)
-  const char *boundary = control ? "control_deadline" : "hv_vcpu_run_until";
-  if (!before(p, boundary, p->vcpu, 0, 20000000))
+  uint64_t duration = spec->forever ? 0 : 20000000;
+  const char *boundary =
+      spec->control ? "control_deadline" : "hv_vcpu_run_until";
+  if (!before(p, boundary, p->vcpu, 0, duration))
     return 74;
-  uint64_t deadline = mach_absolute_time() + (ticks ? ticks : 1);
-  if (control) {
+  uint64_t deadline = spec->forever
+                          ? HV_DEADLINE_FOREVER
+                          : mach_absolute_time() + (ticks ? ticks : 1);
+  if (spec->control) {
     fact(p, "guest_not_executed_control", "fact", 0, p->vcpu, deadline,
          20000000);
     return p->output_failed ? 74 : 0;
   }
   hv_return_t result = hv_vcpu_run_until(p->vcpu, deadline);
-  returned(p, "hv_vcpu_run_until", result, p->vcpu, deadline, 20000000);
-  if (armed)
+  returned(p, "hv_vcpu_run_until", result, p->vcpu, deadline, duration);
+  if (spec->armed)
     TRY(gate(p, "run_return_ready"));
   TRY(status(p, result));
   uint64_t reason = 0, rip = 0, length = 0;
@@ -360,6 +426,33 @@ static int run_once(struct probe *p, bool control, bool armed) {
   fact(p, p->guest_verified ? p->guest->verified_fact : "guest_not_established",
        "fact", p->guest_verified ? 0 : 77, reason, rip, length);
   return p->guest_verified ? 0 : 77;
+}
+
+static int watched_run(struct probe *p, const struct phase_case *spec) {
+  p->observer = (struct observer){.timebase = p->timebase,
+                                  .phase = spec->name,
+                                  .memory = p->memory,
+                                  .vcpu = p->vcpu};
+  pthread_t thread;
+  if (!before(p, "pthread_create", 0, 0, 0))
+    return 74;
+  int created = pthread_create(&thread, NULL, observe_sentinel, &p->observer);
+  p->observer_active = created == 0;
+  fact(p, "pthread_create", "return", created, 0, 0, 0);
+  if (created != 0)
+    return 71;
+  int result = run_once(p, spec);
+  // After an actual API return, run_return_ready precedes this join.
+  // Early errors also join before memory or vCPU cleanup.
+  before(p, "pthread_join", 0, 0, 0);
+  void *thread_result = NULL;
+  int joined = pthread_join(thread, &thread_result);
+  fact(p, "pthread_join", "return", joined, 0, 0, 0);
+  if (joined != 0)
+    return 71;
+  p->observer_active = false;
+  fact(p, "observer_result", "fact", (int)(uintptr_t)thread_result, 0, 0, 0);
+  return result != 0 ? result : (int)(uintptr_t)thread_result;
 }
 
 static int execute(struct probe *p, int target, const struct phase_case *spec) {
@@ -408,12 +501,16 @@ static int execute(struct probe *p, int target, const struct phase_case *spec) {
     return 0;
   p->phase = spec->name;
   TRY(prepare_run(p, spec->armed));
-  return run_once(p, spec->control, spec->armed);
+  return spec->watch ? watched_run(p, spec) : run_once(p, spec);
 }
 
 static int cleanup(struct probe *p) {
   p->phase = "cleanup";
   p->cleaning = true;
+  if (p->observer_active) {
+    fact(p, "cleanup_blocked_observer_not_joined", "fact", 71, 0, 0, 0);
+    return 71;
+  }
   // Stop after a failed teardown API. Retain dependent mappings for process
   // exit.
   if (p->cpu_created) {
@@ -461,6 +558,8 @@ int main(int argc, char **argv) {
       {.name = "armed-run", .armed = true},
       {.name = "armed-cpuid", .guest = GUEST_CPUID, .armed = true},
       {.name = "armed-spin", .guest = GUEST_SPIN, .armed = true},
+      {.name = "armed-hlt-watch", .armed = true, .watch = true},
+      {.name = "armed-hlt-forever", .armed = true, .forever = true},
   };
   int target = -1;
   if (argc == 2)
@@ -471,7 +570,7 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "usage: %s "
             "capabilities|vm|vcpu|configure|run|armed-control|armed-run|"
-            "armed-cpuid|armed-spin\n",
+            "armed-cpuid|armed-spin|armed-hlt-watch|armed-hlt-forever\n",
             argv[0]);
     return 64;
   }
