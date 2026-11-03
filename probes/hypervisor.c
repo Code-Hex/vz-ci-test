@@ -22,7 +22,60 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { PAGE_BYTES = 4096, CODE = 0x100, SENTINEL = 0x800, TAG = 0xa5 };
+enum {
+  PAGE_BYTES = 4096,
+  CODE = 0x100,
+  GDT = 0x400,
+  TSS = 0x500,
+  SENTINEL = 0x800,
+  TAG = 0xa5
+};
+
+enum guest_mode { REAL16, PROTECTED32 };
+
+struct guest_segment {
+  uint64_t selector, base, limit, rights;
+};
+
+struct mode_profile {
+  uint8_t mov[7];
+  size_t mov_length;
+  uint64_t cr0_set;
+  struct guest_segment cs, data, tr, ldtr;
+  uint64_t gdtr_base, gdtr_limit;
+  uint8_t gdt[4][8], tss[104];
+};
+
+static const struct mode_profile profiles[] = {
+    [REAL16] = {.mov = {0xc6, 0x06, 0x00, 0x08, TAG},
+                .mov_length = 5,
+                .cs = {.limit = 0xffff, .rights = 0x9b},
+                .data = {.limit = 0xffff, .rights = 0x93},
+                .tr = {.limit = 0xffff, .rights = 0x8b},
+                .ldtr = {.limit = 0xffff, .rights = 0x10000},
+                .gdtr_limit = 0xffff},
+    [PROTECTED32] =
+        {
+            .mov = {0xc6, 0x05, 0x00, 0x08, 0x00, 0x00, TAG},
+            .mov_length = 7,
+            .cr0_set = 1,
+            .cs = {.selector = 0x08, .limit = UINT32_MAX, .rights = 0xc09b},
+            .data = {.selector = 0x10, .limit = UINT32_MAX, .rights = 0xc093},
+            .tr = {.selector = 0x18, .base = TSS, .limit = 103, .rights = 0x8b},
+            .ldtr = {.limit = 0xffff, .rights = 0x10000},
+            .gdtr_base = GDT,
+            .gdtr_limit = 31,
+            // Null, ring-0 code/data and busy 32-bit TSS descriptors match the
+            // cached segment state. SDM vol. 3A, 3.4.5 and 8.2; vol.
+            // 3C, 27.3.1.2.
+            .gdt = {{0},
+                    {0xff, 0xff, 0, 0, 0, 0x9b, 0xcf, 0},
+                    {0xff, 0xff, 0, 0, 0, 0x93, 0xcf, 0},
+                    {0x67, 0, 0, 5, 0, 0x8b, 0, 0}},
+            // ESP0=0xff0, SS0=0x10; the I/O bitmap starts beyond the TSS limit.
+            .tss = {[4] = 0xf0, [5] = 0x0f, [8] = 0x10, [102] = 104},
+        },
+};
 
 enum guest_kind { GUEST_HLT, GUEST_CPUID, GUEST_SPIN, GUEST_STI_HLT };
 enum observer_kind {
@@ -37,7 +90,7 @@ struct guest_case {
   uint64_t exit_reason;
   // Zero means the asynchronous exit's instruction length is not read or gated.
   uint64_t instruction_length;
-  uint64_t rip_offset;
+  uint64_t tail_offset;
   const char *verified_fact;
 };
 
@@ -47,28 +100,29 @@ static const struct guest_case guests[] = {
     [GUEST_HLT] = {.tail = {0xf4, 0x90},
                    .exit_reason = 12,
                    .instruction_length = 1,
-                   .rip_offset = 5,
+                   .tail_offset = 0,
                    .verified_fact = "sentinel_hlt_verified"},
     [GUEST_CPUID] = {.tail = {0x0f, 0xa2},
                      .exit_reason = 10,
                      .instruction_length = 2,
-                     .rip_offset = 5,
+                     .tail_offset = 0,
                      .verified_fact = "sentinel_cpuid_verified"},
     [GUEST_SPIN] = {.tail = {0xeb, 0xfe},
                     .exit_reason = 52,
                     .instruction_length = 0,
-                    .rip_offset = 5,
+                    .tail_offset = 0,
                     .verified_fact = "sentinel_spin_verified"},
     [GUEST_STI_HLT] = {.tail = {0xfb, 0xf4},
                        .exit_reason = 12,
                        .instruction_length = 1,
-                       .rip_offset = 6,
+                       .tail_offset = 1,
                        .verified_fact = "sentinel_sti_hlt_verified"},
 };
 
 struct phase_case {
   const char *name;
   enum guest_kind guest;
+  enum guest_mode mode;
   enum observer_kind observer;
   bool armed, control, forever;
 };
@@ -86,6 +140,7 @@ struct probe {
   mach_timebase_info_data_t timebase;
   const char *phase;
   const struct guest_case *guest;
+  const struct mode_profile *profile;
   uint64_t sequence;
   uint64_t cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1;
   hv_vcpuid_t vcpu;
@@ -374,7 +429,8 @@ static int configure(struct probe *p) {
   TRY(control(p, VMCS_CTRL_VMENTRY_CONTROLS, 0,
               (1ULL << 9) | (1ULL << 10) | (1ULL << 11), &entry));
   // SDM 26.3.1: unrestricted guest relaxes CR0.PE/PG fixed-one requirements.
-  uint64_t cr0 = (p->cr0_fixed0 | (1ULL << 4)) & ~((1ULL << 31) | 1ULL);
+  uint64_t cr0 = ((p->cr0_fixed0 | (1ULL << 4)) & ~((1ULL << 31) | 1ULL)) |
+                 p->profile->cr0_set;
   uint64_t cr4 = p->cr4_fixed0;
   if ((cr0 & ~p->cr0_fixed1) || (cr4 & ~p->cr4_fixed1) ||
       (cr0 & ((1ULL << 29) | (1ULL << 30))) || (cr4 & (1ULL << 17))) {
@@ -386,38 +442,39 @@ static int configure(struct probe *p) {
   TRY(write_field(p, VMCS_GUEST_CR4, cr4));
   const struct {
     uint32_t selector, base, limit, access;
-    uint64_t rights;
+    const struct guest_segment *state;
   } segments[] = {
       {VMCS_GUEST_CS, VMCS_GUEST_CS_BASE, VMCS_GUEST_CS_LIMIT, VMCS_GUEST_CS_AR,
-       0x9b},
+       &p->profile->cs},
       {VMCS_GUEST_DS, VMCS_GUEST_DS_BASE, VMCS_GUEST_DS_LIMIT, VMCS_GUEST_DS_AR,
-       0x93},
+       &p->profile->data},
       {VMCS_GUEST_ES, VMCS_GUEST_ES_BASE, VMCS_GUEST_ES_LIMIT, VMCS_GUEST_ES_AR,
-       0x93},
+       &p->profile->data},
       {VMCS_GUEST_SS, VMCS_GUEST_SS_BASE, VMCS_GUEST_SS_LIMIT, VMCS_GUEST_SS_AR,
-       0x93},
+       &p->profile->data},
       {VMCS_GUEST_FS, VMCS_GUEST_FS_BASE, VMCS_GUEST_FS_LIMIT, VMCS_GUEST_FS_AR,
-       0x93},
+       &p->profile->data},
       {VMCS_GUEST_GS, VMCS_GUEST_GS_BASE, VMCS_GUEST_GS_LIMIT, VMCS_GUEST_GS_AR,
-       0x93},
+       &p->profile->data},
       {VMCS_GUEST_TR, VMCS_GUEST_TR_BASE, VMCS_GUEST_TR_LIMIT, VMCS_GUEST_TR_AR,
-       0x8b},
+       &p->profile->tr},
       {VMCS_GUEST_LDTR, VMCS_GUEST_LDTR_BASE, VMCS_GUEST_LDTR_LIMIT,
-       VMCS_GUEST_LDTR_AR, 0x10000},
+       VMCS_GUEST_LDTR_AR, &p->profile->ldtr},
   };
-  // SDM 26.3 and 24.4.1 describe segment access rights and real-mode state.
+  // SDM vol. 3C, 27.3.1.2 describes VM-entry segment-state checks.
   for (size_t i = 0; i < sizeof(segments) / sizeof(segments[0]); ++i) {
-    TRY(write_field(p, segments[i].selector, 0));
-    TRY(write_field(p, segments[i].base, 0));
-    TRY(write_field(p, segments[i].limit, 0xffff));
-    TRY(write_field(p, segments[i].access, segments[i].rights));
+    const struct guest_segment *state = segments[i].state;
+    TRY(write_field(p, segments[i].selector, state->selector));
+    TRY(write_field(p, segments[i].base, state->base));
+    TRY(write_field(p, segments[i].limit, state->limit));
+    TRY(write_field(p, segments[i].access, state->rights));
   }
   const struct {
     uint32_t field;
     uint64_t value;
   } fields[] = {
-      {VMCS_GUEST_GDTR_BASE, 0},
-      {VMCS_GUEST_GDTR_LIMIT, 0xffff},
+      {VMCS_GUEST_GDTR_BASE, p->profile->gdtr_base},
+      {VMCS_GUEST_GDTR_LIMIT, p->profile->gdtr_limit},
       {VMCS_GUEST_IDTR_BASE, 0},
       {VMCS_GUEST_IDTR_LIMIT, 0x3ff},
       {VMCS_GUEST_RIP, CODE},
@@ -483,7 +540,7 @@ static int gate(struct probe *p, const char *name) {
 }
 
 static int prepare_run(struct probe *p, bool armed) {
-  // Intel SDM vol. 2: C6 /0, MOV byte [disp16], imm8 precedes each case's tail.
+  // Intel SDM vol. 2: C6 /0 writes the sentinel before each case's tail.
   // Guest validity remains unestablished until the observations below agree.
   uint8_t initial = *(volatile uint8_t *)(p->memory + SENTINEL);
   fact(p, "sentinel_initial", "fact", initial == 0 ? 0 : 77, initial, TAG, 0);
@@ -568,7 +625,9 @@ static int run_once(struct probe *p, const struct phase_case *spec) {
                         length == p->guest->instruction_length;
   p->guest_verified =
       !(reason & (1ULL << 31)) && (reason & 0xffff) == p->guest->exit_reason &&
-      actual == TAG && rip == CODE + p->guest->rip_offset && length_matches;
+      actual == TAG &&
+      rip == CODE + p->profile->mov_length + p->guest->tail_offset &&
+      length_matches;
   fact(p, p->guest_verified ? p->guest->verified_fact : "guest_not_established",
        "fact", p->guest_verified ? 0 : 77, reason, rip, length);
   return p->guest_verified ? 0 : 77;
@@ -636,9 +695,11 @@ static int execute(struct probe *p, int target, const struct phase_case *spec) {
     p->memory = NULL;
     return 71;
   }
-  const uint8_t code[] = {
-      0xc6, 0x06, 0x00, 0x08, TAG, p->guest->tail[0], p->guest->tail[1]};
-  memcpy(p->memory + CODE, code, sizeof(code));
+  memcpy(p->memory + CODE, p->profile->mov, p->profile->mov_length);
+  memcpy(p->memory + CODE + p->profile->mov_length, p->guest->tail,
+         sizeof(p->guest->tail));
+  memcpy(p->memory + GDT, p->profile->gdt, sizeof(p->profile->gdt));
+  memcpy(p->memory + TSS, p->profile->tss, sizeof(p->profile->tss));
   result =
       CALL(p, "hv_vm_map",
            hv_vm_map(p->memory, 0, PAGE_BYTES,
@@ -734,6 +795,11 @@ int main(int argc, char **argv) {
        .armed = true,
        .observer = OBSERVER_INTERRUPT},
       {.name = "armed-sti-hlt", .guest = GUEST_STI_HLT, .armed = true},
+      {.name = "armed-protected32-cpuid",
+       .guest = GUEST_CPUID,
+       .mode = PROTECTED32,
+       .armed = true},
+      {.name = "armed-protected32-hlt", .mode = PROTECTED32, .armed = true},
   };
   int target = -1;
   if (argc == 2)
@@ -746,11 +812,14 @@ int main(int argc, char **argv) {
             "capabilities|vm|vcpu|configure|run|armed-control|armed-run|"
             "armed-cpuid|armed-spin|armed-hlt-watch|armed-hlt-forever|"
             "armed-hlt-threadinfo|armed-cpuid-threadinfo|"
-            "armed-hlt-interrupt|armed-cpuid-interrupt|armed-sti-hlt\n",
+            "armed-hlt-interrupt|armed-cpuid-interrupt|armed-sti-hlt|"
+            "armed-protected32-cpuid|armed-protected32-hlt\n",
             argv[0]);
     return 64;
   }
-  struct probe p = {.phase = "startup", .guest = &guests[phases[target].guest]};
+  struct probe p = {.phase = "startup",
+                    .guest = &guests[phases[target].guest],
+                    .profile = &profiles[phases[target].mode]};
   if (mach_timebase_info(&p.timebase) != KERN_SUCCESS || p.timebase.denom == 0)
     return 71;
   fact(&p, "probe_start", "fact", 0, (uint64_t)target, 0, 0);
