@@ -279,18 +279,10 @@ static int configure(struct probe *p) {
   return p->output_failed ? 74 : 0;
 }
 
-static int prepare_run(struct probe *p, bool armed) {
-  // Intel SDM vol. 2: C6 /0, MOV byte [disp16], imm8 precedes each case's tail.
-  // Guest validity remains unestablished until the observations below agree.
-  uint8_t initial = *(volatile uint8_t *)(p->memory + SENTINEL);
-  fact(p, "sentinel_initial", "fact", initial == 0 ? 0 : 77, initial, TAG, 0);
-  if (initial != 0)
-    return 77;
-  if (!armed)
-    return 0;
+static int gate(struct probe *p, const char *name) {
   // fflush proves only local output completion. The controller must receive
-  // run_ready and independently check the runner before sending G.
-  if (!fact(p, "run_ready", "fact", 0, 'G', 0, 0))
+  // this named gate and independently check the runner before sending G.
+  if (!fact(p, name, "fact", 0, 'G', 0, 0))
     return 74;
   unsigned char command = 0;
   ssize_t bytes;
@@ -298,21 +290,34 @@ static int prepare_run(struct probe *p, bool armed) {
     bytes = read(STDIN_FILENO, &command, 1);
   } while (bytes < 0 && errno == EINTR);
   if (bytes < 0) {
-    fact(p, "armed_input_error_not_executed", "fact", 71, errno, 0, 0);
+    fact(p, name, "protocol_error", 71, errno, 0, 'G');
     return 71;
   }
   if (bytes == 0) {
-    fact(p, "armed_input_eof_not_executed", "fact", 75, 0, 0, 0);
+    fact(p, name, "protocol_error", 75, 0, 0, 'G');
     return 75;
   }
   if (command != 'G') {
-    fact(p, "armed_input_invalid_not_executed", "fact", 64, command, 'G', 0);
+    fact(p, name, "protocol_error", 64, command, 'G', 0);
     return 64;
   }
-  return fact(p, "run_released", "fact", 0, command, 0, 0) ? 0 : 74;
+  return fact(p, name, "released", 0, command, 0, 0) ? 0 : 74;
 }
 
-static int run_once(struct probe *p, bool control) {
+static int prepare_run(struct probe *p, bool armed) {
+  // Intel SDM vol. 2: C6 /0, MOV byte [disp16], imm8 precedes each case's tail.
+  // Guest validity remains unestablished until the observations below agree.
+  uint8_t initial = *(volatile uint8_t *)(p->memory + SENTINEL);
+  fact(p, "sentinel_initial", "fact", initial == 0 ? 0 : 77, initial, TAG, 0);
+  if (initial != 0)
+    return 77;
+  int result = armed ? gate(p, "run_ready") : 0;
+  if (result != 0)
+    fact(p, "guest_not_executed_protocol_error", "fact", result, 0, 0, 0);
+  return result;
+}
+
+static int run_once(struct probe *p, bool control, bool armed) {
   uint64_t ticks =
       (uint64_t)((__uint128_t)20000000 * p->timebase.denom / p->timebase.numer);
   // Apple hv_vcpu_run_until: absolute mach time, finite VMX preemption timer.
@@ -327,8 +332,10 @@ static int run_once(struct probe *p, bool control) {
     return p->output_failed ? 74 : 0;
   }
   hv_return_t result = hv_vcpu_run_until(p->vcpu, deadline);
-  TRY(status(p, returned(p, "hv_vcpu_run_until", result, p->vcpu, deadline,
-                         20000000)));
+  returned(p, "hv_vcpu_run_until", result, p->vcpu, deadline, 20000000);
+  if (armed)
+    TRY(gate(p, "run_return_ready"));
+  TRY(status(p, result));
   uint64_t reason = 0, rip = 0, length = 0;
   TRY(status(p,
              CALL(p, "hv_vmx_vcpu_read_vmcs",
@@ -401,7 +408,7 @@ static int execute(struct probe *p, int target, const struct phase_case *spec) {
     return 0;
   p->phase = spec->name;
   TRY(prepare_run(p, spec->armed));
-  return run_once(p, spec->control);
+  return run_once(p, spec->control, spec->armed);
 }
 
 static int cleanup(struct probe *p) {
@@ -475,11 +482,19 @@ int main(int argc, char **argv) {
   int primary = execute(&p, target, &phases[target]);
   fact(&p, "phase_result", "fact", primary, (uint64_t)target, p.guest_verified,
        0);
+  int cleanup_release = 0;
+  if (phases[target].armed &&
+      (p.vm_created || p.mapped || p.cpu_created || p.memory)) {
+    p.phase = "cleanup";
+    cleanup_release = gate(&p, "cleanup_ready");
+  }
   int teardown = cleanup(&p);
   if (teardown != 0)
     fact(&p, "implicit_process_teardown_required", "fact", teardown,
          p.cpu_created, p.mapped, p.vm_created);
-  int result = teardown != 0 ? teardown : primary;
+  int result = teardown != 0          ? teardown
+               : cleanup_release != 0 ? cleanup_release
+                                      : primary;
   if (p.output_failed)
     result = 74;
   p.phase = "complete";
