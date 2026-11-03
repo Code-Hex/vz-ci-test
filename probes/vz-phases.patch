@@ -1,0 +1,238 @@
+diff --git a/diagnostic_test.go b/diagnostic_test.go
+new file mode 100644
+index 0000000..c72f4cb
+--- /dev/null
++++ b/diagnostic_test.go
+@@ -0,0 +1,49 @@
++package vz_test
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"strconv"
++	"testing"
++	"time"
++)
++
++var diagnosticStarted = time.Now()
++
++func diagnosticPhase(t *testing.T, format string, args ...any) {
++	t.Helper()
++	t.Log(diagnosticJSON(t.Name(), format, args...))
++}
++
++func diagnosticLog(format string, args ...any) {
++	fmt.Println(diagnosticJSON(os.Getenv("VZ_DIAGNOSTIC_TARGET"), format, args...))
++}
++
++func diagnosticJSON(target, format string, args ...any) string {
++	count, _ := strconv.Atoi(os.Getenv("VZ_DIAGNOSTIC_COUNT"))
++	process, _ := strconv.Atoi(os.Getenv("VZ_DIAGNOSTIC_PROCESS_NUMBER"))
++	record := struct {
++		Case              string  `json:"case"`
++		Go                string  `json:"go"`
++		Target            string  `json:"target"`
++		Count             int     `json:"count"`
++		ProcessNumber     int     `json:"processNumber"`
++		Phase             string  `json:"phase"`
++		MonotonicDuration float64 `json:"monotonicDuration"`
++		ExitCode          *int    `json:"exitCode"`
++	}{
++		Case:              os.Getenv("VZ_DIAGNOSTIC_CASE"),
++		Go:                os.Getenv("VZ_DIAGNOSTIC_GO"),
++		Target:            target,
++		Count:             count,
++		ProcessNumber:     process,
++		Phase:             fmt.Sprintf(format, args...),
++		MonotonicDuration: time.Since(diagnosticStarted).Seconds(),
++	}
++	data, err := json.Marshal(record)
++	if err != nil {
++		panic(err)
++	}
++	return string(data)
++}
+diff --git a/network_device_integration_test.go b/network_device_integration_test.go
+index 579268b..857fd0d 100644
+--- a/network_device_integration_test.go
++++ b/network_device_integration_test.go
+@@ -36,6 +36,7 @@ func TestRuntimeNetworkConnection(t *testing.T) {
+ 	}
+ 	start := func(attachments ...vz.NetworkDeviceAttachment) *Container {
+ 		t.Helper()
++		diagnosticPhase(t, "network.guest.start.begin attachments=%d", len(attachments))
+ 		vm := newVirtualizationMachine(t, func(config *vz.VirtualMachineConfiguration) error {
+ 			nat, err := vz.NewNATNetworkDeviceAttachment()
+ 			if err != nil {
+@@ -58,22 +59,31 @@ func TestRuntimeNetworkConnection(t *testing.T) {
+ 			config.SetNetworkDevicesVirtualMachineConfiguration(devices)
+ 			return nil
+ 		})
++		diagnosticPhase(t, "network.guest.start.end")
+ 		t.Cleanup(func() {
++			diagnosticPhase(t, "network.guest.shutdown.begin")
+ 			if err := vm.Shutdown(); err != nil {
+ 				t.Error(err)
+ 			}
++			diagnosticPhase(t, "network.guest.shutdown.end")
+ 		})
+ 		return vm
+ 	}
+ 	run := func(vm *Container, command string) {
+ 		t.Helper()
++		diagnosticPhase(t, "network.deadline.begin command=%s", command)
+ 		if err := vm.conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+ 			t.Fatal(err)
+ 		}
++		diagnosticPhase(t, "network.deadline.end")
+ 		defer vm.conn.SetDeadline(time.Time{})
++		diagnosticPhase(t, "network.session.begin")
+ 		session := vm.NewSession(t)
++		diagnosticPhase(t, "network.session.end")
+ 		defer session.Close()
++		diagnosticPhase(t, "network.command.begin command=%s", command)
+ 		output, err := session.CombinedOutput(command)
++		diagnosticPhase(t, "network.command.end error=%v", err)
+ 		if err != nil {
+ 			t.Fatalf("%s: %v\n%s", command, err, output)
+ 		}
+diff --git a/virtualization_test.go b/virtualization_test.go
+index 05c7874..afd445f 100644
+--- a/virtualization_test.go
++++ b/virtualization_test.go
+@@ -112,22 +112,33 @@ func (c *Container) NewSession(t *testing.T) *ssh.Session {
+ }
+ 
+ func (c *Container) Shutdown() error {
++	diagnosticLog("shutdown.begin")
+ 	defer func() {
+ 		log.Println("shutdown done")
++		diagnosticLog("shutdown.client.close.begin")
+ 		c.Client.Close()
++		diagnosticLog("shutdown.client.close.end")
+ 	}()
+ 
+ 	vm := c.VirtualMachine
+ 
+-	if got := vm.State(); vz.VirtualMachineStateStopped == got {
++	diagnosticLog("shutdown.state.begin")
++	state := vm.State()
++	diagnosticLog("shutdown.state.end state=%v", state)
++	if got := state; vz.VirtualMachineStateStopped == got {
+ 		return nil
+ 	}
+ 
++	diagnosticLog("shutdown.canStop.begin")
++	canStop := vm.CanStop()
++	diagnosticLog("shutdown.canStop.end value=%t", canStop)
+ 	switch {
+-	case vm.CanStop():
++	case canStop:
++		diagnosticLog("shutdown.stop.begin")
+ 		if err := vm.Stop(); err != nil {
+ 			return fmt.Errorf("failed to call stop: %w", err)
+ 		}
++		diagnosticLog("shutdown.stop.end")
+ 	case vm.CanRequestStop():
+ 		if _, err := vm.RequestStop(); err != nil {
+ 			return fmt.Errorf("failed to send request stop: %w", err)
+@@ -142,7 +153,10 @@ func (c *Container) Shutdown() error {
+ 		}
+ 	}
+ 
+-	return waitUntilState(3*time.Second, vm, vz.VirtualMachineStateStopped)
++	diagnosticLog("shutdown.wait.begin")
++	err := waitUntilState(3*time.Second, vm, vz.VirtualMachineStateStopped)
++	diagnosticLog("shutdown.wait.end error=%v", err)
++	return err
+ }
+ 
+ func getFreePort() (int, error) {
+@@ -204,9 +218,11 @@ func newVirtualizationMachine(
+ 		t.Fatal("want CanStart is true")
+ 	}
+ 
++	diagnosticPhase(t, "vm.start.begin port=%d", port)
+ 	if err := vm.Start(); err != nil {
+ 		t.Fatal(err)
+ 	}
++	diagnosticPhase(t, "vm.start.end port=%d", port)
+ 
+ 	// Starting -> Running
+ 	if err := waitUntilState(5*time.Second, vm, vz.VirtualMachineStateRunning); err != nil {
+@@ -229,7 +245,9 @@ func newVirtualizationMachine(
+ 
+ 	const max = 5
+ 	for i := 1; ; i++ {
++		diagnosticPhase(t, "vsock.connect.begin port=%d attempt=%d", port, i)
+ 		conn, err := socketDevice.Connect(uint32(port))
++		diagnosticPhase(t, "vsock.connect.end port=%d attempt=%d error=%v", port, i, err)
+ 		if err != nil {
+ 			var nserr *vz.NSError
+ 			if !errors.As(err, &nserr) || i >= max {
+@@ -250,7 +268,9 @@ func newVirtualizationMachine(
+ 			t.Fatal(err)
+ 		}
+ 
++		diagnosticPhase(t, "ssh.handshake.begin port=%d", port)
+ 		sshClient, err := testhelper.NewSshClient(conn, ":22", sshConfig)
++		diagnosticPhase(t, "ssh.handshake.end port=%d error=%v", port, err)
+ 		if err != nil {
+ 			conn.Close()
+ 			if errors.Is(err, os.ErrDeadlineExceeded) && i < max {
+diff --git a/vmnet_test.go b/vmnet_test.go
+index 9908727..2f8a4e3 100644
+--- a/vmnet_test.go
++++ b/vmnet_test.go
+@@ -122,12 +122,15 @@ func TestVMNetDHCPReservationAndGuestCommunication(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
++	diagnosticPhase(t, "dhcp.network.create.begin")
+ 	network, err := vmnet.NewNetwork(config)
++	diagnosticPhase(t, "dhcp.network.create.end error=%v", err)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	guests := make([]*Container, 2)
+ 	for i := range guests {
++		diagnosticPhase(t, "dhcp.guest.start.begin index=%d", i)
+ 		guests[i] = newVirtualizationMachine(t, func(config *vz.VirtualMachineConfiguration) error {
+ 			attachment, err := vz.NewVMNetNetworkDeviceAttachment(network)
+ 			if err != nil {
+@@ -145,14 +148,21 @@ func TestVMNetDHCPReservationAndGuestCommunication(t *testing.T) {
+ 			config.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{device})
+ 			return nil
+ 		})
++		diagnosticPhase(t, "dhcp.guest.start.end index=%d", i)
+ 		guest := guests[i]
+ 		t.Cleanup(func() {
++			diagnosticPhase(t, "dhcp.guest.shutdown.begin index=%d", i)
+ 			if err := guest.Shutdown(); err != nil {
+ 				t.Error(err)
+ 			}
++			diagnosticPhase(t, "dhcp.guest.shutdown.end index=%d", i)
+ 		})
++		diagnosticPhase(t, "dhcp.ip.session.begin index=%d", i)
+ 		session := guest.NewSession(t)
++		diagnosticPhase(t, "dhcp.ip.session.end index=%d", i)
++		diagnosticPhase(t, "dhcp.ip.command.begin index=%d", i)
+ 		output, err := session.CombinedOutput("ip -4 -o addr show dev eth0")
++		diagnosticPhase(t, "dhcp.ip.command.end index=%d error=%v", i, err)
+ 		session.Close()
+ 		if err != nil {
+ 			t.Fatalf("guest IP query: %v, %s", err, output)
+@@ -162,8 +172,12 @@ func TestVMNetDHCPReservationAndGuestCommunication(t *testing.T) {
+ 		}
+ 	}
+ 	for i, guest := range guests {
++		diagnosticPhase(t, "dhcp.ping.session.begin index=%d", i)
+ 		session := guest.NewSession(t)
++		diagnosticPhase(t, "dhcp.ping.session.end index=%d", i)
++		diagnosticPhase(t, "dhcp.ping.command.begin index=%d", i)
+ 		output, err := session.CombinedOutput("ping " + addresses[1-i])
++		diagnosticPhase(t, "dhcp.ping.command.end index=%d error=%v", i, err)
+ 		session.Close()
+ 		if err != nil {
+ 			t.Fatalf("guest %d ping: %v, %s", i, err, output)
