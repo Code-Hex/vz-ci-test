@@ -21,9 +21,43 @@
 
 enum { PAGE_BYTES = 4096, CODE = 0x100, SENTINEL = 0x800, TAG = 0xa5 };
 
+enum guest_kind { GUEST_HLT, GUEST_CPUID, GUEST_SPIN };
+
+struct guest_case {
+  uint8_t tail[2];
+  uint64_t exit_reason;
+  // Zero means the asynchronous exit's instruction length is not read or gated.
+  uint64_t instruction_length;
+  const char *verified_fact;
+};
+
+// Intel SDM vol. 2 defines HLT, NOP, CPUID and JMP encodings; vol. 3C appendix
+// C defines HLT=12, CPUID=10 and VMX preemption timer=52 exit reasons.
+static const struct guest_case guests[] = {
+    [GUEST_HLT] = {.tail = {0xf4, 0x90},
+                   .exit_reason = 12,
+                   .instruction_length = 1,
+                   .verified_fact = "sentinel_hlt_verified"},
+    [GUEST_CPUID] = {.tail = {0x0f, 0xa2},
+                     .exit_reason = 10,
+                     .instruction_length = 2,
+                     .verified_fact = "sentinel_cpuid_verified"},
+    [GUEST_SPIN] = {.tail = {0xeb, 0xfe},
+                    .exit_reason = 52,
+                    .instruction_length = 0,
+                    .verified_fact = "sentinel_spin_verified"},
+};
+
+struct phase_case {
+  const char *name;
+  enum guest_kind guest;
+  bool armed, control;
+};
+
 struct probe {
   mach_timebase_info_data_t timebase;
   const char *phase;
+  const struct guest_case *guest;
   uint64_t sequence;
   uint64_t cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1;
   hv_vcpuid_t vcpu;
@@ -245,20 +279,53 @@ static int configure(struct probe *p) {
   return p->output_failed ? 74 : 0;
 }
 
-static int run_once(struct probe *p) {
-  // Intel SDM vol. 2: C6 /0, MOV byte [disp16], imm8; F4, HLT.
+static int prepare_run(struct probe *p, bool armed) {
+  // Intel SDM vol. 2: C6 /0, MOV byte [disp16], imm8 precedes each case's tail.
   // Guest validity remains unestablished until the observations below agree.
   uint8_t initial = *(volatile uint8_t *)(p->memory + SENTINEL);
   fact(p, "sentinel_initial", "fact", initial == 0 ? 0 : 77, initial, TAG, 0);
   if (initial != 0)
     return 77;
+  if (!armed)
+    return 0;
+  // fflush proves only local output completion. The controller must receive
+  // run_ready and independently check the runner before sending G.
+  if (!fact(p, "run_ready", "fact", 0, 'G', 0, 0))
+    return 74;
+  unsigned char command = 0;
+  ssize_t bytes;
+  do {
+    bytes = read(STDIN_FILENO, &command, 1);
+  } while (bytes < 0 && errno == EINTR);
+  if (bytes < 0) {
+    fact(p, "armed_input_error_not_executed", "fact", 71, errno, 0, 0);
+    return 71;
+  }
+  if (bytes == 0) {
+    fact(p, "armed_input_eof_not_executed", "fact", 75, 0, 0, 0);
+    return 75;
+  }
+  if (command != 'G') {
+    fact(p, "armed_input_invalid_not_executed", "fact", 64, command, 'G', 0);
+    return 64;
+  }
+  return fact(p, "run_released", "fact", 0, command, 0, 0) ? 0 : 74;
+}
+
+static int run_once(struct probe *p, bool control) {
   uint64_t ticks =
       (uint64_t)((__uint128_t)20000000 * p->timebase.denom / p->timebase.numer);
   // Apple hv_vcpu_run_until: absolute mach time, finite VMX preemption timer.
   // https://developer.apple.com/documentation/hypervisor/hv_vcpu_run_until(_:_:)
-  if (!before(p, "hv_vcpu_run_until", p->vcpu, 0, 20000000))
+  const char *boundary = control ? "control_deadline" : "hv_vcpu_run_until";
+  if (!before(p, boundary, p->vcpu, 0, 20000000))
     return 74;
   uint64_t deadline = mach_absolute_time() + (ticks ? ticks : 1);
+  if (control) {
+    fact(p, "guest_not_executed_control", "fact", 0, p->vcpu, deadline,
+         20000000);
+    return p->output_failed ? 74 : 0;
+  }
   hv_return_t result = hv_vcpu_run_until(p->vcpu, deadline);
   TRY(status(p, returned(p, "hv_vcpu_run_until", result, p->vcpu, deadline,
                          20000000)));
@@ -270,21 +337,25 @@ static int run_once(struct probe *p) {
   TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
                      hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_GUEST_RIP, &rip),
                      VMCS_GUEST_RIP, 0, 0)));
-  TRY(status(
-      p, CALL(p, "hv_vmx_vcpu_read_vmcs",
-              hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_RO_VMEXIT_INSTR_LEN, &length),
-              VMCS_RO_VMEXIT_INSTR_LEN, 0, 0)));
+  if (p->guest->instruction_length != 0)
+    TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
+                       hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_RO_VMEXIT_INSTR_LEN,
+                                             &length),
+                       VMCS_RO_VMEXIT_INSTR_LEN, 0, 0)));
   uint8_t actual = *(volatile uint8_t *)(p->memory + SENTINEL);
   fact(p, "guest_observation", "fact", 0, actual, rip, length);
-  // SDM appendix C: exit reason 12 is HLT; bit 31 marks VM-entry failure.
-  p->guest_verified = !(reason & (1ULL << 31)) && (reason & 0xffff) == 12 &&
-                      actual == TAG && rip == CODE + 5 && length == 1;
-  fact(p, p->guest_verified ? "sentinel_hlt_verified" : "guest_not_established",
+  // SDM appendix C: bit 31 marks VM-entry failure.
+  bool length_matches = p->guest->instruction_length == 0 ||
+                        length == p->guest->instruction_length;
+  p->guest_verified = !(reason & (1ULL << 31)) &&
+                      (reason & 0xffff) == p->guest->exit_reason &&
+                      actual == TAG && rip == CODE + 5 && length_matches;
+  fact(p, p->guest_verified ? p->guest->verified_fact : "guest_not_established",
        "fact", p->guest_verified ? 0 : 77, reason, rip, length);
   return p->guest_verified ? 0 : 77;
 }
 
-static int execute(struct probe *p, int target) {
+static int execute(struct probe *p, int target, const struct phase_case *spec) {
   p->phase = "capabilities";
   TRY(capabilities(p));
   if (target == 0)
@@ -307,7 +378,8 @@ static int execute(struct probe *p, int target) {
     p->memory = NULL;
     return 71;
   }
-  const uint8_t code[] = {0xc6, 0x06, 0x00, 0x08, TAG, 0xf4};
+  const uint8_t code[] = {
+      0xc6, 0x06, 0x00, 0x08, TAG, p->guest->tail[0], p->guest->tail[1]};
   memcpy(p->memory + CODE, code, sizeof(code));
   result =
       CALL(p, "hv_vm_map",
@@ -327,8 +399,9 @@ static int execute(struct probe *p, int target) {
   TRY(configure(p));
   if (target == 3)
     return 0;
-  p->phase = "run";
-  return run_once(p);
+  p->phase = spec->name;
+  TRY(prepare_run(p, spec->armed));
+  return run_once(p, spec->control);
 }
 
 static int cleanup(struct probe *p) {
@@ -371,21 +444,35 @@ static int cleanup(struct probe *p) {
 int main(int argc, char **argv) {
   if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
     return 71;
-  const char *phases[] = {"capabilities", "vm", "vcpu", "configure", "run"};
+  const struct phase_case phases[] = {
+      {.name = "capabilities"},
+      {.name = "vm"},
+      {.name = "vcpu"},
+      {.name = "configure"},
+      {.name = "run"},
+      {.name = "armed-control", .armed = true, .control = true},
+      {.name = "armed-run", .armed = true},
+      {.name = "armed-cpuid", .guest = GUEST_CPUID, .armed = true},
+      {.name = "armed-spin", .guest = GUEST_SPIN, .armed = true},
+  };
   int target = -1;
   if (argc == 2)
     for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); ++i)
-      if (strcmp(argv[1], phases[i]) == 0)
+      if (strcmp(argv[1], phases[i].name) == 0)
         target = (int)i;
   if (target < 0) {
-    fprintf(stderr, "usage: %s capabilities|vm|vcpu|configure|run\n", argv[0]);
+    fprintf(stderr,
+            "usage: %s "
+            "capabilities|vm|vcpu|configure|run|armed-control|armed-run|"
+            "armed-cpuid|armed-spin\n",
+            argv[0]);
     return 64;
   }
-  struct probe p = {.phase = "startup"};
+  struct probe p = {.phase = "startup", .guest = &guests[phases[target].guest]};
   if (mach_timebase_info(&p.timebase) != KERN_SUCCESS || p.timebase.denom == 0)
     return 71;
   fact(&p, "probe_start", "fact", 0, (uint64_t)target, 0, 0);
-  int primary = execute(&p, target);
+  int primary = execute(&p, target, &phases[target]);
   fact(&p, "phase_result", "fact", primary, (uint64_t)target, p.guest_verified,
        0);
   int teardown = cleanup(&p);
