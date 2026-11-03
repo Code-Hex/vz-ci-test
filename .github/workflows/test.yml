@@ -1,36 +1,70 @@
-name: Build
+name: Intel macOS SSH diagnostics
+
 on:
-  push:
-    branches:
-      - "main"
+  workflow_dispatch:
+    inputs:
+      ssh_public_key:
+        description: One ephemeral Ed25519 public key
+        required: true
+        type: string
+      duration_minutes:
+        description: Session lifetime in minutes (1 through 60)
+        required: true
+        default: '30'
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  test:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      # Can't expand the matrix due to the flakiness of the CI infra
-      matrix:
-        os:
-        - macos-12 # because macOS 14, 15 does not support build on nested virtualization
-        go:
-        - '^1.23'
+  ssh:
+    runs-on: macos-26-intel
+    timeout-minutes: 75
     steps:
-      - name: Check out repository code
-        uses: actions/checkout@v4
+      - name: Check out diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Code-Hex/vz
-          ref: fix/175
-      - name: Set up Go
-        uses: actions/setup-go@v5
+          persist-credentials: false
+      - name: Validate session inputs
+        env:
+          SSH_PUBLIC_KEY: ${{ inputs.ssh_public_key }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: bash scripts/validate-ssh-inputs.sh
+      - name: Install pinned upterm
+        timeout-minutes: 3
+        run: bash scripts/install-upterm.sh
+      - name: Start key-restricted SSH session
+        timeout-minutes: 3
+        env:
+          SSH_PUBLIC_KEY: ${{ inputs.ssh_public_key }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: bash scripts/start-ssh.sh
+      - name: Publish connection metadata
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          go-version: ${{ matrix.go }}
-      - name: Download Linux kernel
-        run: make download_kernel
-      - name: Build Linux
-        run: make -C example/linux
-      #- run: make test
-      #- name: Setup tmate session
-      #  uses: mxschmitt/action-tmate@v3
-      #  timeout-minutes: 15
+          name: intel-connection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/debug/public/connection.json
+            ${{ runner.temp }}/debug/public/relay-known-hosts
+            ${{ runner.temp }}/debug/public/runner-info.json
+          retention-days: 1
+          if-no-files-found: error
+      - name: Wait for diagnostics or session deadline
+        run: bash scripts/hold-ssh.sh
+      - name: Stop SSH session
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: bash scripts/stop-ssh.sh
+      - name: Preserve selected session logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: intel-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/debug/logs/lifecycle.tsv
+            ${{ runner.temp }}/debug/logs/heartbeat.tsv
+            ${{ runner.temp }}/debug/logs/start.log
+            ${{ runner.temp }}/debug/logs/stop.log
+            ${{ runner.temp }}/debug/logs/session-end.json
+          retention-days: 1
+          if-no-files-found: warn
