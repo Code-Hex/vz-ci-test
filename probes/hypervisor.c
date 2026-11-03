@@ -323,6 +323,7 @@ static int execute(struct probe *p, int target) {
   if (target == 2)
     return 0;
   p->phase = "configure";
+  TRY(capabilities(p));
   TRY(configure(p));
   if (target == 3)
     return 0;
