@@ -2,7 +2,7 @@ diff --git a/diagnostic_guest_halt_test.go b/diagnostic_guest_halt_test.go
 new file mode 100644
 --- /dev/null
 +++ b/diagnostic_guest_halt_test.go
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,312 @@
 +package vz_test
 +
 +import (
@@ -73,12 +73,27 @@ new file mode 100644
 +
 +func TestDiagnosticGuestNoop(t *testing.T) { diagnosticGuestAction(t, "noop") }
 +
++func diagnosticGuestConsole(config *vz.VirtualMachineConfiguration) error {
++	attachment, err := vz.NewFileHandleSerialPortAttachment(nil, os.Stderr)
++	if err != nil {
++		return err
++	}
++	defer objc.Release(attachment)
++	console, err := vz.NewVirtioConsoleDeviceSerialPortConfiguration(attachment)
++	if err != nil {
++		return err
++	}
++	defer objc.Release(console)
++	config.SetSerialPortsVirtualMachineConfiguration([]*vz.VirtioConsoleDeviceSerialPortConfiguration{console})
++	return nil
++}
++
 +func diagnosticGuestAction(t *testing.T, action string) {
 +	t.Helper()
 +	if runtime.GOARCH != "amd64" || os.Getenv("VZ_DIAGNOSTIC_IDLE") != "poll" || os.Getenv("VZ_DIAGNOSTIC_GUEST_ACTION") != action {
 +		t.Fatal("requires Intel, VZ_DIAGNOSTIC_IDLE=poll, and matching explicit VZ_DIAGNOSTIC_GUEST_ACTION")
 +	}
-+	container := newVirtualizationMachine(t)
++	container := newVirtualizationMachine(t, diagnosticGuestConsole)
 +	diagnosticGuestRetained = container
 +	defer func() { runtime.KeepAlive(container) }()
 +	if err := container.conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -117,6 +132,25 @@ new file mode 100644
 +		if !strings.Contains(applets, "\n"+applet+"\n") {
 +			t.Fatalf("guest busybox lacks %s", applet)
 +		}
++	}
++	consoleSession, err := container.Client.NewSession()
++	if err != nil {
++		t.Fatal(err)
++	}
++	consoleOutput, err := consoleSession.Output("cat /proc/consoles")
++	consoleSession.Close()
++	if err != nil {
++		t.Fatalf("guest console readback: %v", err)
++	}
++	consoleReady := false
++	for _, line := range strings.Split(string(consoleOutput), "\n") {
++		fields := strings.Fields(line)
++		if len(fields) > 0 && fields[0] == "hvc0" {
++			consoleReady = true
++		}
++	}
++	if !consoleReady {
++		t.Fatalf("guest hvc0 console is not registered: %q", consoleOutput)
 +	}
 +	session, err := container.Client.NewSession()
 +	if err != nil {
@@ -183,6 +217,7 @@ new file mode 100644
 +	diagnosticGuestFact("guest_ready", map[string]any{
 +		"guestID": lines[2], "uid": lines[0], "kernelRelease": lines[1], "commandLine": lines[3],
 +		"capEff": capability[1], "busyboxHalt": true, "busyboxTrue": true,
++		"consoleReadback": string(consoleOutput), "consoleInput": false,
 +		"sessionExecAccepted": true, "vm": fmt.Sprintf("%p", objc.Ptr(container.VirtualMachine)), "command": command,
 +	})
 +	diagnosticGuestGate("guest_ready_gate_error")
