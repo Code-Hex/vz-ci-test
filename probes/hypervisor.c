@@ -24,6 +24,8 @@
 
 enum {
   PAGE_BYTES = 4096,
+  PAGE_DIRECTORY = PAGE_BYTES,
+  PAGE_TABLE = 2 * PAGE_BYTES,
   CODE = 0x100,
   GDT = 0x400,
   TSS = 0x500,
@@ -77,6 +79,25 @@ static const struct mode_profile profiles[] = {
         },
 };
 
+enum paging_kind { PAGING_LEGACY, PAGING_DISABLED, PAGING_ENABLED };
+
+struct paging_profile {
+  size_t memory_bytes;
+  uint64_t cr0_set, cr3;
+};
+
+static const struct paging_profile paging_profiles[] = {
+    [PAGING_LEGACY] = {.memory_bytes = PAGE_BYTES},
+    [PAGING_DISABLED] = {.memory_bytes = 3 * PAGE_BYTES, .cr3 = PAGE_DIRECTORY},
+    [PAGING_ENABLED] = {.memory_bytes = 3 * PAGE_BYTES,
+                        .cr0_set = 1ULL << 31,
+                        .cr3 = PAGE_DIRECTORY},
+};
+
+// SDM vol. 3A, 4.3: supervisor read/write 4KiB identity mappings, CR4.PAE=0.
+static const uint32_t page_directory[] = {PAGE_TABLE | 3};
+static const uint32_t page_table[] = {3, PAGE_DIRECTORY | 3, PAGE_TABLE | 3};
+
 enum guest_kind { GUEST_HLT, GUEST_CPUID, GUEST_SPIN, GUEST_STI_HLT };
 enum observer_kind {
   OBSERVER_NONE,
@@ -123,6 +144,7 @@ struct phase_case {
   const char *name;
   enum guest_kind guest;
   enum guest_mode mode;
+  enum paging_kind paging;
   enum observer_kind observer;
   bool armed, control, forever;
 };
@@ -141,6 +163,7 @@ struct probe {
   const char *phase;
   const struct guest_case *guest;
   const struct mode_profile *profile;
+  const struct paging_profile *paging;
   uint64_t sequence;
   uint64_t cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1;
   hv_vcpuid_t vcpu;
@@ -430,15 +453,16 @@ static int configure(struct probe *p) {
               (1ULL << 9) | (1ULL << 10) | (1ULL << 11), &entry));
   // SDM 26.3.1: unrestricted guest relaxes CR0.PE/PG fixed-one requirements.
   uint64_t cr0 = ((p->cr0_fixed0 | (1ULL << 4)) & ~((1ULL << 31) | 1ULL)) |
-                 p->profile->cr0_set;
+                 p->profile->cr0_set | p->paging->cr0_set;
   uint64_t cr4 = p->cr4_fixed0;
   if ((cr0 & ~p->cr0_fixed1) || (cr4 & ~p->cr4_fixed1) ||
-      (cr0 & ((1ULL << 29) | (1ULL << 30))) || (cr4 & (1ULL << 17))) {
+      (cr0 & ((1ULL << 29) | (1ULL << 30))) || (cr4 & (1ULL << 17)) ||
+      (p->paging->cr3 != 0 && (cr4 & (1ULL << 5)))) {
     fact(p, "cr_not_established", "fact", 77, cr0, cr4, 0);
     return 77;
   }
   TRY(write_field(p, VMCS_GUEST_CR0, cr0));
-  TRY(write_field(p, VMCS_GUEST_CR3, 0));
+  TRY(write_field(p, VMCS_GUEST_CR3, p->paging->cr3));
   TRY(write_field(p, VMCS_GUEST_CR4, cr4));
   const struct {
     uint32_t selector, base, limit, access;
@@ -685,12 +709,13 @@ static int execute(struct probe *p, int target, const struct phase_case *spec) {
   if (target == 1)
     return 0;
   p->phase = "vcpu";
-  if (!before(p, "mmap", PAGE_BYTES, PROT_READ | PROT_WRITE, 0))
+  size_t memory_bytes = p->paging->memory_bytes;
+  if (!before(p, "mmap", memory_bytes, PROT_READ | PROT_WRITE, 0))
     return 74;
-  p->memory = mmap(NULL, PAGE_BYTES, PROT_READ | PROT_WRITE,
+  p->memory = mmap(NULL, memory_bytes, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANON, -1, 0);
   int error = p->memory == MAP_FAILED ? errno : 0;
-  fact(p, "mmap", "return", error, PAGE_BYTES, PROT_READ | PROT_WRITE, 0);
+  fact(p, "mmap", "return", error, memory_bytes, PROT_READ | PROT_WRITE, 0);
   if (p->memory == MAP_FAILED) {
     p->memory = NULL;
     return 71;
@@ -700,11 +725,15 @@ static int execute(struct probe *p, int target, const struct phase_case *spec) {
          sizeof(p->guest->tail));
   memcpy(p->memory + GDT, p->profile->gdt, sizeof(p->profile->gdt));
   memcpy(p->memory + TSS, p->profile->tss, sizeof(p->profile->tss));
+  if (p->paging->cr3 != 0) {
+    memcpy(p->memory + PAGE_DIRECTORY, page_directory, sizeof(page_directory));
+    memcpy(p->memory + PAGE_TABLE, page_table, sizeof(page_table));
+  }
   result =
       CALL(p, "hv_vm_map",
-           hv_vm_map(p->memory, 0, PAGE_BYTES,
+           hv_vm_map(p->memory, 0, memory_bytes,
                      HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC),
-           0, PAGE_BYTES, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+           0, memory_bytes, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
   p->mapped = result == HV_SUCCESS;
   TRY(status(p, result));
   result = CALL(p, "hv_vcpu_create", hv_vcpu_create(&p->vcpu, HV_VCPU_DEFAULT),
@@ -742,7 +771,8 @@ static int cleanup(struct probe *p) {
   }
   if (p->mapped) {
     hv_return_t rc =
-        CALL(p, "hv_vm_unmap", hv_vm_unmap(0, PAGE_BYTES), 0, PAGE_BYTES, 0);
+        CALL(p, "hv_vm_unmap", hv_vm_unmap(0, p->paging->memory_bytes), 0,
+             p->paging->memory_bytes, 0);
     if (rc != HV_SUCCESS)
       return 70;
     p->mapped = false;
@@ -754,9 +784,10 @@ static int cleanup(struct probe *p) {
     p->vm_created = false;
   }
   if (p->memory) {
-    before(p, "munmap", PAGE_BYTES, 0, 0);
-    int rc = munmap(p->memory, PAGE_BYTES);
-    fact(p, "munmap", "return", rc == 0 ? 0 : errno, PAGE_BYTES, 0, 0);
+    before(p, "munmap", p->paging->memory_bytes, 0, 0);
+    int rc = munmap(p->memory, p->paging->memory_bytes);
+    fact(p, "munmap", "return", rc == 0 ? 0 : errno, p->paging->memory_bytes, 0,
+         0);
     if (rc != 0)
       return 71;
     p->memory = NULL;
@@ -800,6 +831,26 @@ int main(int argc, char **argv) {
        .mode = PROTECTED32,
        .armed = true},
       {.name = "armed-protected32-hlt", .mode = PROTECTED32, .armed = true},
+      {.name = "armed-protected32-nopaging-cpuid",
+       .guest = GUEST_CPUID,
+       .mode = PROTECTED32,
+       .paging = PAGING_DISABLED,
+       .armed = true},
+      {.name = "armed-protected32-nopaging-hlt",
+       .mode = PROTECTED32,
+       .paging = PAGING_DISABLED,
+       .observer = OBSERVER_SENTINEL,
+       .armed = true},
+      {.name = "armed-protected32-paging-cpuid",
+       .guest = GUEST_CPUID,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .armed = true},
+      {.name = "armed-protected32-paging-hlt",
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .observer = OBSERVER_SENTINEL,
+       .armed = true},
   };
   int target = -1;
   if (argc == 2)
@@ -813,13 +864,16 @@ int main(int argc, char **argv) {
             "armed-cpuid|armed-spin|armed-hlt-watch|armed-hlt-forever|"
             "armed-hlt-threadinfo|armed-cpuid-threadinfo|"
             "armed-hlt-interrupt|armed-cpuid-interrupt|armed-sti-hlt|"
-            "armed-protected32-cpuid|armed-protected32-hlt\n",
+            "armed-protected32-cpuid|armed-protected32-hlt|"
+            "armed-protected32-nopaging-cpuid|armed-protected32-nopaging-hlt|"
+            "armed-protected32-paging-cpuid|armed-protected32-paging-hlt\n",
             argv[0]);
     return 64;
   }
   struct probe p = {.phase = "startup",
                     .guest = &guests[phases[target].guest],
-                    .profile = &profiles[phases[target].mode]};
+                    .profile = &profiles[phases[target].mode],
+                    .paging = &paging_profiles[phases[target].paging]};
   if (mach_timebase_info(&p.timebase) != KERN_SUCCESS || p.timebase.denom == 0)
     return 71;
   fact(&p, "probe_start", "fact", 0, (uint64_t)target, 0, 0);
