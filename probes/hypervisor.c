@@ -24,32 +24,46 @@
 
 enum { PAGE_BYTES = 4096, CODE = 0x100, SENTINEL = 0x800, TAG = 0xa5 };
 
-enum guest_kind { GUEST_HLT, GUEST_CPUID, GUEST_SPIN };
-enum observer_kind { OBSERVER_NONE, OBSERVER_SENTINEL, OBSERVER_THREADINFO };
+enum guest_kind { GUEST_HLT, GUEST_CPUID, GUEST_SPIN, GUEST_STI_HLT };
+enum observer_kind {
+  OBSERVER_NONE,
+  OBSERVER_SENTINEL,
+  OBSERVER_THREADINFO,
+  OBSERVER_INTERRUPT
+};
 
 struct guest_case {
   uint8_t tail[2];
   uint64_t exit_reason;
   // Zero means the asynchronous exit's instruction length is not read or gated.
   uint64_t instruction_length;
+  uint64_t rip_offset;
   const char *verified_fact;
 };
 
-// Intel SDM vol. 2 defines HLT, NOP, CPUID and JMP encodings; vol. 3C appendix
-// C defines HLT=12, CPUID=10 and VMX preemption timer=52 exit reasons.
+// Intel SDM vol. 2 defines HLT, STI, NOP, CPUID and JMP encodings; vol. 3C
+// appendix C defines HLT=12, CPUID=10 and VMX preemption timer=52 exit reasons.
 static const struct guest_case guests[] = {
     [GUEST_HLT] = {.tail = {0xf4, 0x90},
                    .exit_reason = 12,
                    .instruction_length = 1,
+                   .rip_offset = 5,
                    .verified_fact = "sentinel_hlt_verified"},
     [GUEST_CPUID] = {.tail = {0x0f, 0xa2},
                      .exit_reason = 10,
                      .instruction_length = 2,
+                     .rip_offset = 5,
                      .verified_fact = "sentinel_cpuid_verified"},
     [GUEST_SPIN] = {.tail = {0xeb, 0xfe},
                     .exit_reason = 52,
                     .instruction_length = 0,
+                    .rip_offset = 5,
                     .verified_fact = "sentinel_spin_verified"},
+    [GUEST_STI_HLT] = {.tail = {0xfb, 0xf4},
+                       .exit_reason = 12,
+                       .instruction_length = 1,
+                       .rip_offset = 6,
+                       .verified_fact = "sentinel_sti_hlt_verified"},
 };
 
 struct phase_case {
@@ -137,6 +151,42 @@ static int observe_thread_info(const struct observer *o, size_t sample) {
   return valid ? 0 : 71;
 }
 
+static int interrupt_vcpu(const struct observer *o) {
+  flockfile(stderr);
+  int written = fprintf(
+      stderr,
+      "{\"actor\":\"interrupt-observer\",\"monotonic_ns\":%" PRIu64
+      ",\"pid\":%d,\"seq\":1,\"phase\":\"%s\","
+      "\"api\":\"hv_vcpu_interrupt\",\"edge\":\"before\",\"result\":null,"
+      "\"sourcehash\":\"%s\",\"vcpu\":%u,\"owner_tid\":%" PRIu64 "}\n",
+      observer_now(o), getpid(), o->phase, PROBE_SOURCE_SHA, o->vcpu,
+      o->owner_tid);
+  int flushed = fflush(stderr);
+  funlockfile(stderr);
+  if (written < 0 || flushed != 0)
+    return 74;
+
+  // Unlike register access, this public API has no owning-thread restriction.
+  // QEMU a3565937b39779d4e3704298095f566e7559ad53 uses it in
+  // hvf_kick_vcpu_thread.
+  hv_vcpuid_t target = o->vcpu;
+  hv_return_t result = hv_vcpu_interrupt(&target, 1);
+  flockfile(stderr);
+  written =
+      fprintf(stderr,
+              "{\"actor\":\"interrupt-observer\",\"monotonic_ns\":%" PRIu64
+              ",\"pid\":%d,\"seq\":2,\"phase\":\"%s\","
+              "\"api\":\"hv_vcpu_interrupt\",\"edge\":\"return\",\"result\":%d,"
+              "\"sourcehash\":\"%s\",\"vcpu\":%u,\"owner_tid\":%" PRIu64 "}\n",
+              observer_now(o), getpid(), o->phase, (int)result,
+              PROBE_SOURCE_SHA, o->vcpu, o->owner_tid);
+  flushed = fflush(stderr);
+  funlockfile(stderr);
+  if (written < 0 || flushed != 0)
+    return 74;
+  return result == HV_SUCCESS ? 0 : 70;
+}
+
 static void *observe_sentinel(void *argument) {
   const struct observer *o = argument;
   uint64_t started = observer_now(o), first_tag_ns = 0;
@@ -181,6 +231,11 @@ static void *observe_sentinel(void *argument) {
       return (void *)(uintptr_t)71;
     if (o->kind == OBSERVER_THREADINFO) {
       int result = observe_thread_info(o, i);
+      if (result != 0)
+        return (void *)(uintptr_t)result;
+    }
+    if (o->kind == OBSERVER_INTERRUPT && i == 0) {
+      int result = interrupt_vcpu(o);
       if (result != 0)
         return (void *)(uintptr_t)result;
     }
@@ -441,6 +496,13 @@ static int prepare_run(struct probe *p, bool armed) {
 }
 
 static int run_once(struct probe *p, const struct phase_case *spec) {
+  uint64_t idle_before = 0;
+  if (spec->observer == OBSERVER_INTERRUPT) {
+    TRY(status(p, CALL(p, "hv_vcpu_get_idle_time",
+                       hv_vcpu_get_idle_time(p->vcpu, &idle_before), p->vcpu, 0,
+                       0)));
+    fact(p, "idle_time_before", "fact", 0, idle_before, 0, 0);
+  }
   uint64_t ticks =
       (uint64_t)((__uint128_t)20000000 * p->timebase.denom / p->timebase.numer);
   // Apple hv_vcpu_run_until: absolute mach time, finite VMX preemption timer.
@@ -462,7 +524,19 @@ static int run_once(struct probe *p, const struct phase_case *spec) {
   returned(p, "hv_vcpu_run_until", result, p->vcpu, deadline, duration);
   if (spec->armed)
     TRY(gate(p, "run_return_ready"));
+  hv_return_t idle_result = HV_SUCCESS;
+  if (spec->observer == OBSERVER_INTERRUPT) {
+    uint64_t idle_after = 0;
+    idle_result =
+        CALL(p, "hv_vcpu_get_idle_time",
+             hv_vcpu_get_idle_time(p->vcpu, &idle_after), p->vcpu, 0, 0);
+    if (idle_result == HV_SUCCESS)
+      fact(p, "idle_time_delta", "fact", idle_after >= idle_before ? 0 : 77,
+           idle_before, idle_after,
+           idle_after >= idle_before ? idle_after - idle_before : 0);
+  }
   TRY(status(p, result));
+  TRY(status(p, idle_result));
   uint64_t reason = 0, rip = 0, length = 0;
   TRY(status(p,
              CALL(p, "hv_vmx_vcpu_read_vmcs",
@@ -471,19 +545,30 @@ static int run_once(struct probe *p, const struct phase_case *spec) {
   TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
                      hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_GUEST_RIP, &rip),
                      VMCS_GUEST_RIP, 0, 0)));
-  if (p->guest->instruction_length != 0)
+  if (p->guest->instruction_length != 0 &&
+      (spec->observer != OBSERVER_INTERRUPT ||
+       (!(reason & (1ULL << 31)) &&
+        (reason & 0xffff) == p->guest->exit_reason)))
     TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
                        hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_RO_VMEXIT_INSTR_LEN,
                                              &length),
                        VMCS_RO_VMEXIT_INSTR_LEN, 0, 0)));
   uint8_t actual = *(volatile uint8_t *)(p->memory + SENTINEL);
   fact(p, "guest_observation", "fact", 0, actual, rip, length);
+  if (spec->observer == OBSERVER_INTERRUPT) {
+    uint64_t activity = 0;
+    TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
+                       hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_GUEST_ACTIVITY_STATE,
+                                             &activity),
+                       VMCS_GUEST_ACTIVITY_STATE, 0, 0)));
+    fact(p, "interrupt_guest_state", "fact", 0, reason, rip, activity);
+  }
   // SDM appendix C: bit 31 marks VM-entry failure.
   bool length_matches = p->guest->instruction_length == 0 ||
                         length == p->guest->instruction_length;
-  p->guest_verified = !(reason & (1ULL << 31)) &&
-                      (reason & 0xffff) == p->guest->exit_reason &&
-                      actual == TAG && rip == CODE + 5 && length_matches;
+  p->guest_verified =
+      !(reason & (1ULL << 31)) && (reason & 0xffff) == p->guest->exit_reason &&
+      actual == TAG && rip == CODE + p->guest->rip_offset && length_matches;
   fact(p, p->guest_verified ? p->guest->verified_fact : "guest_not_established",
        "fact", p->guest_verified ? 0 : 77, reason, rip, length);
   return p->guest_verified ? 0 : 77;
@@ -491,7 +576,8 @@ static int run_once(struct probe *p, const struct phase_case *spec) {
 
 static int watched_run(struct probe *p, const struct phase_case *spec) {
   uint64_t owner_tid = 0;
-  if (spec->observer == OBSERVER_THREADINFO) {
+  if (spec->observer == OBSERVER_THREADINFO ||
+      spec->observer == OBSERVER_INTERRUPT) {
     if (!before(p, "pthread_threadid_np", 0, 0, 0))
       return 74;
     int error = pthread_threadid_np(NULL, &owner_tid);
@@ -640,6 +726,14 @@ int main(int argc, char **argv) {
        .guest = GUEST_CPUID,
        .armed = true,
        .observer = OBSERVER_THREADINFO},
+      {.name = "armed-hlt-interrupt",
+       .armed = true,
+       .observer = OBSERVER_INTERRUPT},
+      {.name = "armed-cpuid-interrupt",
+       .guest = GUEST_CPUID,
+       .armed = true,
+       .observer = OBSERVER_INTERRUPT},
+      {.name = "armed-sti-hlt", .guest = GUEST_STI_HLT, .armed = true},
   };
   int target = -1;
   if (argc == 2)
@@ -651,7 +745,8 @@ int main(int argc, char **argv) {
             "usage: %s "
             "capabilities|vm|vcpu|configure|run|armed-control|armed-run|"
             "armed-cpuid|armed-spin|armed-hlt-watch|armed-hlt-forever|"
-            "armed-hlt-threadinfo|armed-cpuid-threadinfo\n",
+            "armed-hlt-threadinfo|armed-cpuid-threadinfo|"
+            "armed-hlt-interrupt|armed-cpuid-interrupt|armed-sti-hlt\n",
             argv[0]);
     return 64;
   }
