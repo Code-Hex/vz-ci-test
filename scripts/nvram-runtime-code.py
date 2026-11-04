@@ -56,11 +56,11 @@ def function_instructions(text, name, start, end):
 
 ENTRIES = ('com.apple.driver.AppleEFINVRAM', 'com.apple.driver.AppleEFIRuntime')
 EXTRA_SYMBOLS = frozenset((
-    '__ZL19IsMagicVariableNamePKc',
-    '__ZL27MagicVariableNameWithSuffixPKc',
+    '__ZL11ConvertGuidP8EFI_GUID',
+    '__ZL16verifyPermissionPKc16IONVRAMOperationP8EFI_GUID',
+    '__ZL24keyWithGuidAndUTF8StringRK8EFI_GUIDPKc',
     '__ZL17ParseVariableNamePKcP8EFI_GUIDPS0_',
     '__ZNK13AppleEFINVRAM16skipCacheForGUIDEPK8EFI_GUID',
-    '__ZN13AppleEFINVRAM14backupBootPathEv',
     '__ZN13AppleEFINVRAM16restorePanicInfoEv',
 ))
 

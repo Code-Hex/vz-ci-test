@@ -62,6 +62,31 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(len([c for c in result['candidates'] if c['name'] == duplicate]), 1)
         self.assertTrue(next(c for c in result['candidates'] if c['name'] == duplicate)['ambiguous'])
 
+    def test_namespace_helpers_are_selected_by_exact_name(self):
+        helpers = (
+            '__ZL11ConvertGuidP8EFI_GUID',
+            '__ZL16verifyPermissionPKc16IONVRAMOperationP8EFI_GUID',
+            '__ZL24keyWithGuidAndUTF8StringRK8EFI_GUIDPKc',
+        )
+        census = probe.SymbolCensus()
+        for i in range(25):
+            census.feed(f'{i:08x} T __ZN13AppleEFINVRAM11setVariable{i}Ev')
+        for i, name in enumerate(helpers, 25):
+            census.feed(f'{i:08x} t {name}')
+        for i, name in enumerate(helpers, 28):
+            census.feed(f'{i:08x} t {name}_other')
+        census.feed('00000040 T _end')
+        result = census.finish()
+        selected = {c['name']: (c['start'], c['end'], c['ambiguous'])
+                    for c in result['candidates'] if c['name'] in helpers}
+        self.assertEqual(selected, {
+            '__ZL11ConvertGuidP8EFI_GUID': (25, 26, False),
+            '__ZL16verifyPermissionPKc16IONVRAMOperationP8EFI_GUID': (26, 27, False),
+            '__ZL24keyWithGuidAndUTF8StringRK8EFI_GUIDPKc': (27, 28, False),
+        })
+        self.assertEqual(result['target_count'], 28)
+        self.assertEqual(len(result['candidates']), 27)
+
     def test_candidate_limit_and_order_reversal(self):
         census = probe.SymbolCensus()
         for i in range(25):
