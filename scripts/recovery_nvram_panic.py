@@ -5,7 +5,9 @@ import re
 MAX_RAW = 16 * 768
 KERNEL_UUID = '87453B1D-A163-31FA-B33B-0FB4BE78E6E8'
 HEADER = re.compile(rb'^panic\(cpu [0-9]+(?: caller (?:0x)?[0-9a-fA-F]+)?\): dtrace: panic action at probe pid[1-9][0-9]*:[^:\r\n]+:vz_nonce_([0-9a-f]{64}):entry \(ecb (?:0x)?[0-9a-fA-F]+\)(?:\r?\n|$)')
-UUID = re.compile(rb'(?im)^Kernel UUID:[ \t]*([0-9a-f-]+)[ \t]*\r?$')
+UUID = re.compile(rb'(?im)^Kernel UUID:[ \t]*([0-9a-f-]+)[ \t]*\r?\n')
+UUID_PREFIX = re.compile(rb'(?im)^Kernel UUID:')
+PANIC_PREFIX = re.compile(rb'(?m)^panic\(')
 
 
 def unpack_a(raw):
@@ -26,27 +28,31 @@ def classify_candidates(candidates, nonce):
         match = HEADER.match(data)
         if not match:
             if data.startswith(b'panic(') and b'\0' not in data:
-                recognized.append({'status': 'truncated', 'encoding': encoding, 'completeness': 'unknown'})
+                recognized.append({'status': 'truncated', 'encoding': encoding, 'terminator_present': False})
             continue
         end = data.find(b'\0')
         text = data if end < 0 else data[:end]
-        uuids = UUID.findall(text)
-        if match.group(1).decode('ascii') != nonce:
+        uuids = UUID.findall(text + (b'\n' if end >= 0 else b''))
+        if len(PANIC_PREFIX.findall(data)) != 1 or len(UUID_PREFIX.findall(data)) > 1:
+            status = 'ambiguous'
+        elif match.group(1).decode('ascii') != nonce:
             status = 'nonce_missing'
-        elif end < 0:
-            status = 'truncated'
-        elif len(data) - end - 1 > (7 if encoding == 'packA' else 0):
-            status = 'truncated'
         elif not uuids:
             status = 'uuid_missing'
         elif len(uuids) != 1 or uuids[0].decode('ascii').upper() != KERNEL_UUID:
             status = 'uuid_mismatch'
         else:
-            status = 'verified'
-        recognized.append({'status': status, 'encoding': encoding, 'completeness': 'unknown'})
+            status = 'fresh_fragment'
+        recognized.append({'status': status, 'encoding': encoding, 'terminator_present': end >= 0})
     if len(recognized) > 1:
-        return {'status': 'ambiguous', 'encoding': None, 'completeness': 'unknown'}
-    return recognized[0] if recognized else {'status': 'unrecognized', 'encoding': None, 'completeness': 'unknown'}
+        selected = {'status': 'ambiguous', 'encoding': None, 'terminator_present': None}
+    elif recognized:
+        selected = recognized[0]
+    else:
+        selected = {'status': 'unrecognized', 'encoding': None, 'terminator_present': None}
+    selected.update(freshness='verified' if selected['status'] == 'fresh_fragment' else 'unverified',
+                    completeness='unknown', packed_tail_bytes=0)
+    return selected
 
 
 def classify(raw, nonce):
@@ -54,18 +60,17 @@ def classify(raw, nonce):
         raise ValueError('invalid nonce')
     if not isinstance(raw, bytes):
         raise TypeError('raw must be bytes')
-    if not raw:
-        return {'status': 'empty', 'encoding': None, 'completeness': 'unknown'}
-    if len(raw) > MAX_RAW:
-        return {'status': 'oversized', 'encoding': None, 'completeness': 'unknown'}
+    if not raw or len(raw) > MAX_RAW:
+        return {'status': 'empty' if not raw else 'oversized', 'encoding': None,
+                'freshness': 'unverified', 'completeness': 'unknown',
+                'terminator_present': None, 'packed_tail_bytes': 0}
     candidates = [('raw', raw)]
-    # A platform may truncate after any byte, so inspect the complete packed prefix.
     packed_length = len(raw) - len(raw) % 7
     if packed_length:
         candidates.append(('packA', unpack_a(raw[:packed_length])))
     result = classify_candidates(candidates, nonce)
-    if result['encoding'] == 'packA' and len(raw) % 7:
-        result['status'] = 'truncated'
+    if result['encoding'] == 'packA':
+        result['packed_tail_bytes'] = len(raw) % 7
     return result
 
 
