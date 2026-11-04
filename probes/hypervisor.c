@@ -181,6 +181,7 @@ struct phase_case {
   enum observer_kind observer;
   hv_vm_options_t vm_flags;
   bool armed, control, forever, cr8_exits, timer_only;
+  unsigned mtf_phase;
 };
 
 struct observer {
@@ -210,6 +211,7 @@ struct probe {
   bool marker_locked;
   bool vm_created, mapped, cpu_created, cleaning, output_failed, guest_verified;
   bool observer_active, cr8_exits, timer_only;
+  unsigned mtf_phase;
 };
 
 static uint64_t observer_now(const struct observer *o) {
@@ -554,13 +556,27 @@ static int configure(struct probe *p) {
   // run_until enables the timer before applying pending controls; keep it on.
   TRY(control(p, VMCS_CTRL_PIN_BASED, p->timer_only ? (1ULL << 6) : 0, 0,
               &applied));
+  if (p->mtf_phase) {
+    uint64_t must_one = 0, may_one = 0;
+    TRY(status(p, CALL(p, "hv_vmx_vcpu_get_cap_write_vmcs",
+                       hv_vmx_vcpu_get_cap_write_vmcs(
+                           p->vcpu, VMCS_CTRL_CPU_BASED, &must_one, &may_one),
+                       VMCS_CTRL_CPU_BASED, 0, 0)));
+    bool toggle = !(must_one & (1ULL << 27)) && (may_one & (1ULL << 27));
+    fact(p, "mtf_toggle_capability", "fact", toggle ? 0 : 77, must_one, may_one,
+         1ULL << 27);
+    if (!toggle)
+      return 77;
+  }
   uint64_t primary = (1ULL << 31) | (p->timer_only ? 0 : (1ULL << 7));
   // AppleHV 25G76 prepare_cond_vmcs applies primary controls only with
   // both CR8 exits or TPR shadow. This phase tests that coupled condition.
   if (p->cr8_exits)
     primary |= (1ULL << 19) | (1ULL << 20);
+  if (p->mtf_phase)
+    primary |= 1ULL << 27;
   TRY(control(p, VMCS_CTRL_CPU_BASED, primary,
-              (1ULL << 2) | (1ULL << 22) | (1ULL << 27) |
+              (1ULL << 2) | (1ULL << 22) | (p->mtf_phase ? 0 : (1ULL << 27)) |
                   (p->timer_only ? (1ULL << 7) : 0),
               &applied));
   TRY(control(p, VMCS_CTRL_CPU_BASED2, (1ULL << 1) | (1ULL << 7), 1ULL << 14,
@@ -820,6 +836,163 @@ static int run_once(struct probe *p, const struct phase_case *spec) {
   return p->guest_verified ? 0 : 77;
 }
 
+enum { MTF_FIELDS = 10, MTF_REGS = 16 };
+struct mtf_state {
+  uint64_t fields[MTF_FIELDS], regs[MTF_REGS];
+};
+static const uint32_t mtf_fields[MTF_FIELDS] = {VMCS_GUEST_RIP,
+                                                VMCS_GUEST_RSP,
+                                                VMCS_GUEST_RFLAGS,
+                                                VMCS_GUEST_ACTIVITY_STATE,
+                                                VMCS_GUEST_INTERRUPTIBILITY,
+                                                VMCS_CTRL_VMENTRY_IRQ_INFO,
+                                                VMCS_CTRL_PIN_BASED,
+                                                VMCS_CTRL_CPU_BASED,
+                                                VMCS_GUEST_VMX_TIMER_VALUE,
+                                                VMCS_CTRL_VMEXIT_CONTROLS};
+static const hv_x86_reg_t mtf_regs[MTF_REGS] = {
+    HV_X86_RAX, HV_X86_RBX, HV_X86_RCX, HV_X86_RDX, HV_X86_RSI, HV_X86_RDI,
+    HV_X86_RBP, HV_X86_RSP, HV_X86_R8,  HV_X86_R9,  HV_X86_R10, HV_X86_R11,
+    HV_X86_R12, HV_X86_R13, HV_X86_R14, HV_X86_R15};
+
+static int mtf_snapshot(struct probe *p, unsigned stage,
+                        struct mtf_state *state) {
+  for (size_t i = 0; i < MTF_FIELDS; ++i) {
+    TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
+                       hv_vmx_vcpu_read_vmcs(p->vcpu, mtf_fields[i],
+                                             &state->fields[i]),
+                       mtf_fields[i], stage, 0)));
+    fact(p, "mtf_guest_vmcs", "fact", 0, stage, mtf_fields[i],
+         state->fields[i]);
+  }
+  for (size_t i = 0; i < MTF_REGS; ++i) {
+    TRY(status(
+        p, CALL(p, "hv_vcpu_read_register",
+                hv_vcpu_read_register(p->vcpu, mtf_regs[i], &state->regs[i]),
+                mtf_regs[i], stage, 0)));
+    fact(p, "mtf_guest_register", "fact", 0, stage, mtf_regs[i],
+         state->regs[i]);
+  }
+  // A timer value is not a live countdown when the exit-save bit is clear.
+  fact(p, "mtf_timer_save_enabled", "fact", 0, stage,
+       (state->fields[9] >> 22) & 1, state->fields[8]);
+  fact(p, "mtf_snapshot_complete", "fact", 0, stage, state->fields[0],
+       state->fields[3]);
+  return p->output_failed ? 74 : 0;
+}
+
+static int mtf_step(struct probe *p, unsigned stage, uint64_t expected_rip,
+                    uint64_t expected_activity) {
+  uint64_t ticks =
+      (uint64_t)((__uint128_t)20000000 * p->timebase.denom / p->timebase.numer);
+  if (!before(p, "mtf_run_until", p->vcpu, stage, 20000000))
+    return 74;
+  uint64_t deadline = mach_absolute_time() + (ticks ? ticks : 1);
+  hv_return_t rc = hv_vcpu_run_until(p->vcpu, deadline);
+  returned(p, "mtf_run_until", rc, p->vcpu, stage, deadline);
+  TRY(status(p, rc));
+  uint64_t reason = 0, rip = 0, activity = 0;
+  TRY(status(p,
+             CALL(p, "hv_vmx_vcpu_read_vmcs",
+                  hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_RO_EXIT_REASON, &reason),
+                  VMCS_RO_EXIT_REASON, stage, 0)));
+  TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
+                     hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_GUEST_RIP, &rip),
+                     VMCS_GUEST_RIP, stage, 0)));
+  TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
+                     hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_GUEST_ACTIVITY_STATE,
+                                           &activity),
+                     VMCS_GUEST_ACTIVITY_STATE, stage, 0)));
+  uint64_t tag = *(volatile uint8_t *)(p->memory + SENTINEL);
+  bool valid = !(reason & (1ULL << 31)) && (reason & 0xffff) == 37 &&
+               rip == expected_rip && activity == expected_activity &&
+               tag == TAG;
+  fact(p, "mtf_exit", "fact", valid ? 0 : 77, reason, rip, activity);
+  fact(p, "mtf_exit_tag", "fact", valid ? 0 : 77, stage, tag, 0);
+  if (!valid) {
+    fact(p, "mtf_unexpected_exit", "fact", 77, reason, stage, 0);
+    return 77;
+  }
+  return p->output_failed ? 74 : 0;
+}
+
+static int run_mtf(struct probe *p, const struct phase_case *spec) {
+  struct mtf_state before_state = {0}, after_state = {0};
+  TRY(mtf_step(p, 1, CODE + p->profile->mov_length, 0));
+  if (spec->mtf_phase == 1) {
+    p->guest_verified = true;
+    fact(p, "mtf_mov_verified", "fact", 0, 37, CODE + p->profile->mov_length,
+         TAG);
+    return p->output_failed ? 74 : 0;
+  }
+  TRY(mtf_step(p, 2, CODE + p->profile->mov_length + 1, 1));
+  TRY(mtf_snapshot(p, 2, &before_state));
+  uint64_t primary = before_state.fields[7];
+  if (before_state.fields[0] != CODE + p->profile->mov_length + 1 ||
+      before_state.fields[3] != 1 || !(primary & (1ULL << 27)) ||
+      (primary & (1ULL << 7)) ||
+      (primary & ((1ULL << 19) | (1ULL << 20))) !=
+          ((1ULL << 19) | (1ULL << 20)))
+    return 77;
+  p->guest_verified = true;
+  fact(p, "mtf_hlt_verified", "fact", 0, 37, before_state.fields[0],
+       before_state.fields[3]);
+  TRY(gate(p, "mtf_checkpoint_ready"));
+  if (spec->mtf_phase == 2)
+    return p->output_failed ? 74 : 0;
+  uint64_t must_one = 0, may_one = 0;
+  TRY(status(p, CALL(p, "hv_vmx_vcpu_get_cap_write_vmcs",
+                     hv_vmx_vcpu_get_cap_write_vmcs(
+                         p->vcpu, VMCS_CTRL_CPU_BASED, &must_one, &may_one),
+                     VMCS_CTRL_CPU_BASED, 0, 0)));
+  if (must_one & (1ULL << 27))
+    return 77;
+  TRY(write_field(p, VMCS_CTRL_CPU_BASED, primary & ~(1ULL << 27)));
+  TRY(mtf_snapshot(p, 3, &after_state));
+  bool same = after_state.fields[7] == (primary & ~(1ULL << 27));
+  for (size_t i = 0; i < MTF_FIELDS; ++i)
+    if (i != 7 && i != 8 && before_state.fields[i] != after_state.fields[i])
+      same = false;
+  for (size_t i = 0; i < MTF_REGS; ++i)
+    if (before_state.regs[i] != after_state.regs[i])
+      same = false;
+  if (after_state.fields[5] & (1ULL << 31))
+    same = false;
+  fact(p, "mtf_resume_compared_scope", "fact", 0, VMCS_GUEST_VMX_TIMER_VALUE,
+       VMCS_CTRL_CPU_BASED, 1ULL << 27);
+  fact(p, "mtf_resume_state_equal", "fact", same ? 0 : 77,
+       before_state.fields[0], after_state.fields[0], after_state.fields[3]);
+  if (!same)
+    return 77;
+  uint64_t ticks =
+      (uint64_t)((__uint128_t)20000000 * p->timebase.denom / p->timebase.numer);
+  if (!before(p, "mtf_resume_run_until", p->vcpu, 0, 20000000))
+    return 74;
+  uint64_t deadline = mach_absolute_time() + (ticks ? ticks : 1);
+  hv_return_t rc = hv_vcpu_run_until(p->vcpu, deadline);
+  returned(p, "mtf_resume_run_until", rc, p->vcpu, deadline, 20000000);
+  TRY(status(p, rc));
+  uint64_t reason = 0, rip = 0, activity = 0;
+  TRY(status(p,
+             CALL(p, "hv_vmx_vcpu_read_vmcs",
+                  hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_RO_EXIT_REASON, &reason),
+                  VMCS_RO_EXIT_REASON, 0, 0)));
+  TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
+                     hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_GUEST_RIP, &rip),
+                     VMCS_GUEST_RIP, 0, 0)));
+  TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
+                     hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_GUEST_ACTIVITY_STATE,
+                                           &activity),
+                     VMCS_GUEST_ACTIVITY_STATE, 0, 0)));
+  bool timer_exit = !(reason & (1ULL << 31)) && (reason & 0xffff) == 52 &&
+                    rip == CODE + p->profile->mov_length + 1 && activity == 1;
+  fact(p, "mtf_resume_exit", "fact", timer_exit ? 0 : 77, reason, rip,
+       activity);
+  if (p->output_failed)
+    return 74;
+  return timer_exit ? 0 : 77;
+}
+
 static int watched_run(struct probe *p, const struct phase_case *spec) {
   uint64_t owner_tid = 0;
   if (spec->observer == OBSERVER_THREADINFO ||
@@ -921,6 +1094,8 @@ static int execute(struct probe *p, int target, const struct phase_case *spec) {
   if (spec->observer == OBSERVER_KERNELMARKERS)
     TRY(prepare_kernel_markers(p));
   TRY(prepare_run(p, spec->armed));
+  if (spec->mtf_phase)
+    return run_mtf(p, spec);
   return spec->observer != OBSERVER_NONE ? watched_run(p, spec)
                                          : run_once(p, spec);
 }
@@ -1090,6 +1265,27 @@ int main(int argc, char **argv) {
        .paging = PAGING_ENABLED,
        .cr8_exits = true,
        .timer_only = true},
+      {.name = "mtf-mov",
+       .guest = GUEST_HLT_TIMER,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .cr8_exits = true,
+       .timer_only = true,
+       .mtf_phase = 1},
+      {.name = "mtf-hlt-observe",
+       .guest = GUEST_HLT_TIMER,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .cr8_exits = true,
+       .timer_only = true,
+       .mtf_phase = 2},
+      {.name = "mtf-hlt-resume",
+       .guest = GUEST_HLT_TIMER,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .cr8_exits = true,
+       .timer_only = true,
+       .mtf_phase = 3},
   };
   int target = -1;
   if (argc == 2)
@@ -1113,7 +1309,8 @@ int main(int argc, char **argv) {
             "armed-protected32-paging-cpuid-cr8-kernelmarkers|"
             "armed-protected32-paging-hlt-cr8-kernelmarkers|"
             "protected32-paging-spin-cr8-timer|"
-            "protected32-paging-hlt-cr8-timer\n",
+            "protected32-paging-hlt-cr8-timer|mtf-mov|mtf-hlt-observe|mtf-hlt-"
+            "resume\n",
             argv[0]);
     return 64;
   }
@@ -1122,7 +1319,8 @@ int main(int argc, char **argv) {
                     .profile = &profiles[phases[target].mode],
                     .paging = &paging_profiles[phases[target].paging],
                     .cr8_exits = phases[target].cr8_exits,
-                    .timer_only = phases[target].timer_only};
+                    .timer_only = phases[target].timer_only,
+                    .mtf_phase = phases[target].mtf_phase};
   if (mach_timebase_info(&p.timebase) != KERN_SUCCESS || p.timebase.denom == 0)
     return 71;
   fact(&p, "probe_start", "fact", 0, (uint64_t)target, 0, 0);

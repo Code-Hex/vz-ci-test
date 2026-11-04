@@ -1,0 +1,55 @@
+name: Intel MTF halt boundary
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Observe HLT or also resume the halted vCPU
+        required: true
+        type: choice
+        options:
+          - observe
+          - resume
+        default: observe
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  verify:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-26-intel
+    timeout-minutes: 5
+    steps:
+      - name: Check out trusted diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build the signed native probe
+        run: bash scripts/build-hypervisor.sh
+      - name: Verify CPUID and HLT exit controls
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify-cr8-controls.py "$RUNNER_TEMP/debug/probes/hypervisor"
+      - name: Verify the MTF instruction control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify-mtf-controls.py "$RUNNER_TEMP/debug/probes/hypervisor" mtf-mov
+      - name: Observe the natural HLT state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify-mtf-controls.py "$RUNNER_TEMP/debug/probes/hypervisor" mtf-hlt-observe
+      - name: Resume the natural HLT state
+        if: ${{ inputs.phase == 'resume' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify-mtf-controls.py "$RUNNER_TEMP/debug/probes/hypervisor" mtf-hlt-resume
+      - name: Preserve MTF observations
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mtf-controls-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/debug/mtf-controls/
+            ${{ runner.temp }}/debug/cr8-controls/
+          if-no-files-found: warn
