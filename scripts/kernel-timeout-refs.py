@@ -26,7 +26,7 @@ def find_symbol(text, name):
         if len(fields) >= 3 and fields[-1] == name and re.fullmatch(r"[0-9a-fA-F]+", fields[0]):
             addresses.add(int(fields[0], 16))
     if len(addresses) != 1:
-        raise ValueError("missing or ambiguous symbol")
+        raise ValueError("symbol_missing" if not addresses else "symbol_ambiguous")
     return addresses.pop()
 
 
@@ -103,9 +103,9 @@ def parse_disassembly(lines, target, symbol, known_handler):
             if owner == known_handler:
                 known = True
                 handler_access.add(access)
-            if len(references) < 64 and (owner == known_handler or len(references) < 62):
-                references.append({"function": owner, "address": "0x%x" % address, "evidence": evidence, "access": access})
-                group = functions.setdefault(owner, {"function": owner, "context": [], "context_truncated": False, "tail": 0})
+            if len(references) < 64 and (known_handler is None or owner == known_handler or len(references) < 62):
+                references.append({"symbol_hint": owner, "address": "0x%x" % address, "evidence": evidence, "access": access})
+                group = functions.setdefault(owner, {"symbol_hint": owner, "context": [], "context_truncated": False, "tail": 0})
                 add_context(group, list(history) + [text])
                 group["tail"] = 3
             else:
@@ -130,7 +130,7 @@ def parse_disassembly(lines, target, symbol, known_handler):
     for group in functions.values():
         group.pop("tail")
         output.append(group)
-    return {"references": references, "functions": output, "total_matches": total,
+    return {"references": references, "symbol_hints": output, "total_matches": total,
             "truncated": clipped, "known_handler_xref": known, "handler_access": sorted(handler_access)}
 
 
@@ -148,6 +148,46 @@ def disassemble(binary, target, symbol, handler):
             process.kill()
             process.wait()
         process.stdout.close()
+
+
+def analyze_binary(binary, nm, target_symbol=TARGET, handler_symbol=HANDLER, on_metadata=None):
+    result = {"status": "unsupported", "known_handler_xref": False,
+              "scope": "symbol_hint is the nearest named label, not necessarily the actual function; direct static references only; indirect references, kernel collections, fixups and closed kexts are not excluded; address-taking does not prove a write"}
+    try:
+        target = find_symbol(nm, target_symbol)
+    except ValueError as error:
+        result["reason_enum"] = "target_missing" if str(error) == "symbol_missing" else "target_ambiguous"
+        if on_metadata:
+            on_metadata(result.copy())
+        return result
+    result["target_address"] = "0x%x" % target
+    try:
+        handler = find_symbol(nm, handler_symbol)
+    except ValueError as error:
+        handler = None
+        result["reason_enum"] = "handler_missing" if str(error) == "symbol_missing" else "handler_ambiguous"
+        result["handler_state"] = result["reason_enum"]
+    else:
+        result["handler_address"] = "0x%x" % handler
+        result["handler_state"] = "found"
+    if on_metadata:
+        on_metadata(result.copy())
+    try:
+        scan = disassemble(binary, target, target_symbol, handler_symbol if handler is not None else None)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        result["reason_enum"] = "disassembly_failed"
+        result["error_kind"] = type(error).__name__
+        return result
+    result.update(scan)
+    access = set(scan["handler_access"])
+    if handler is None:
+        return result
+    if scan["known_handler_xref"] and "read" in access and ("write" in access or "address" in access):
+        result["status"] = "direct_refs_observed"
+        result["reason_enum"] = "known_handler_verified"
+    else:
+        result["reason_enum"] = "known_handler_unverified"
+    return result
 
 
 def positive_control():
@@ -177,24 +217,21 @@ def validate_runner():
 
 def main():
     result = {"event": "kernel_timeout_refs", "status": "unsupported", "kernel_uuid": UUID}
+    stage = "runner_guard_failed"
     try:
         validate_runner()
+        stage = "positive_control_failed"
         result["positive_control"] = positive_control()
         if not result["positive_control"]:
             raise ValueError("synthetic Mach-O control failed")
+        stage = "nm_failed"
         nm = subprocess.check_output(["xcrun", "nm", "-n", KERNEL], text=True, stderr=subprocess.DEVNULL, timeout=90)
-        target = find_symbol(nm, TARGET)
-        handler = find_symbol(nm, HANDLER)
-        result.update({"target_address": "0x%x" % target, "handler_address": "0x%x" % handler})
-        scan = disassemble(KERNEL, target, TARGET, HANDLER)
-        result.update(scan)
-        access = set(scan["handler_access"])
-        if scan["known_handler_xref"] and "read" in access and ("write" in access or "address" in access):
-            result["status"] = "direct_refs_observed"
-            result["scope"] = "direct static references only; indirect references, kernel collections, fixups and closed kexts are not excluded; address-taking does not prove a write"
-        else:
-            result["reason"] = "known handler read and write/address references not verified; scan cannot exclude consumers"
+        def publish_metadata(metadata):
+            print(json.dumps({"event": "kernel_symbol_metadata", **metadata}, separators=(",", ":")), flush=True)
+
+        result.update(analyze_binary(KERNEL, nm, on_metadata=publish_metadata))
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        result["reason_enum"] = stage
         result["error_kind"] = type(error).__name__
     runner_temp = os.environ.get("RUNNER_TEMP")
     if runner_temp and Path(runner_temp).is_dir():
