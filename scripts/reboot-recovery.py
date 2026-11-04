@@ -7,6 +7,7 @@ from pathlib import Path
 import plistlib
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -35,18 +36,51 @@ def binding(ctx):
     return ctx["run_id"] + "/" + ctx["attempt"] + "/" + ctx["sha"]
 
 
-def details_url(ctx):
-    return "https://github.com/Code-Hex/vz-ci-test/actions/runs/" + ctx["run_id"] + "/attempts/" + ctx["attempt"]
-
-
 def select_check(checks, ctx):
     matches = [c for c in checks if c.get("name") == "Runner recovery " + ctx["run_id"] and
                c.get("external_id") == binding(ctx) and c.get("head_sha") == ctx["sha"] and
                c.get("app", {}).get("slug") == "github-actions" and c.get("app", {}).get("id") == 15368 and
-               c.get("details_url") == details_url(ctx)]
+               type(c.get("id")) is int and c["id"] > 0 and
+               c.get("details_url") == "https://github.com/Code-Hex/vz-ci-test/runs/" + str(c["id"])]
     if len(matches) > 1:
         raise ValueError("duplicate matching check")
     return matches[0] if matches else None
+
+
+def cleanup_identity(check, check_id, current):
+    if not isinstance(check_id, str) or not re.fullmatch(r"[1-9][0-9]{0,19}", check_id):
+        return False
+    external = check.get("external_id")
+    if not isinstance(external, str):
+        return False
+    match = re.fullmatch(r"([1-9][0-9]{0,19})/([1-9][0-9]{0,4})/([0-9a-f]{40})", external)
+    if not match or match.group(1) == current.get("run_id"):
+        return False
+    old = {"run_id": match.group(1), "attempt": match.group(2), "sha": match.group(3)}
+    return (type(check.get("id")) is int and str(check["id"]) == check_id and
+            select_check([check], old) is not None)
+
+
+def cleanup_eligible(check, check_id, current):
+    return cleanup_identity(check, check_id, current) and check.get("status") in {"queued", "in_progress", "waiting", "requested", "pending"}
+
+
+def cleanup_old_check(ctx, token, check_id):
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", check_id):
+        raise ValueError("invalid cleanup check identifier")
+    check = api("GET", CHECKS + "/" + check_id, token)
+    if not cleanup_identity(check, check_id, ctx):
+        raise ValueError("cleanup check identity rejected")
+    if cleanup_eligible(check, check_id, ctx):
+        api("PATCH", CHECKS + "/" + check_id, token,
+            {"status": "completed", "conclusion": "cancelled",
+             "output": {"title": "Prior recovery attempt cancelled", "summary": "Superseded recovery attempt."}})
+        status = "cancelled"
+    elif check.get("status") == "completed":
+        status = "already_completed"
+    else:
+        raise ValueError("cleanup check status unknown")
+    print(json.dumps({"event": "cleanup_check", "id": int(check_id), "status": status}), flush=True)
 
 
 def reboot_observed(before, after):
@@ -238,7 +272,7 @@ def prepare_root(payload):
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "public_key", "binding": binding(ctx),
                           "nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public})
     check = api("POST", CHECKS, token, {"name": "Runner recovery " + ctx["run_id"], "head_sha": ctx["sha"],
-                "external_id": binding(ctx), "details_url": details_url(ctx), "status": "in_progress",
+                "external_id": binding(ctx), "status": "in_progress",
                 "output": {"title": "Awaiting controller", "summary": summary}})
     if not isinstance(check.get("id"), int) or check["id"] <= 0:
         raise ValueError("invalid check identifier")
@@ -397,53 +431,64 @@ def controller(ctx, token):
     check_id = None
     pending = None
     sealed = False
-    while time.monotonic() < deadline:
-        try:
-            check = list_check(ctx, token)
-            if check:
-                if check_id is not None and check_id != check["id"]:
-                    raise ValueError("check identity changed")
-                check_id = check["id"]
-                data = json.loads(check.get("output", {}).get("summary", "{}"))
-                if check.get("status") == "completed":
-                    if (pending is not None and check.get("conclusion") == "success" and
-                            boot_proof_matches(data, pending, ctx)):
-                        print(json.dumps({"event": "controller_boot_proof", "check_id": check_id}), flush=True)
-                        return
-                    raise ValueError("check completed without boot proof")
-                if data.get("phase") == "public_key" and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx):
-                    nonce, baseline, public = data.get("nonce", ""), data.get("baseline_boot_uuid", ""), data.get("public_key", "")
-                    if not re.fullmatch(r"[0-9a-f]{64}", nonce) or not re.fullmatch(r"[0-9A-Fa-f-]{36}", baseline):
-                        raise ValueError("nonce or baseline invalid")
-                    if pending is None:
-                        ciphertext = encrypt_token(public.encode(), token)
-                        pending = {"nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public,
-                                   "ciphertext": base64.b64encode(ciphertext).decode()}
-                    if (nonce, baseline, public) != (pending["nonce"], pending["baseline_boot_uuid"], pending["public_key"]):
-                        raise ValueError("public key metadata changed")
-                    sealed_summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "sealed_token", "binding": binding(ctx),
-                                                 "nonce": nonce, "baseline_boot_uuid": baseline, "ciphertext": pending["ciphertext"]})
-                    api("PATCH", CHECKS + "/" + str(check_id), token,
-                        {"output": {"title": "Controller credential sealed", "summary": sealed_summary}})
-                    sealed = True
-                    print(json.dumps({"event": "controller_token_sealed", "check_id": check_id}), flush=True)
-                elif pending is not None and (sealed_matches(data, pending, ctx) or armed_matches(data, pending, ctx)):
-                    if not sealed:
-                        print(json.dumps({"event": "controller_token_sealed_recovered", "check_id": check_id}), flush=True)
-                    sealed = True
-        except (OSError, urllib.error.URLError, subprocess.SubprocessError):
-            pass
-        time.sleep(min(3, max(0, deadline - time.monotonic())))
-    if check_id is not None:
-        try:
-            current = api("GET", CHECKS + "/" + str(check_id), token, timeout=5)
-            if select_check([current], ctx) is not None and current.get("status") != "completed":
-                api("PATCH", CHECKS + "/" + str(check_id), token,
-                    {"status": "completed", "conclusion": "failure", "output": {"title": "Recovery not observed",
-                     "summary": "Controller timed out; this does not prove a reboot or kernel failure."}}, timeout=5)
-        except (OSError, urllib.error.URLError, ValueError):
-            pass
-    raise RuntimeError("controller timed out")
+    proof = False
+
+    def interrupted(_signum, _frame):
+        raise SystemExit(143)
+
+    previous = signal.signal(signal.SIGTERM, interrupted)
+    try:
+        while time.monotonic() < deadline:
+            try:
+                check = list_check(ctx, token)
+                if check:
+                    if check_id is not None and check_id != check["id"]:
+                        raise ValueError("check identity changed")
+                    check_id = check["id"]
+                    data = json.loads(check.get("output", {}).get("summary", "{}"))
+                    if check.get("status") == "completed":
+                        if (pending is not None and check.get("conclusion") == "success" and
+                                boot_proof_matches(data, pending, ctx)):
+                            print(json.dumps({"event": "controller_boot_proof", "check_id": check_id}), flush=True)
+                            proof = True
+                            return
+                        raise ValueError("check completed without boot proof")
+                    if data.get("phase") == "public_key" and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx):
+                        nonce, baseline, public = data.get("nonce", ""), data.get("baseline_boot_uuid", ""), data.get("public_key", "")
+                        if not re.fullmatch(r"[0-9a-f]{64}", nonce) or not re.fullmatch(r"[0-9A-Fa-f-]{36}", baseline):
+                            raise ValueError("nonce or baseline invalid")
+                        if pending is None:
+                            ciphertext = encrypt_token(public.encode(), token)
+                            pending = {"nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public,
+                                       "ciphertext": base64.b64encode(ciphertext).decode()}
+                        if (nonce, baseline, public) != (pending["nonce"], pending["baseline_boot_uuid"], pending["public_key"]):
+                            raise ValueError("public key metadata changed")
+                        sealed_summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "sealed_token", "binding": binding(ctx),
+                                                     "nonce": nonce, "baseline_boot_uuid": baseline, "ciphertext": pending["ciphertext"]})
+                        api("PATCH", CHECKS + "/" + str(check_id), token,
+                            {"output": {"title": "Controller credential sealed", "summary": sealed_summary}})
+                        sealed = True
+                        print(json.dumps({"event": "controller_token_sealed", "check_id": check_id}), flush=True)
+                    elif pending is not None and (sealed_matches(data, pending, ctx) or armed_matches(data, pending, ctx)):
+                        if not sealed:
+                            print(json.dumps({"event": "controller_token_sealed_recovered", "check_id": check_id}), flush=True)
+                        sealed = True
+            except (OSError, urllib.error.URLError, subprocess.SubprocessError):
+                pass
+            time.sleep(min(3, max(0, deadline - time.monotonic())))
+        raise RuntimeError("controller timed out")
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        if not proof:
+            if check_id is not None:
+                try:
+                    current = api("GET", CHECKS + "/" + str(check_id), token, timeout=5)
+                    if select_check([current], ctx) is not None and current.get("status") != "completed":
+                        api("PATCH", CHECKS + "/" + str(check_id), token,
+                            {"status": "completed", "conclusion": "failure", "output": {"title": "Recovery not observed",
+                             "summary": "Controller stopped before recovery proof; this does not prove a reboot or kernel failure."}}, timeout=5)
+                except (OSError, urllib.error.URLError, ValueError):
+                    pass
 
 
 def main():
@@ -457,6 +502,9 @@ def main():
         if op != "reboot" and not token:
             raise ValueError("GITHUB_TOKEN missing")
         if op == "controller":
+            cleanup_id = os.environ.get("RECOVERY_CLEANUP_CHECK_ID", "")
+            if cleanup_id:
+                cleanup_old_check(ctx, token, cleanup_id)
             controller(ctx, token)
         elif op == "prepare":
             print(sudo_call("prepare-root", {"context": ctx, "token": token}, timeout=120), end="", flush=True)

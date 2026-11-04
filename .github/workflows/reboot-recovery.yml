@@ -2,6 +2,12 @@ name: Intel normal reboot recovery
 
 on:
   workflow_dispatch:
+    inputs:
+      cleanup_check:
+        description: Unfinished recovery check from an earlier run
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -23,6 +29,7 @@ jobs:
       - name: Keep the recovery controller token alive until completion
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RECOVERY_CLEANUP_CHECK_ID: ${{ inputs.cleanup_check }}
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py controller
   verify:
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
