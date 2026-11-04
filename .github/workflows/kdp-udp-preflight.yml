@@ -1,0 +1,44 @@
+name: Intel KDP UDP network preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  probe:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
+    name: UDP ${{ matrix.role }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: intel
+            os: macos-26-intel
+          - role: receiver
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 4
+    env:
+      KDP_ROLE: ${{ matrix.role }}
+      KDP_STUN_HOST: stun.cloudflare.com
+      KDP_STUN_PORT: '3478'
+    steps:
+      - name: Check out trusted diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check UDP connectivity with disposable identifiers
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/kdp-udp-preflight.py
+      - name: Preserve the bounded network result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kdp-udp-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/debug/kdp-udp-preflight.json
+          if-no-files-found: warn
