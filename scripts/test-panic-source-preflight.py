@@ -48,7 +48,7 @@ class Preflight(unittest.TestCase):
         data = f'READY\nHIT pid456:helper:{name}:return\n'.encode()
         result = p.event_facts(data, 456, name)
         self.assertEqual(result, {'ready_count': 1, 'hit_count': 1, 'provider_exact': True,
-                                  'function_exact': True, 'name_exact': False})
+                                  'function_exact': True, 'name_exact': False, 'nonempty_line_count': 2})
         self.assertNotIn(name, str(result))
         self.assertEqual(p.stderr_kind(b'dtrace: permission denied: secret'), 'permission')
         self.assertEqual(p.stderr_kind(b'dtrace: strange details'), 'other')
@@ -62,6 +62,13 @@ class Preflight(unittest.TestCase):
             finally: __import__('os').umask(old)
             self.assertEqual(path.stat().st_mode & 0o777, 0o644)
             self.assertEqual(__import__('json').loads(path.read_text()), {'status': 'failed'})
+
+    def test_probe_events_allow_only_surrounding_whitespace(self):
+        name = 'vz_nonce_' + 'a' * 64
+        hit = f'HIT pid456:helper:{name}:entry'.encode()
+        self.assertTrue(p.events_valid(b'\n  READY\r\n\n  ' + hit + b'  \n\n', 456, name))
+        for data in (b'READY\nunknown\n' + hit + b'\n', b'READY\n' + hit + b'\n' + hit + b'\n'):
+            self.assertFalse(p.events_valid(data, 456, name))
 
     def test_events_only_exact_once_in_order(self):
         name = 'vz_nonce_' + 'a' * 64

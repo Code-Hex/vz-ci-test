@@ -43,7 +43,7 @@ def parse_probe_list(text, pid, name):
 
 
 def events_valid(data, pid, name):
-    lines = data.splitlines()
+    lines = [line.strip() for line in data.splitlines() if line.strip()]
     if len(lines) != 2 or lines[0] != b'READY': return False
     pattern = rb'HIT pid' + str(pid).encode() + rb':[A-Za-z0-9_.+-]+:' + re.escape(name.encode()) + rb':entry'
     return bool(re.fullmatch(pattern, lines[1]))
@@ -54,6 +54,7 @@ def event_facts(data, pid, name):
     hits = [line[4:].split(b':') for line in lines if line.startswith(b'HIT ')]
     fields = hits[0] if len(hits) == 1 and len(hits[0]) == 4 else None
     return {'ready_count': lines.count(b'READY'), 'hit_count': len(hits),
+            'nonempty_line_count': sum(bool(line) for line in lines),
             'provider_exact': fields[0] == ('pid' + str(pid)).encode() if fields else None,
             'function_exact': fields[2] == name.encode() if fields else None,
             'name_exact': fields[3] == b'entry' if fields else None}
@@ -156,7 +157,7 @@ def observe(binary, nonce, directory, facts):
                         key.data.write(part); key.data.flush()
                         if key.fileobj is tracer.stdout: data.extend(part)
                         else: err_data.extend(part)
-                        if not released and bytes(data).splitlines() == [b'READY'] and data.endswith(b'\n'):
+                        if not released and [line.strip() for line in bytes(data).splitlines() if line.strip()] == [b'READY'] and data.endswith(b'\n'):
                             helper.stdin.write(b'G'); helper.stdin.flush(); helper.stdin.close(); released = True
                 tracer_code = tracer.wait(timeout=max(0.1, deadline-time.monotonic()))
                 helper_code = helper.wait(timeout=2) if released else helper.poll()
@@ -216,7 +217,7 @@ def main():
         result['helper_sha256'] = hashlib.sha256(binary.read_bytes()).hexdigest()
         result['stage'] = 'probe'
         result['probe_diagnostics'] = {'list_status': 'unavailable', 'list_exit': None, 'list_stderr': 'unavailable',
-                                       'ready_count': 0, 'hit_count': 0, 'provider_exact': None, 'function_exact': None,
+                                       'ready_count': 0, 'hit_count': 0, 'nonempty_line_count': 0, 'provider_exact': None, 'function_exact': None,
                                        'name_exact': None, 'released': False, 'tracer_exit': None, 'helper_exit': None,
                                        'trace_stderr': 'unavailable'}
         observe(binary, nonce, directory, result['probe_diagnostics'])
