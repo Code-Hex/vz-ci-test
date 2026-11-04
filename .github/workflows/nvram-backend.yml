@@ -46,10 +46,29 @@ jobs:
             0|69|70) ;;
             *) exit "$sync_exit" ;;
           esac
+      - name: Measure synchronization after staging two owned variables
+        run: |
+          set -euo pipefail
+          native_python=$(command -v python3)
+          sudo -n /usr/bin/env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            PYTHONDONTWRITEBYTECODE=1 \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            GITHUB_REF="$GITHUB_REF" \
+            GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            GITHUB_SHA="$GITHUB_SHA" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            "$native_python" scripts/nvram-staged-sync.py
       - name: Preserve the direct IOKit results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nvram-backend-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/debug/nvram-backend.jsonl
+          path: |
+            ${{ runner.temp }}/debug/nvram-backend.jsonl
+            ${{ runner.temp }}/debug/nvram-staged-sync.json
           if-no-files-found: error
