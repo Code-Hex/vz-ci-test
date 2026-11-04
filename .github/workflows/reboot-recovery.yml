@@ -76,12 +76,16 @@ jobs:
       - name: Build the guarded quick-reboot helper
         if: ${{ inputs.trigger == 'reboot-quick' }}
         run: xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -std=c11 -Wall -Wextra -Werror -O1 probes/reboot_quick.c -o "$RUNNER_TEMP/recovery-quick-reboot"
+      - name: Build the guarded NVRAM synchronization helper
+        if: ${{ inputs.debug_boot && inputs.trigger == 'reboot-quick' }}
+        run: xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -std=c11 -Wall -Wextra -Werror -O1 probes/nvram_backend.c -framework IOKit -framework CoreFoundation -o "$RUNNER_TEMP/recovery-nvram-backend"
       - name: Publish the runner recovery public key
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RECOVERY_REPORT_CERT: ${{ inputs.report_cert }}
           RECOVERY_FORCE_HELPER: ${{ runner.temp }}/recovery-force-reset
           RECOVERY_QUICK_HELPER: ${{ runner.temp }}/recovery-quick-reboot
+          RECOVERY_NVRAM_HELPER: ${{ runner.temp }}/recovery-nvram-backend
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py prepare
       - name: Receive the controller token and verify the armed reporter
         env:

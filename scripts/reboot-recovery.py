@@ -11,6 +11,7 @@ from pathlib import Path
 import plistlib
 import re
 import secrets
+import selectors
 import stat
 import signal
 import subprocess
@@ -338,6 +339,25 @@ def prepare_root(payload):
         helper_sha = hashlib.sha256(helper_data).hexdigest()
     else:
         helper_sha = ""
+    nvram_helper_sha = ""
+    nvram_source_sha = ""
+    if ctx.get("debug_boot") and ctx.get("trigger") == "reboot-quick":
+        helper_path = payload.get("nvram_helper", "")
+        nvram_source_sha = payload.get("nvram_source_sha256", "")
+        if (not isinstance(helper_path, str) or not os.path.isabs(helper_path) or
+                Path(helper_path).name != "recovery-nvram-backend" or
+                not isinstance(nvram_source_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", nvram_source_sha)):
+            raise ValueError("NVRAM helper metadata invalid")
+        fd = os.open(helper_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError("NVRAM helper must be a regular file")
+            helper_data = stream.read(4 * 1024 * 1024 + 1)
+        if not helper_data or len(helper_data) > 4 * 1024 * 1024:
+            raise ValueError("NVRAM helper size invalid")
+        private_write(directory / "nvram-backend", helper_data)
+        os.chmod(directory / "nvram-backend", 0o700)
+        nvram_helper_sha = hashlib.sha256(helper_data).hexdigest()
     private = directory / "key.pem"
     fd = os.open(private, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as stream:
@@ -359,6 +379,7 @@ def prepare_root(payload):
         raise ValueError("invalid check identifier")
     config = {"context": ctx, "baseline": baseline, "check_id": check["id"], "nonce": nonce, "python": python, "cert_fingerprint": fingerprint, "helper_sha256": helper_sha,
               "debug_boot": ctx.get("debug_boot", False),
+              "nvram_helper_sha256": nvram_helper_sha, "nvram_source_sha256": nvram_source_sha,
               "debug_source_identity": debug_source_identity() if ctx.get("debug_boot", False) else "",
               "arrival_api_ipv4": recovery_arrival.resolve_api()}
     private_write(directory / "config.json", json.dumps(config).encode())
@@ -456,7 +477,7 @@ def debug_source_identity():
     return hashlib.sha256(Path(__file__).read_bytes() + b"\0" + Path(recovery_bootargs.__file__).read_bytes()).hexdigest()
 
 
-DEBUG_EVENTS = ("request", "staged", "intent", "returned", "uncertain", "aborted")
+DEBUG_EVENTS = ("request", "staged", "native_inflight", "native_synced", "native_failed", "rollback_inflight", "rollback_cleanup", "intent", "returned", "uncertain", "aborted")
 DEBUG_REASONS = ("stage_failure", "orphan_stage", "timeout", "interrupted", "exec_error", "rollback_failed", "intent_storage_error", "intent_ack_failure")
 
 
@@ -477,6 +498,16 @@ def read_debug_event(directory, config, event):
         result["reason"] = record["reason"]
     if record.get("nvram_before_rollback") in ("staged", "original", "partial", "unstaged"):
         result["nvram_before_rollback"] = record["nvram_before_rollback"]
+    if event == "native_synced":
+        fact = record.get("native_sync")
+        if not valid_native_sync(fact, config):
+            raise ValueError("native sync evidence invalid")
+        result["native_sync"] = fact
+    if event in ("native_failed", "rollback_cleanup"):
+        fact = record.get("sync_result")
+        if not valid_native_result(fact, cleanup=(event == "rollback_cleanup")):
+            raise ValueError("native failure evidence invalid")
+        result["sync_result"] = fact
     if isinstance(record.get("quick_return"), dict):
         returned = safe_quick_return(json.dumps(record["quick_return"]))
         if returned is not None:
@@ -532,14 +563,250 @@ def debug_reboot_child():
         return {"reason": "timeout", "reboot_pid": child.pid}
 
 
+class NativeSyncUncertain(Exception):
+    pass
+
+
+class NativeSyncFailure(ValueError):
+    def __init__(self, fact):
+        super().__init__("native sync failed")
+        self.fact = fact
+
+
+def native_failure_fact(raw, code):
+    try:
+        if len(raw) > 4096 or type(code) is not int or not -128 <= code <= 255:
+            raise ValueError()
+        rows = [json.loads(line) for line in raw.splitlines()]
+        events = [row for row in rows if isinstance(row, dict) and row.get("event") == "sync"]
+        if len(events) != 1:
+            raise ValueError()
+        event = events[0]
+        if event.get("status") == "returned" and type(event.get("ioreturn")) is int and 0 <= event["ioreturn"] <= 0xffffffff:
+            return {"status": "returned", "exit": code, "ioreturn": event["ioreturn"]}
+        if code == 69 and event.get("status") in ("options_unavailable", "options_type_mismatch"):
+            return {"status": event["status"], "exit": code}
+    except (ValueError, UnicodeDecodeError):
+        pass
+    return {"status": "invalid"}
+
+
+def valid_native_result(fact, cleanup=False):
+    if not isinstance(fact, dict):
+        return False
+    if cleanup:
+        if type(fact.get("sameboot_readback_original")) is not bool:
+            return False
+        fact = {key: value for key, value in fact.items() if key != "sameboot_readback_original"}
+    status = fact.get("status")
+    if status in ("invalid", "failed_or_uncertain"):
+        return set(fact) == {"status"}
+    if status in ("options_unavailable", "options_type_mismatch"):
+        return set(fact) == {"status", "exit"} and type(fact["exit"]) is int and fact["exit"] == 69
+    return (status == "returned" and set(fact) == {"status", "exit", "ioreturn"} and
+            type(fact["exit"]) is int and -128 <= fact["exit"] <= 255 and
+            type(fact["ioreturn"]) is int and 0 <= fact["ioreturn"] <= 0xffffffff)
+
+
+def terminal_native_failure(fact):
+    return (valid_native_result(fact) and
+            ((fact['status'] == 'returned' and fact['exit'] == 70 and fact['ioreturn'] != 0) or
+             (fact['status'] in ('options_unavailable', 'options_type_mismatch') and fact['exit'] == 69)))
+
+
+def native_sync_fact(raw, code, before, after, binary_sha, source_sha):
+    if (code != 0 or len(raw) > 4096 or before != {"boot_args": "staged", "canary": "staged"} or
+            after != {"boot_args": "staged", "canary": "staged"} or
+            not isinstance(binary_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", binary_sha) or
+            not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha)):
+        raise ValueError("native sync failed")
+    try:
+        rows = [json.loads(line) for line in raw.splitlines()]
+    except (ValueError, UnicodeDecodeError) as error:
+        raise ValueError("native sync output invalid") from error
+    events = [row for row in rows if isinstance(row, dict) and row.get("event") == "sync"]
+    if (len(events) != 1 or events[0].get("status") != "returned" or
+            type(events[0].get("ioreturn")) is not int or events[0]["ioreturn"] != 0):
+        raise ValueError("native sync result invalid")
+    return {"exit": 0, "ioreturn": 0, "before_key_states": dict(before), "after_key_states": dict(after), "binary_sha256": binary_sha,
+            "source_sha256": source_sha, "prior_cli_sync": True}
+
+
+def valid_native_sync(fact, config):
+    return (isinstance(fact, dict) and set(fact) == {"exit", "ioreturn", "before_key_states", "after_key_states", "binary_sha256", "source_sha256", "prior_cli_sync"} and
+            type(fact["exit"]) is int and fact["exit"] == 0 and type(fact["ioreturn"]) is int and fact["ioreturn"] == 0 and
+            fact["before_key_states"] == {"boot_args": "staged", "canary": "staged"} and
+            fact["after_key_states"] == {"boot_args": "staged", "canary": "staged"} and
+            fact["binary_sha256"] == config.get("nvram_helper_sha256") and
+            fact["source_sha256"] == config.get("nvram_source_sha256") and fact["prior_cli_sync"] is True and
+            bool(re.fullmatch(r"[0-9a-f]{64}", str(fact["binary_sha256"]))) and
+            bool(re.fullmatch(r"[0-9a-f]{64}", str(fact["source_sha256"]))))
+
+
+def invoke_native_helper(directory, config):
+    helper = directory / "nvram-backend"
+    expected = config.get("nvram_helper_sha256", "")
+    if (not helper.is_file() or helper.is_symlink() or not re.fullmatch(r"[0-9a-f]{64}", str(expected)) or
+            hashlib.sha256(helper.read_bytes()).hexdigest() != expected or boot_uuid() != config["baseline"]):
+        raise ValueError("native helper identity mismatch")
+    try:
+        child = subprocess.Popen([str(helper), "force-sync"], env=helper_env(config), stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, bufsize=0)
+    except OSError:
+        raise
+    except BaseException as error:
+        raise NativeSyncUncertain() from error
+    try:
+        return finish_native_helper(child, config)
+    except NativeSyncUncertain:
+        raise
+    except BaseException as error:
+        raise NativeSyncUncertain() from error
+
+
+def finish_native_helper(child, config):
+    selector = None
+    output = bytearray()
+    deadline = time.monotonic() + 10
+    failed = False
+    try:
+        selector = selectors.DefaultSelector()
+        selector.register(child.stdout, selectors.EVENT_READ)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not selector.select(max(0, left)):
+                failed = True
+                break
+            chunk = os.read(child.stdout.fileno(), min(4097 - len(output), 4096))
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > 4096:
+                failed = True
+                break
+        if failed:
+            try:
+                child.kill()
+            except OSError:
+                pass
+        try:
+            code = child.wait(timeout=max(0.01, deadline - time.monotonic())) if not failed else child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            failed = True
+            try:
+                child.kill()
+            except OSError:
+                pass
+            code = None
+    except BaseException as error:
+        raise NativeSyncUncertain() from error
+    finally:
+        if selector is not None:
+            selector.close()
+        if child.poll() is None:
+            try:
+                child.kill()
+            except OSError:
+                pass
+            while child.poll() is None:
+                try:
+                    child.wait()
+                except KeyboardInterrupt:
+                    continue
+        child.stdout.close()
+    if failed:
+        raise NativeSyncUncertain()
+    try:
+        if boot_uuid() != config["baseline"]:
+            raise NativeSyncUncertain()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise NativeSyncUncertain() from error
+    return bytes(output), code
+
+
+def native_force_sync(directory, config, platform):
+    helper = directory / "nvram-backend"
+    expected = config.get("nvram_helper_sha256", "")
+    if (not helper.is_file() or helper.is_symlink() or not re.fullmatch(r"[0-9a-f]{64}", str(expected)) or
+            hashlib.sha256(helper.read_bytes()).hexdigest() != expected or boot_uuid() != config["baseline"]):
+        raise ValueError("native helper identity mismatch")
+    original = recovery_bootargs.parse_nvram((directory / "debug-boot-original.plist").read_bytes())
+    staged = recovery_bootargs.parse_nvram((directory / "debug-boot-staged.plist").read_bytes())
+    expected_states = {"boot_args": "staged", "canary": "staged"}
+    before = recovery_bootargs.key_states(original, staged, platform.read())[1]
+    if before != expected_states:
+        raise ValueError("native sync precondition changed")
+    output, code = invoke_native_helper(directory, config)
+    try:
+        observed = native_failure_fact(output, code)
+        if terminal_native_failure(observed):
+            raise NativeSyncFailure(observed)
+        if observed != {"status": "returned", "exit": 0, "ioreturn": 0}:
+            raise NativeSyncUncertain()
+        states = recovery_bootargs.key_states(original, staged, platform.read())[1]
+        return native_sync_fact(output, code, before, states, expected, config.get("nvram_source_sha256", ""))
+    except (NativeSyncFailure, NativeSyncUncertain):
+        raise
+    except BaseException as error:
+        raise NativeSyncUncertain() from error
+
+
+def rollback_native_sync(directory, config, platform):
+    original = recovery_bootargs.parse_nvram((directory / "debug-boot-original.plist").read_bytes())
+    if boot_uuid() != config["baseline"] or platform.read() != original:
+        return {"status": "failed_or_uncertain", "sameboot_readback_original": False}
+    try:
+        raw, code = invoke_native_helper(directory, config)
+    except NativeSyncUncertain:
+        raise
+    except (OSError, ValueError, subprocess.SubprocessError):
+        fact = {"status": "failed_or_uncertain"}
+    else:
+        try:
+            fact = native_failure_fact(raw, code)
+            if fact != {"status": "returned", "exit": 0, "ioreturn": 0} and not terminal_native_failure(fact):
+                raise NativeSyncUncertain()
+        except NativeSyncUncertain:
+            raise
+        except BaseException as error:
+            raise NativeSyncUncertain() from error
+    try:
+        fact["sameboot_readback_original"] = boot_uuid() == config["baseline"] and platform.read() == original
+    except (OSError, ValueError, subprocess.SubprocessError):
+        fact["sameboot_readback_original"] = False
+    return fact
+
+
 def debug_owner(directory, config, current):
     if (current != config["baseline"] or config.get("debug_boot") is not True or
             config["context"].get("trigger") not in ("reboot", "reboot-quick") or config.get("debug_source_identity") != debug_source_identity()):
         raise ValueError("debug owner context mismatch")
     read_debug_event(directory, config, "request")
-    for event in ("aborted", "intent"):
+    for event in ("aborted", "intent", "rollback_cleanup"):
         if (directory / ("debug-reboot-" + event + ".json")).exists():
             read_debug_event(directory, config, event)
+            return
+    cleanup_inflight = directory / "debug-reboot-rollback_inflight.json"
+    if cleanup_inflight.exists():
+        read_debug_event(directory, config, "rollback_inflight")
+        if not (directory / "debug-reboot-rollback_cleanup.json").exists():
+            return
+    inflight = directory / "debug-reboot-native_inflight.json"
+    if inflight.exists():
+        try:
+            read_debug_event(directory, config, "native_inflight")
+            settled = False
+            if (directory / "debug-reboot-native_synced.json").exists():
+                read_debug_event(directory, config, "native_synced")
+                settled = True
+            if (directory / "debug-reboot-native_failed.json").exists():
+                failure = read_debug_event(directory, config, "native_failed")
+                if not terminal_native_failure(failure.get("sync_result")) or settled:
+                    return
+                settled = True
+            if not settled:
+                return
+        except (OSError, ValueError, KeyError):
             return
     platform = recovery_bootargs.MacPlatform()
     marker = debug_boot_marker(config)
@@ -551,6 +818,21 @@ def debug_owner(directory, config, current):
             raise ValueError("kernel debugging not permitted")
         recovery_bootargs.stage(directory, marker, platform, private_write, sync_directory)
         debug_event(directory, config, "staged", current)
+        if config["context"].get("trigger") == "reboot-quick":
+            debug_event(directory, config, "native_inflight", current)
+            try:
+                fact = native_force_sync(directory, config, platform)
+            except NativeSyncUncertain:
+                return
+            except NativeSyncFailure as error:
+                if not terminal_native_failure(error.fact):
+                    return
+                debug_event(directory, config, "native_failed", current, sync_result=error.fact)
+                raise
+            except (OSError, ValueError, subprocess.SubprocessError):
+                debug_event(directory, config, "native_failed", current, sync_result={"status": "failed_or_uncertain"})
+                raise
+            debug_event(directory, config, "native_synced", current, native_sync=fact)
         prepared = quick_prepare(directory, config) if config["context"].get("trigger") == "reboot-quick" else None
         debug_event(directory, config, "intent", current)
     except BaseException:
@@ -559,7 +841,14 @@ def debug_owner(directory, config, current):
             return
         try:
             state = recovery_bootargs.rollback(directory, marker, platform, private_write, sync_directory)
+            if config["context"].get("trigger") == "reboot-quick" and (directory / "debug-boot-original.plist").exists():
+                debug_event(directory, config, "rollback_inflight", current)
+                cleanup = rollback_native_sync(directory, config, platform)
+                debug_event(directory, config, "rollback_cleanup", current, sync_result=cleanup)
+                print(json.dumps({"event": "rollback_cleanup", **cleanup}), flush=True)
             debug_event(directory, config, "aborted", current, reason=reason, nvram_before_rollback=state)
+        except NativeSyncUncertain:
+            return
         except BaseException:
             debug_event(directory, config, "aborted", current, reason="rollback_failed")
         return
@@ -780,7 +1069,9 @@ def quick_intent_ack(directory, config, prepared):
             prepared.get("phase") != "quick_prepared"):
         raise ValueError("quick intent context mismatch")
     intent = {**prepared, "phase": "quick_intent",
-              "owner_events": [read_debug_event(directory, config, event) for event in ("staged", "intent")]}
+              "owner_events": [read_debug_event(directory, config, event) for event in ("staged", "native_synced", "intent")]}
+    if not valid_native_sync(intent["owner_events"][1].get("native_sync"), config):
+        raise ValueError("native sync evidence mismatch")
     output = {"title": "Quick reboot intent durable", "summary": json.dumps(intent), "text": ""}
     url = CHECKS + "/" + str(config["check_id"])
     token = (directory / "token").read_text()
@@ -1177,7 +1468,10 @@ def main():
             print(sudo_call("prepare-root", {"context": ctx, "token": token,
                             "report_cert": os.environ.pop("RECOVERY_REPORT_CERT", ""),
                             "force_helper": os.environ.pop("RECOVERY_FORCE_HELPER", ""),
-                            "quick_helper": os.environ.pop("RECOVERY_QUICK_HELPER", "")}, timeout=120), end="", flush=True)
+                            "quick_helper": os.environ.pop("RECOVERY_QUICK_HELPER", ""),
+                            "nvram_helper": os.environ.pop("RECOVERY_NVRAM_HELPER", ""),
+                            "nvram_source_sha256": hashlib.sha256(Path("probes/nvram_backend.c").read_bytes()).hexdigest()
+                            if ctx.get("debug_boot") and ctx.get("trigger") == "reboot-quick" else ""}, timeout=120), end="", flush=True)
         elif op == "arm":
             print(sudo_call("arm-root", {"context": ctx, "token": token}, timeout=510), end="", flush=True)
             deadline = time.monotonic() + 20

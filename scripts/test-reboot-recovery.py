@@ -407,12 +407,49 @@ class Recovery(unittest.TestCase):
             self.assertEqual(r.read_debug_event(directory, config, "returned")["returncode"], 0)
             self.assertFalse((directory / "debug-boot-restored.json").exists())
 
+    def test_native_sync_fact_requires_exact_success(self):
+        good = b'{"event":"sync","status":"returned","ioreturn":0}\n'
+        states = {'boot_args': 'staged', 'canary': 'staged'}
+        fact = r.native_sync_fact(good, 0, states, states, 'a' * 64, 'b' * 64)
+        self.assertEqual(fact['ioreturn'], 0)
+        self.assertEqual(fact['after_key_states'], states)
+        for raw, code, keys in ((good, 70, states), (good + good, 0, states),
+                                (good.replace(b':0', b':true'), 0, states),
+                                (good, 0, {'boot_args': 'original', 'canary': 'staged'})):
+            with self.assertRaises(ValueError): r.native_sync_fact(raw, code, states, keys, 'a' * 64, 'b' * 64)
+
+    def test_native_spawn_interruption_is_uncertain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            helper = directory / 'nvram-backend'
+            helper.write_bytes(b'synthetic helper')
+            config = {'baseline': 'old', 'nonce': 'b' * 64,
+                      'nvram_helper_sha256': r.hashlib.sha256(helper.read_bytes()).hexdigest(),
+                      'context': {'actions': 'true', 'event': 'workflow_dispatch', 'repo': 'Code-Hex/vz-ci-test',
+                                  'ref': 'refs/heads/main', 'runner_environment': 'github-hosted',
+                                  'run_id': '123', 'attempt': '1', 'sha': 'a' * 40, 'trigger': 'reboot-quick'}}
+            with patch.object(r, 'boot_uuid', lambda: 'old'), patch.object(r.subprocess, 'Popen', side_effect=KeyboardInterrupt()):
+                try:
+                    r.invoke_native_helper(directory, config)
+                except BaseException as error:
+                    self.assertIsInstance(error, r.NativeSyncUncertain)
+                else:
+                    self.fail('interrupted spawn reported success')
+
+    def test_native_failure_fact_preserves_only_bounded_status(self):
+        raw = b'{"event":"sync","status":"returned","ioreturn":3758097084,"private":"never"}\n'
+        self.assertEqual(r.native_failure_fact(raw, 70), {'status': 'returned', 'exit': 70, 'ioreturn': 3758097084})
+        self.assertEqual(r.native_failure_fact(raw.replace(b'3758097084', b'true'), 70), {'status': 'invalid'})
+
     def test_debug_quick_owner_ack_before_intent_and_no_reissue(self):
         for acknowledged, intent_acknowledged in ((True, True), (True, False), (False, True)):
             with self.subTest(acknowledged=acknowledged, intent_acknowledged=intent_acknowledged), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 config, platform, original = self.owner_fixture(directory)
                 config["context"]["trigger"] = "reboot-quick"
+                config.update({"nvram_helper_sha256": "a" * 64, "nvram_source_sha256": "b" * 64})
+                native_fact = r.native_sync_fact(b'{"event":"sync","status":"returned","ioreturn":0}', 0,
+                    {"boot_args": "staged", "canary": "staged"}, {"boot_args": "staged", "canary": "staged"}, "a" * 64, "b" * 64)
                 events = []
                 def prepare(*_args):
                     self.assertNotEqual(platform.value, original)
@@ -435,6 +472,7 @@ class Recovery(unittest.TestCase):
                     return {"reason": "exec_error"}
                 with patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), \
                         patch.object(r.recovery_bootargs, "csr_allowed", lambda: True), \
+                        patch.object(r, "native_force_sync", lambda *_args: native_fact), \
                         patch.object(r, "quick_prepare", prepare), patch.object(r, "quick_reboot_child", execute), \
                         patch.object(r, "quick_intent_ack", intent_ack), \
                         patch.object(r, "debug_reboot_child", lambda: self.fail("normal reboot fallback")):
@@ -449,6 +487,112 @@ class Recovery(unittest.TestCase):
                 if acknowledged and not intent_acknowledged:
                     self.assertEqual(r.read_debug_event(directory, config, "uncertain")["reason"], "intent_ack_failure")
 
+    def test_unsettled_native_marker_blocks_retry_and_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, platform, original = self.owner_fixture(directory)
+            config["context"]["trigger"] = "reboot-quick"
+            r.debug_event(directory, config, "native_inflight", "old")
+            with patch.object(r.recovery_bootargs, "MacPlatform", lambda: self.fail("unsettled native owner retried")):
+                r.debug_owner(directory, config, "old")
+            self.assertEqual(platform.value, original)
+            self.assertFalse((directory / "debug-reboot-aborted.json").exists())
+            self.assertFalse((directory / "debug-reboot-intent.json").exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, platform, original = self.owner_fixture(directory)
+            config["context"]["trigger"] = "reboot-quick"
+            r.debug_event(directory, config, "rollback_inflight", "old")
+            with patch.object(r.recovery_bootargs, "MacPlatform", lambda: self.fail("unsettled cleanup retried")):
+                r.debug_owner(directory, config, "old")
+            self.assertEqual(platform.value, original)
+
+    def test_uncertain_native_and_invalid_terminal_never_mutate_again(self):
+        for variant in ('uncertain', 'partial_synced', 'partial_failed', 'uncertain_failed', 'inconsistent_failed'):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config, platform, original = self.owner_fixture(directory)
+                config["context"]["trigger"] = "reboot-quick"
+                calls = []
+                if variant == 'uncertain':
+                    def native(*_args):
+                        calls.append('native')
+                        raise r.NativeSyncUncertain()
+                    with patch.object(r.recovery_bootargs, 'MacPlatform', lambda: platform), \
+                            patch.object(r.recovery_bootargs, 'csr_allowed', lambda: True), \
+                            patch.object(r, 'native_force_sync', native), \
+                            patch.object(r.recovery_bootargs, 'rollback', lambda *_a, **_k: self.fail('uncertain rollback')), \
+                            patch.object(r, 'rollback_native_sync', lambda *_: self.fail('uncertain cleanup')), \
+                            patch.object(r, 'quick_reboot_child', lambda *_a, **_k: self.fail('uncertain reboot')):
+                        r.debug_owner(directory, config, 'old')
+                        r.debug_owner(directory, config, 'old')
+                    self.assertEqual(calls, ['native'])
+                    self.assertNotEqual(platform.value, original)
+                else:
+                    r.debug_event(directory, config, 'native_inflight', 'old')
+                    event = 'native_synced' if variant == 'partial_synced' else 'native_failed'
+                    path = directory / ('debug-reboot-' + event + '.json')
+                    if variant == 'uncertain_failed':
+                        r.debug_event(directory, config, event, 'old', sync_result={'status': 'failed_or_uncertain'})
+                    elif variant == 'inconsistent_failed':
+                        r.debug_event(directory, config, event, 'old', sync_result={'status': 'returned', 'exit': 0, 'ioreturn': 123})
+                    else:
+                        path.write_text('{')
+                    with patch.object(r.recovery_bootargs, 'MacPlatform', lambda: self.fail('invalid record retried')):
+                        r.debug_owner(directory, config, 'old')
+                self.assertFalse((directory / 'debug-reboot-aborted.json').exists())
+                self.assertFalse((directory / 'debug-reboot-intent.json').exists())
+
+    def test_uncertain_cleanup_retains_marker_without_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, platform, original = self.owner_fixture(directory)
+            config['context']['trigger'] = 'reboot-quick'
+            calls = []
+            def native(*_args):
+                calls.append('native')
+                raise r.NativeSyncFailure({'status': 'returned', 'exit': 70, 'ioreturn': 123})
+            def cleanup(*_args):
+                calls.append('cleanup')
+                raise r.NativeSyncUncertain()
+            with patch.object(r.recovery_bootargs, 'MacPlatform', lambda: platform), \
+                    patch.object(r.recovery_bootargs, 'csr_allowed', lambda: True), \
+                    patch.object(r, 'native_force_sync', native), patch.object(r, 'rollback_native_sync', cleanup), \
+                    patch.object(r, 'quick_reboot_child', lambda *_a, **_k: self.fail('unexpected reboot')):
+                r.debug_owner(directory, config, 'old')
+                r.debug_owner(directory, config, 'old')
+            self.assertEqual(calls, ['native', 'cleanup'])
+            self.assertEqual(platform.value, original)
+            self.assertTrue((directory / 'debug-reboot-rollback_inflight.json').exists())
+            self.assertFalse((directory / 'debug-reboot-rollback_cleanup.json').exists())
+            self.assertFalse((directory / 'debug-reboot-aborted.json').exists())
+
+    def test_native_failure_rolls_back_and_never_reboots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, platform, original = self.owner_fixture(directory)
+            config["context"]["trigger"] = "reboot-quick"
+            calls = []
+            def native(*_args):
+                calls.append("native")
+                raise r.NativeSyncFailure({"status": "returned", "exit": 70, "ioreturn": 123})
+            def cleanup(*_args):
+                self.assertEqual(platform.value, original)
+                calls.append("cleanup")
+                return {"status": "returned", "exit": 0, "ioreturn": 0, "sameboot_readback_original": True}
+            with patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), \
+                    patch.object(r.recovery_bootargs, "csr_allowed", lambda: True), \
+                    patch.object(r, "native_force_sync", native), patch.object(r, "rollback_native_sync", cleanup), \
+                    patch.object(r, "quick_prepare", lambda *_: self.fail("prepare after native failure")), \
+                    patch.object(r, "quick_reboot_child", lambda *_a, **_k: self.fail("reboot after native failure")):
+                r.debug_owner(directory, config, "old")
+                r.debug_owner(directory, config, "old")
+            self.assertEqual(calls, ["native", "cleanup"])
+            self.assertEqual(platform.value, original)
+            self.assertEqual(r.read_debug_event(directory, config, "native_failed")["sync_result"]["ioreturn"], 123)
+            self.assertTrue(r.read_debug_event(directory, config, "rollback_cleanup")["sync_result"]["sameboot_readback_original"])
+            self.assertFalse((directory / "debug-reboot-intent.json").exists())
+
     def test_quick_intent_canonical_ack_preserves_prepared_and_filters_owner_fields(self):
         for acknowledged in (True, False):
             with self.subTest(acknowledged=acknowledged), tempfile.TemporaryDirectory() as tmp:
@@ -456,6 +600,7 @@ class Recovery(unittest.TestCase):
                 config, _platform, _original = self.owner_fixture(directory)
                 config["context"]["trigger"] = "reboot-quick"
                 config["check_id"] = 9
+                config.update({"nvram_helper_sha256": "a" * 64, "nvram_source_sha256": "b" * 64})
                 ctx = config["context"]
                 prepared = {"protocol": "vz-recovery-v1", "phase": "quick_prepared", "binding": r.binding(ctx),
                             "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "trigger": "reboot-quick",
@@ -464,6 +609,9 @@ class Recovery(unittest.TestCase):
                 r.private_write(directory / "token", b"synthetic-token")
                 for event in ("staged", "intent"):
                     r.debug_event(directory, config, event, "old")
+                native_fact = r.native_sync_fact(b'{"event":"sync","status":"returned","ioreturn":0}', 0,
+                    {"boot_args": "staged", "canary": "staged"}, {"boot_args": "staged", "canary": "staged"}, "a" * 64, "b" * 64)
+                r.debug_event(directory, config, "native_synced", "old", native_sync=native_fact)
                 path = directory / "debug-reboot-staged.json"
                 raw = r.json.loads(path.read_text())
                 path.write_text(r.json.dumps({**raw, "raw": "private-not-published"}))
@@ -489,7 +637,7 @@ class Recovery(unittest.TestCase):
                 summary = r.json.loads(sent["output"]["summary"])
                 self.assertEqual({key: summary[key] for key in prepared if key != "phase"},
                                  {key: value for key, value in prepared.items() if key != "phase"})
-                self.assertEqual([event["event"] for event in summary["owner_events"]], ["staged", "intent"])
+                self.assertEqual([event["event"] for event in summary["owner_events"]], ["staged", "native_synced", "intent"])
                 self.assertNotIn("private-not-published", sent["output"]["summary"])
 
     def test_quick_timeout_retains_same_child_until_exit_without_kill(self):
