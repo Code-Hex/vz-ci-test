@@ -1,0 +1,49 @@
+name: Intel normal reboot recovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  controller:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Check out trusted diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Keep the recovery controller token alive until completion
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py controller
+  verify:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-26-intel
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Check out trusted diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Publish the runner recovery public key
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py prepare
+      - name: Receive the controller token and verify the armed reporter
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py arm
+      - name: Reboot the disposable runner and await the separate recovery check
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py reboot
