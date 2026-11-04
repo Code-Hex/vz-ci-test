@@ -49,11 +49,22 @@ class TestParsing(unittest.TestCase):
         reverse.feed('00000001 T _out_of_order')
         self.assertTrue(reverse.finish()['candidates'][0]['ambiguous'])
 
+    def test_fileset_id_selection(self):
+        info = [{'id': 'com.apple.driver.AppleEFIRuntime'}, {'id': 'bad/../../etc'},
+                {'id': 'com.apple.driver.AppleEFINVRAM'}]
+        self.assertEqual(probe.selected_entries(info), ['com.apple.driver.AppleEFINVRAM', 'com.apple.driver.AppleEFIRuntime'])
+        with self.assertRaises(ValueError): probe.selected_entries({'id': 'com.apple.driver.AppleEFINVRAM'})
+        with self.assertRaises(ValueError): probe.selected_entries([{'id': 'com.apple.driver.AppleEFINVRAM'}] * 2)
+
     def test_real_macho_symbol_selection(self):
         with tempfile.TemporaryDirectory() as folder:
             path = pathlib.Path(folder)
             (path / 'f.cc').write_text('struct AppleEFINVRAM { int sync(int); int setVariable(int); };\nint AppleEFINVRAM::sync(int x){return x+17;}\nint AppleEFINVRAM::setVariable(int x){return x+29;}\n')
             subprocess.run(['xcrun', 'clang++', '-arch', 'x86_64', '-O0', '-c', str(path / 'f.cc'), '-o', str(path / 'f.o')], check=True, capture_output=True)
+            self.assertTrue(probe.valid_extracted(path / 'f.o'))
+            self.assertFalse(probe.valid_extracted(path / 'absent'))
+            (path / 'link').symlink_to(path / 'f.o')
+            self.assertFalse(probe.valid_extracted(path / 'link'))
             status, result = probe.nm_census(['xcrun', 'nm', '-n', str(path / 'f.o')], time.monotonic() + 10)
             self.assertEqual(status, 'ok')
             candidate = next(c for c in result['candidates'] if '4syncE' in c['name'])

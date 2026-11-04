@@ -4,6 +4,10 @@ import os
 import pathlib
 import plistlib
 import re
+import resource
+import stat
+import struct
+import tempfile
 import selectors
 import subprocess
 import sys
@@ -48,6 +52,30 @@ def function_instructions(text, name, start, end):
             previous = address
             out.append(line)
     return out if found and out and int(instruction.match(out[0]).group(1), 16) == start else []
+
+
+ENTRIES = ('com.apple.driver.AppleEFINVRAM', 'com.apple.driver.AppleEFIRuntime')
+
+
+def selected_entries(data):
+    if not isinstance(data, list) or not all(isinstance(x, dict) for x in data):
+        raise ValueError('unexpected_kext_schema')
+    ids = [item.get('id') for item in data]
+    if any(ids.count(name) > 1 for name in ENTRIES):
+        raise ValueError('duplicate_entry')
+    return [name for name in ENTRIES if name in ids]
+
+
+def valid_extracted(path):
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 32 <= info.st_size <= 64 * 1024 * 1024:
+            return False
+        with path.open('rb') as source:
+            magic, cpu = struct.unpack('<II', source.read(8))
+        return magic == 0xfeedfacf and cpu == 0x01000007
+    except (OSError, struct.error):
+        return False
 
 
 class SymbolCensus:
@@ -166,8 +194,11 @@ def plist_summary(value):
             'debug_present': bool(re.search(r'(?:^|\s)debug=', flags)) if isinstance(flags, str) else None}
 
 
-def command(argv, max_bytes, timeout=20, deadline=None):
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+def command(argv, max_bytes, timeout=20, deadline=None, file_limit=None):
+    def limit():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            preexec_fn=limit if file_limit is not None else None)
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ)
     data = bytearray()
@@ -288,8 +319,74 @@ def main():
     except OSError:
         pass
     save()
-    for path in BINARIES:
-        item = {'path': path, 'functions': [], 'status': 'pending'}
+    private = output.parent / 'private'
+    private.mkdir(mode=0o700, exist_ok=True)
+    if private.is_symlink() or not private.is_dir():
+        print(json.dumps({'event': 'private_directory', 'status': 'invalid'}), flush=True)
+        return 1
+    os.chmod(private, 0o700)
+    ipsw = os.environ.get('NVRAM_IPSW', '')
+    expected_ipsw = output.parent / 'bin' / 'ipsw'
+    config = private / 'ipsw-empty.yml'
+    extraction = {'status': 'pending', 'source': 'BootKernelExtensions.kc',
+                  'image_kind': 'reconstructed', 'runtime_match': 'not_verified', 'entries': []}
+    result['extraction'] = extraction
+    save()
+    temp = tempfile.TemporaryDirectory(prefix='nvram-extract-', dir=private)
+    extracted = []
+    try:
+        if (not os.path.isabs(ipsw) or pathlib.Path(ipsw) != expected_ipsw or
+                not os.path.isfile(ipsw) or os.path.islink(ipsw)):
+            extraction['status'] = 'tool_unavailable'
+        else:
+            if not config.exists():
+                fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(fd)
+            if config.is_symlink() or not config.is_file() or config.stat().st_size != 0:
+                extraction['status'] = 'config_invalid'
+            else:
+                status, version = command([ipsw, '--config', str(config), 'version'], 4096, 5, deadline)
+                if status != 'ok' or not re.search(r'Version:\s*3\.1\.730(?:,|\s|$)', version):
+                    extraction['status'] = 'tool_version_unverified'
+                else:
+                    status, data = command([ipsw, '--config', str(config), 'kernel', 'kexts', BINARIES[3],
+                                            '--arch', 'x86_64', '--json'], 8 * 1024 * 1024, 40, deadline)
+                    if status != 'ok':
+                        extraction['status'] = 'list_' + status
+                    else:
+                        try:
+                            entries = selected_entries(json.loads(data))
+                        except (ValueError, json.JSONDecodeError):
+                            entries = []
+                            extraction['status'] = 'list_invalid'
+                        else:
+                            extraction['status'] = 'observed' if entries else 'no_matching_entry'
+                        for name in entries:
+                            unit = {'entry': name, 'status': 'pending'}
+                            extraction['entries'].append(unit)
+                            save()
+                            directory = pathlib.Path(temp.name) / name
+                            directory.mkdir(mode=0o700)
+                            status, _ = command([ipsw, '--config', str(config), 'macho', 'info', BINARIES[3],
+                                '--arch', 'x86_64', '--fileset-entry', name, '--extract-fileset-entry',
+                                '--output', str(directory)], 65536, 40, deadline, 64 * 1024 * 1024)
+                            candidate = directory / name
+                            if status != 'ok': unit['status'] = 'extract_' + status
+                            elif not valid_extracted(candidate): unit['status'] = 'extract_invalid'
+                            else:
+                                unit['status'] = 'extracted'
+                                uuid_status, uuid_output = command(['/usr/bin/xcrun', 'dwarfdump', '--uuid', str(candidate)], 4096, 10, deadline)
+                                found = re.search(r'UUID: ([0-9A-Fa-f-]{36}) \(x86_64\)', uuid_output) if uuid_status == 'ok' else None
+                                unit['image_uuid'] = found.group(1).upper() if found else None
+                                extracted.append((str(candidate), name))
+                            save()
+    except (OSError, subprocess.SubprocessError):
+        extraction['status'] = 'unavailable'
+    save()
+    sources = [(path, None) for path in BINARIES]
+    sources = [(path, entry) for path, entry in extracted] + sources
+    for path, entry in sources:
+        item = {'path': path if entry is None else 'reconstructed:' + entry, 'functions': [], 'status': 'pending'}
         result['binaries'].append(item)
         save()
         if time.monotonic() >= deadline:
@@ -336,6 +433,7 @@ def main():
         except (OSError, subprocess.SubprocessError): item['status'] = 'unavailable'
         save()
     save()
+    temp.cleanup()
     print(json.dumps({'event': 'complete', 'status': 'saved', 'path': str(output)}), flush=True)
     return 0
 

@@ -17,7 +17,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Install the pinned fileset reader in the runner temporary directory
+        run: bash scripts/install-ipsw-reader.sh
       - name: Read bounded NVRAM implementation and boot configuration facts
+        env:
+          NVRAM_IPSW: ${{ runner.temp }}/debug/bin/ipsw
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/nvram-runtime-code.py
       - name: Preserve the static observations
         if: always()
