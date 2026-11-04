@@ -1,0 +1,28 @@
+name: Intel NVRAM runtime code
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-26-intel
+    timeout-minutes: 5
+    steps:
+      - name: Check out the diagnostic source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read bounded NVRAM implementation and boot configuration facts
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/nvram-runtime-code.py
+      - name: Preserve the static observations
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nvram-runtime-code-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/debug/nvram-runtime-code.json
+          if-no-files-found: error
