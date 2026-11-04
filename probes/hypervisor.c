@@ -168,7 +168,7 @@ struct phase_case {
   enum paging_kind paging;
   enum observer_kind observer;
   hv_vm_options_t vm_flags;
-  bool armed, control, forever;
+  bool armed, control, forever, cr8_exits;
 };
 
 struct observer {
@@ -197,7 +197,7 @@ struct probe {
   atomic_bool observer_stop;
   bool marker_locked;
   bool vm_created, mapped, cpu_created, cleaning, output_failed, guest_verified;
-  bool observer_active;
+  bool observer_active, cr8_exits;
 };
 
 static uint64_t observer_now(const struct observer *o) {
@@ -540,7 +540,12 @@ static int configure(struct probe *p) {
   // EPT (secondary 1), unrestricted guest (secondary 7). See
   // https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
   TRY(control(p, VMCS_CTRL_PIN_BASED, 0, 0, &applied));
-  TRY(control(p, VMCS_CTRL_CPU_BASED, (1ULL << 31) | (1ULL << 7),
+  uint64_t primary = (1ULL << 31) | (1ULL << 7);
+  // AppleHV 25G76 prepare_cond_vmcs applies primary controls only with
+  // both CR8 exits or TPR shadow. This phase tests that coupled condition.
+  if (p->cr8_exits)
+    primary |= (1ULL << 19) | (1ULL << 20);
+  TRY(control(p, VMCS_CTRL_CPU_BASED, primary,
               (1ULL << 2) | (1ULL << 22) | (1ULL << 27), &applied));
   TRY(control(p, VMCS_CTRL_CPU_BASED2, (1ULL << 1) | (1ULL << 7), 1ULL << 14,
               &applied));
@@ -1042,6 +1047,19 @@ int main(int argc, char **argv) {
        .observer = OBSERVER_KERNELMARKERS,
        .vm_flags = HV_VM_ACCEL_APIC,
        .armed = true},
+      {.name = "armed-protected32-paging-cpuid-cr8-kernelmarkers",
+       .guest = GUEST_CPUID,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .observer = OBSERVER_KERNELMARKERS,
+       .armed = true,
+       .cr8_exits = true},
+      {.name = "armed-protected32-paging-hlt-cr8-kernelmarkers",
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .observer = OBSERVER_KERNELMARKERS,
+       .armed = true,
+       .cr8_exits = true},
   };
   int target = -1;
   if (argc == 2)
@@ -1061,14 +1079,17 @@ int main(int argc, char **argv) {
             "armed-protected32-paging-cpuid-kernelmarkers|"
             "armed-protected32-paging-hlt-kernelmarkers|"
             "armed-protected32-paging-cpuid-accel-kernelmarkers|"
-            "armed-protected32-paging-hlt-accel-kernelmarkers\n",
+            "armed-protected32-paging-hlt-accel-kernelmarkers|"
+            "armed-protected32-paging-cpuid-cr8-kernelmarkers|"
+            "armed-protected32-paging-hlt-cr8-kernelmarkers\n",
             argv[0]);
     return 64;
   }
   struct probe p = {.phase = "startup",
                     .guest = &guests[phases[target].guest],
                     .profile = &profiles[phases[target].mode],
-                    .paging = &paging_profiles[phases[target].paging]};
+                    .paging = &paging_profiles[phases[target].paging],
+                    .cr8_exits = phases[target].cr8_exits};
   if (mach_timebase_info(&p.timebase) != KERN_SUCCESS || p.timebase.denom == 0)
     return 71;
   fact(&p, "probe_start", "fact", 0, (uint64_t)target, 0, 0);
