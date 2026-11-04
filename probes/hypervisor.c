@@ -548,14 +548,16 @@ static int control(struct probe *p, uint32_t field, uint64_t desired,
   return write_field(p, field, *applied);
 }
 
-static int configure(struct probe *p) {
+static int configure(struct probe *p, const struct phase_case *spec) {
   uint64_t applied, entry;
   // Intel SDM vol. 3C, 24.6: activate secondary controls (31), HLT exiting (7),
   // EPT (secondary 1), unrestricted guest (secondary 7). See
   // https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
-  // run_until enables the timer before applying pending controls; keep it on.
-  TRY(control(p, VMCS_CTRL_PIN_BASED, p->timer_only ? (1ULL << 6) : 0, 0,
-              &applied));
+  // Finite run_until enables the timer before applying pending controls.
+  bool mtf_forever = spec->mtf_phase && spec->forever;
+  TRY(control(p, VMCS_CTRL_PIN_BASED,
+              p->timer_only && !mtf_forever ? (1ULL << 6) : 0,
+              mtf_forever ? (1ULL << 6) : 0, &applied));
   if (p->mtf_phase) {
     uint64_t must_one = 0, may_one = 0;
     TRY(status(p, CALL(p, "hv_vmx_vcpu_get_cap_write_vmcs",
@@ -881,13 +883,17 @@ static int mtf_snapshot(struct probe *p, unsigned stage,
   return p->output_failed ? 74 : 0;
 }
 
-static int mtf_step(struct probe *p, unsigned stage, uint64_t expected_rip,
+static int mtf_step(struct probe *p, const struct phase_case *spec,
+                    unsigned stage, uint64_t expected_rip,
                     uint64_t expected_activity) {
   uint64_t ticks =
       (uint64_t)((__uint128_t)20000000 * p->timebase.denom / p->timebase.numer);
-  if (!before(p, "mtf_run_until", p->vcpu, stage, 20000000))
+  uint64_t duration = spec->forever ? 0 : 20000000;
+  if (!before(p, "mtf_run_until", p->vcpu, stage, duration))
     return 74;
-  uint64_t deadline = mach_absolute_time() + (ticks ? ticks : 1);
+  uint64_t deadline = spec->forever
+                          ? HV_DEADLINE_FOREVER
+                          : mach_absolute_time() + (ticks ? ticks : 1);
   hv_return_t rc = hv_vcpu_run_until(p->vcpu, deadline);
   returned(p, "mtf_run_until", rc, p->vcpu, stage, deadline);
   TRY(status(p, rc));
@@ -918,7 +924,7 @@ static int mtf_step(struct probe *p, unsigned stage, uint64_t expected_rip,
 
 static int run_mtf(struct probe *p, const struct phase_case *spec) {
   struct mtf_state before_state = {0}, after_state = {0};
-  TRY(mtf_step(p, 1, CODE + p->profile->mov_length, 0));
+  TRY(mtf_step(p, spec, 1, CODE + p->profile->mov_length, 0));
   if (spec->mtf_phase == 1) {
     p->guest_verified = true;
     fact(p, "mtf_mov_verified", "fact", 0, 37, CODE + p->profile->mov_length,
@@ -926,7 +932,7 @@ static int run_mtf(struct probe *p, const struct phase_case *spec) {
     return p->output_failed ? 74 : 0;
   }
   TRY(gate(p, "mtf_mov_checkpoint_ready"));
-  TRY(mtf_step(p, 2, CODE + p->profile->mov_length + 1, 1));
+  TRY(mtf_step(p, spec, 2, CODE + p->profile->mov_length + 1, 1));
   TRY(mtf_snapshot(p, 2, &before_state));
   uint64_t primary = before_state.fields[7];
   if (before_state.fields[0] != CODE + p->profile->mov_length + 1 ||
@@ -1088,7 +1094,7 @@ static int execute(struct probe *p, int target, const struct phase_case *spec) {
     return 0;
   p->phase = "configure";
   TRY(capabilities(p));
-  TRY(configure(p));
+  TRY(configure(p, spec));
   if (target == 3)
     return 0;
   p->phase = spec->name;
@@ -1280,6 +1286,22 @@ int main(int argc, char **argv) {
        .cr8_exits = true,
        .timer_only = true,
        .mtf_phase = 2},
+      {.name = "mtf-forever-mov",
+       .guest = GUEST_HLT_TIMER,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .cr8_exits = true,
+       .timer_only = true,
+       .forever = true,
+       .mtf_phase = 1},
+      {.name = "mtf-forever-hlt-observe",
+       .guest = GUEST_HLT_TIMER,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .cr8_exits = true,
+       .timer_only = true,
+       .forever = true,
+       .mtf_phase = 2},
       {.name = "mtf-hlt-resume",
        .guest = GUEST_HLT_TIMER,
        .mode = PROTECTED32,
@@ -1311,7 +1333,7 @@ int main(int argc, char **argv) {
             "armed-protected32-paging-hlt-cr8-kernelmarkers|"
             "protected32-paging-spin-cr8-timer|"
             "protected32-paging-hlt-cr8-timer|mtf-mov|mtf-hlt-observe|mtf-hlt-"
-            "resume\n",
+            "resume|mtf-forever-mov|mtf-forever-hlt-observe\n",
             argv[0]);
     return 64;
   }

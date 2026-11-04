@@ -12,7 +12,9 @@ import time
 import urllib.request
 
 FIELDS = {0x681e, 0x681c, 0x6820, 0x4826, 0x4824, 0x4016, 0x4000, 0x4002, 0x482e, 0x400c}
-PHASES = {"mtf-mov", "mtf-hlt-observe", "mtf-hlt-resume"}
+MOV_PHASES = {"mtf-mov", "mtf-forever-mov"}
+OBSERVE_PHASES = {"mtf-hlt-observe", "mtf-forever-hlt-observe"}
+PHASES = MOV_PHASES | OBSERVE_PHASES | {"mtf-hlt-resume"}
 API = "https://api.github.com/repos/Code-Hex/vz-ci-test/check-runs"
 KERNEL_UUID = "87453B1D-A163-31FA-B33B-0FB4BE78E6E8"
 
@@ -97,6 +99,15 @@ def checkpoint_state(records, accepted):
 def resume_verified(records):
     return (exact(records, "mtf_resume_state_equal", (264, 264, 1))
             and exact(records, "mtf_resume_exit", (52, 264, 1)))
+
+
+def phase_success(phase, records, clean, checkpoints):
+    if not clean:
+        return False
+    if phase in MOV_PHASES:
+        return exact(records, "mtf_mov_verified", (37, 263, 165))
+    return (set(checkpoints) == {"mov", "hlt"} and
+            (phase in OBSERVE_PHASES or (phase == "mtf-hlt-resume" and resume_verified(records))))
 
 
 def attempt_classification(records, exit_code, timed_out):
@@ -198,7 +209,7 @@ def run_attempt(binary, directory, phase, number, token):
                         emit(record)
                         records.append(record)
                         if record.get("api") in ("mtf_mov_checkpoint_ready", "mtf_checkpoint_ready") and record.get("edge") == "fact":
-                            if phase == "mtf-mov":
+                            if phase in MOV_PHASES:
                                 raise ValueError("checkpoint_gate")
                             state = checkpoint_state(records, set(checkpoints))
                             state["kernel_uuid"] = KERNEL_UUID
@@ -254,11 +265,8 @@ def run_attempt(binary, directory, phase, number, token):
         child.stdin.close()
     result = attempt_classification(records, exit_code, timed_out)
     clean = exit_code == 0 and exact(records, "process_result", (0, 0, 1)) and not invalid and not pending
-    if clean and phase == "mtf-mov" and exact(records, "mtf_mov_verified", (37, 263, 165)):
+    if phase_success(phase, records, clean, checkpoints):
         result = "success"
-    if clean and phase != "mtf-mov" and set(checkpoints) == {"mov", "hlt"}:
-        if phase == "mtf-hlt-observe" or resume_verified(records):
-            result = "success"
     emit({"event": "attempt_result", "phase": phase, "attempt": number, "result": result,
           "exit": exit_code, "checkpoints": checkpoints})
     return result
@@ -281,7 +289,7 @@ def main():
         return 2
     emit({"event": "kernel_identity", "kernel_uuid": kernel_uuid})
     token = os.environ.pop("GITHUB_TOKEN", "")
-    if not binary.is_file() or not os.access(binary, os.X_OK) or (phase != "mtf-mov" and not token):
+    if not binary.is_file() or not os.access(binary, os.X_OK) or (phase not in MOV_PHASES and not token):
         emit({"event": "error", "reason": "invalid_input"})
         return 2
     directory = Path(os.environ["RUNNER_TEMP"]) / "debug" / "mtf-controls"

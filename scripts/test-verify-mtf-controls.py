@@ -71,6 +71,14 @@ class Mtf(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.checkpoint_state(facts, {"mov", "hlt"})
 
+    def test_forever_phases_require_mov_and_both_checkpoint_acks(self):
+        mov = [fact("mtf_mov_verified", 0, 37, 263, 165)]
+        self.assertTrue(r.phase_success("mtf-forever-mov", mov, True, {}))
+        self.assertFalse(r.phase_success("mtf-forever-mov", mov, False, {}))
+        self.assertFalse(r.phase_success("mtf-forever-hlt-observe", [], True, {"mov": 1}))
+        self.assertTrue(r.phase_success("mtf-forever-hlt-observe", [], True, {"mov": 1, "hlt": 2}))
+        self.assertFalse(r.phase_success("mtf-hlt-resume", [], True, {"mov": 1, "hlt": 2}))
+
     def test_resume_requires_reason_rip_and_halted_activity(self):
         facts = [fact("mtf_resume_state_equal", 0, 264, 264, 1),
                  fact("mtf_resume_exit", 0, 52, 264, 1)]
