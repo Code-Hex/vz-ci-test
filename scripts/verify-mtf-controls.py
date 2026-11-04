@@ -14,6 +14,7 @@ import urllib.request
 FIELDS = {0x681e, 0x681c, 0x6820, 0x4826, 0x4824, 0x4016, 0x4000, 0x4002, 0x482e, 0x400c}
 PHASES = {"mtf-mov", "mtf-hlt-observe", "mtf-hlt-resume"}
 API = "https://api.github.com/repos/Code-Hex/vz-ci-test/check-runs"
+KERNEL_UUID = "87453B1D-A163-31FA-B33B-0FB4BE78E6E8"
 
 
 def events(records, name):
@@ -170,6 +171,7 @@ def run_attempt(binary, directory, phase, number, token):
                             if phase == "mtf-mov" or checkpoint_id is not None or record.get("result") != 0 or args(record) != (71, 0, 0):
                                 raise ValueError("checkpoint_gate")
                             state = valid_snapshot(records)
+                            state["kernel_uuid"] = KERNEL_UUID
                             identity = (record.get("pid"), record.get("sourcehash"))
                             relevant = [r for r in records if str(r.get("api", "")).startswith("mtf_")]
                             if (identity[0] != child.pid or not isinstance(identity[1], str)
@@ -242,6 +244,11 @@ def main():
         emit({"event": "error", "reason": "invalid_context"})
         return 2
     binary, phase = Path(sys.argv[1]).resolve(), sys.argv[2]
+    kernel_uuid = subprocess.check_output(["/usr/sbin/sysctl", "-n", "kern.uuid"], text=True, timeout=5).strip().upper()
+    if kernel_uuid != KERNEL_UUID:
+        emit({"event": "error", "reason": "kernel_uuid_mismatch"})
+        return 2
+    emit({"event": "kernel_identity", "kernel_uuid": kernel_uuid})
     token = os.environ.pop("GITHUB_TOKEN", "")
     if not binary.is_file() or not os.access(binary, os.X_OK) or (phase != "mtf-mov" and not token):
         emit({"event": "error", "reason": "invalid_input"})
