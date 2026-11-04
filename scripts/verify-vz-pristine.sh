@@ -18,6 +18,12 @@ case "$workload" in
   *) printf '%s\n' 'workload must be package or ci' >&2; exit 2 ;;
 esac
 
+go_version_input=${3:-1.26.8}
+case "$go_version_input" in
+  1.26.8|1.26.10|1.27.3) ;;
+  *) printf '%s\n' 'unsupported Go version' >&2; exit 2 ;;
+esac
+
 debug_dir="$RUNNER_TEMP/debug"
 mkdir -p "$debug_dir" || exit 1
 log="$debug_dir/vz-pristine-output.log"
@@ -74,10 +80,10 @@ run() (
   git -C "$source_dir" checkout --detach FETCH_HEAD
   [[ $(git -C "$source_dir" rev-parse HEAD) == "$source_sha" ]]
   cd "$source_dir"
-  export GOTOOLCHAIN=go1.26.8
+  export GOTOOLCHAIN="go$go_version_input"
   go_version=$(go env GOVERSION)
   printf 'GO_VERSION=%s\n' "$go_version"
-  [[ $go_version == go1.26.8 ]]
+  [[ $go_version == "go$go_version_input" ]]
   make download_kernel
   printf '%s\n' \
     '336421443dbdba32f11762a8d9d4bd1db21abf9e722ea43ffffcd0478b4c11f3  testdata/Image' \
