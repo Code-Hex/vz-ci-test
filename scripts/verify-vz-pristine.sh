@@ -6,6 +6,12 @@ if [[ -z ${RUNNER_TEMP:-} || ! -d $RUNNER_TEMP ]]; then
   exit 2
 fi
 
+iterations=${1:-1}
+case "$iterations" in
+  1|2) ;;
+  *) printf '%s\n' 'iteration count must be 1 or 2' >&2; exit 2 ;;
+esac
+
 debug_dir="$RUNNER_TEMP/debug"
 mkdir -p "$debug_dir" || exit 1
 log="$debug_dir/vz-pristine-output.log"
@@ -74,7 +80,11 @@ run() (
   go test -c -o vz.test .
   python3 -u -c 'import json,time; exec("while True:\n print(json.dumps({\"event\":\"host_heartbeat\",\"monotonic_ns\":time.monotonic_ns()}),flush=True)\n time.sleep(2)")' &
   heartbeat_pid=$!
-  go run ./cmd/codesign "$PWD/vz.test" -test.timeout=5m -test.v
+  for ((iteration = 1; iteration <= iterations; iteration++)); do
+    printf 'SUITE_ITERATION=%s\n' "$iteration"
+    go run ./cmd/codesign "$PWD/vz.test" -test.timeout=3m -test.v
+    printf 'SUITE_COMPLETED=%s\n' "$iteration"
+  done
 )
 
 run 2>&1 | tee "$log"
