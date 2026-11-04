@@ -132,60 +132,173 @@ class Recovery(unittest.TestCase):
         self.assertFalse(r.boot_proof_matches(data, pending, dict(ctx, debug_boot=False)))
         self.assertFalse(r.boot_proof_matches(dict(data, current_boot_uuid="another"), pending, ctx))
 
-    def test_debug_reboot_failures_restore_once_without_reboot(self):
-        for failure in ("stage_response", "stdout", "sync"):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
-                directory = Path(tmp)
-                original = {"boot-args": b"preempt=10"}
-                state, events = dict(original), []
-                class Platform:
-                    def read(self):
-                        return state.copy()
-                    def active(self):
-                        return b"preempt=10"
-                    def write(self, path):
-                        state.clear()
-                        state.update(r.recovery_bootargs.parse_nvram(path.read_bytes()))
-                        events.append("restore" if state == original else "stage")
-                platform, marker = Platform(), {"baseline": "old", "nonce": "n"}
-                def sudo(operation, _payload, **_kwargs):
-                    if operation == "verify-root":
-                        return "ready"
-                    if operation == "debug-stage-root":
-                        r.recovery_bootargs.stage(directory, marker, platform, r.private_write, r.sync_directory)
-                        if failure == "stage_response":
-                            raise RuntimeError("stage reply lost")
-                        return "staged"
-                    self.assertEqual(operation, "debug-restore-root")
-                    r.recovery_bootargs.rollback(directory, marker, platform, r.private_write, r.sync_directory)
-                    return "restored"
-                class Output(io.StringIO):
-                    def write(self, value):
-                        if failure == "stdout" and value == "staged":
-                            raise BrokenPipeError("closed stdout")
-                        return super().write(value)
-                def sync():
-                    if failure == "sync":
-                        raise OSError("sync failed")
-                def forbidden(*_args, **_kwargs):
-                    self.fail("failed debug stage reached reboot")
-                ctx = {"trigger": "reboot", "debug_boot": True}
-                with patch.object(r.sys, "argv", ["reboot-recovery.py", "reboot"]), \
-                        patch.object(r, "context_from_env", lambda: ctx), patch.object(r, "require_context", lambda *_: None), \
-                        patch.object(r, "sudo_call", sudo), patch.object(r.os, "sync", sync), \
-                        patch.object(r.subprocess, "run", forbidden), contextlib.redirect_stdout(Output()):
-                    with self.assertRaises((OSError, RuntimeError)):
-                        r.main()
-                self.assertEqual(events, ["stage", "restore"])
-                self.assertEqual(state, original)
+    def test_debug_parent_shutdown_cannot_restore_or_reboot(self):
+        calls = []
+        def sudo(operation, *_args, **_kwargs):
+            calls.append(operation)
+            if operation == "verify-root":
+                return "ready"
+            self.assertEqual(operation, "debug-request-root")
+            raise KeyboardInterrupt()
+        def forbidden(*_args, **_kwargs):
+            self.fail("runner parent performed debug mutation or reboot")
+        with patch.object(r.sys, "argv", ["reboot-recovery.py", "reboot"]), \
+                patch.object(r, "context_from_env", lambda: {"trigger": "reboot", "debug_boot": True}), \
+                patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
+                patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                r.main()
+        self.assertEqual(calls, ["verify-root", "debug-request-root"])
 
-    def test_debug_rollback_refuses_another_boot(self):
-        config = {"context": {"debug_boot": True}, "debug_boot": True, "baseline": "old"}
-        with patch.object(r, "root_only", lambda: None), patch.object(r, "require_context", lambda *_: None), \
-                patch.object(r, "root_dir", lambda _: Path("/unused")), patch.object(r, "load_config", lambda _: config), \
-                patch.object(r, "boot_uuid", lambda: "new"):
-            with self.assertRaises(ValueError):
-                r.debug_restore_root({"context": config["context"]})
+    def test_debug_parent_waits_after_request_without_mutation(self):
+        calls = []
+        def sudo(operation, *_args, **_kwargs):
+            calls.append(operation)
+            return "ready"
+        def forbidden(*_args, **_kwargs):
+            self.fail("runner parent mutated debug state")
+        with patch.object(r.sys, "argv", ["reboot-recovery.py", "reboot"]), \
+                patch.object(r, "context_from_env", lambda: {"trigger": "reboot", "debug_boot": True}), \
+                patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
+                patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), \
+                patch.object(r.time, "sleep", lambda seconds: calls.append(("wait", seconds))), contextlib.redirect_stdout(io.StringIO()):
+            r.main()
+        self.assertEqual(calls, ["verify-root", "debug-request-root", ("wait", 90)])
+
+    def owner_fixture(self, directory):
+        config = {"context": {"run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True, "trigger": "reboot"},
+                  "debug_boot": True, "baseline": "old", "nonce": "n", "debug_source_identity": r.debug_source_identity()}
+        original = {"boot-args": b"preempt=10"}
+        class Platform:
+            fail_write = False
+            def __init__(self):
+                self.value = original.copy()
+                self.active_value = b"preempt=10"
+                self.events = []
+            def read(self):
+                return self.value.copy()
+            def active(self):
+                return self.active_value
+            def write(self, path):
+                self.events.append("write")
+                self.value = r.recovery_bootargs.parse_nvram(path.read_bytes())
+                if self.fail_write:
+                    self.fail_write = False
+                    raise OSError("write response lost")
+            def inventory(self):
+                self.events.append("inventory")
+                return {"nic_inventory_status": "unsupported"}
+        r.debug_event(directory, config, "request", "old")
+        return config, Platform(), original
+
+    def test_owner_preintent_failure_restores_without_reboot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, platform, original = self.owner_fixture(directory)
+            platform.fail_write = True
+            with patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), \
+                    patch.object(r.recovery_bootargs, "csr_allowed", lambda: True), \
+                    patch.object(r, "debug_reboot_child", lambda: self.fail("preintent reboot")):
+                r.debug_owner(directory, config, "old")
+            self.assertEqual(platform.value, original)
+            self.assertFalse((directory / "debug-reboot-intent.json").exists())
+            self.assertTrue((directory / "debug-reboot-aborted.json").exists())
+
+    def test_owner_postintent_timeout_or_signal_never_kills_restores_or_retries(self):
+        for failure in (subprocess.TimeoutExpired("reboot", 15), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config, platform, original = self.owner_fixture(directory)
+                calls = []
+                class Child:
+                    pid = 1234
+                    def wait(self, timeout):
+                        raise failure
+                    def kill(self):
+                        raise AssertionError("postintent kill")
+                def popen(*_args, **_kwargs):
+                    calls.append("reboot")
+                    return Child()
+                with patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), \
+                        patch.object(r.recovery_bootargs, "csr_allowed", lambda: True), patch.object(r.subprocess, "Popen", popen):
+                    r.debug_owner(directory, config, "old")
+                    r.debug_owner(directory, config, "old")
+                self.assertNotEqual(platform.value, original)
+                self.assertEqual(calls, ["reboot"])
+                self.assertTrue((directory / "debug-reboot-intent.json").exists())
+                self.assertFalse((directory / "debug-boot-restored.json").exists())
+
+    def test_owner_orphan_stage_restores_without_reboot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, platform, original = self.owner_fixture(directory)
+            r.recovery_bootargs.stage(directory, r.debug_boot_marker(config), platform, r.private_write, r.sync_directory)
+            with patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), \
+                    patch.object(r, "debug_reboot_child", lambda: self.fail("orphan stage reboot")):
+                r.debug_owner(directory, config, "old")
+            self.assertEqual(platform.value, original)
+            record = r.read_debug_event(directory, config, "aborted")
+            self.assertEqual(record["reason"], "orphan_stage")
+            self.assertEqual(record["nvram_before_rollback"], "staged")
+
+    def test_owner_returned_request_is_immutable_and_never_reissued(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, platform, _original = self.owner_fixture(directory)
+            request = directory / "debug-reboot-request.json"
+            first = request.read_bytes()
+            r.debug_event(directory, config, "request", "old", reason="interrupted")
+            self.assertEqual(request.read_bytes(), first)
+            calls = []
+            def reboot():
+                calls.append("reboot")
+                return {"returncode": 0, "reboot_pid": 1234}
+            with patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), \
+                    patch.object(r.recovery_bootargs, "csr_allowed", lambda: True), patch.object(r, "debug_reboot_child", reboot):
+                r.debug_owner(directory, config, "old")
+                r.debug_owner(directory, config, "old")
+            self.assertEqual(calls, ["reboot"])
+            self.assertEqual(r.read_debug_event(directory, config, "returned")["returncode"], 0)
+            self.assertFalse((directory / "debug-boot-restored.json").exists())
+
+    def test_newboot_collect_restores_before_inventory_and_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, platform, original = self.owner_fixture(directory)
+            config["check_id"] = 9
+            r.recovery_bootargs.stage(directory, r.debug_boot_marker(config), platform, r.private_write, r.sync_directory)
+            platform.active_value = b"preempt=10 debug=0x2000"
+            platform.events.clear()
+            r.private_write(directory / "token", b"test-token")
+            r.private_write(directory / "ready.json", r.json.dumps({"baseline": "old", "nonce": "n", "preboot_patch": True}).encode())
+            def api(*_args, **_kwargs):
+                platform.events.append("api")
+                error = r.urllib.error.HTTPError("https://api.github.com", 401, "test refusal", {}, None)
+                self.addCleanup(error.close)
+                raise error
+            with patch.object(r, "load_config", lambda _: config), patch.object(r, "boot_uuid", lambda: "new"), \
+                    patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), patch.object(r, "api", api), \
+                    patch.object(r, "debug_owner", lambda *_: self.fail("newboot invoked oldboot owner")):
+                r.collect(directory)
+            self.assertEqual(platform.value, original)
+            self.assertLess(platform.events.index("write"), platform.events.index("inventory"))
+            self.assertLess(platform.events.index("inventory"), platform.events.index("api"))
+
+    def test_default_reboot_path_still_uses_existing_command(self):
+        calls = []
+        def sudo(operation, *_args, **_kwargs):
+            calls.append(operation)
+            return "ready"
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+        with patch.object(r.sys, "argv", ["reboot-recovery.py", "reboot"]), \
+                patch.object(r, "context_from_env", lambda: {"trigger": "reboot", "debug_boot": False}), \
+                patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
+                patch.object(r.os, "sync", lambda: calls.append("sync")), patch.object(r.subprocess, "run", run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            r.main()
+        self.assertEqual(calls, ["verify-root", "sync", (["/usr/bin/sudo", "-n", "/sbin/reboot"], {"check": True, "timeout": 15})])
 
     def test_rsa_oaep_sha256_roundtrip_and_key_size(self):
         with tempfile.TemporaryDirectory() as tmp:

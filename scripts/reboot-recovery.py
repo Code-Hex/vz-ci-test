@@ -349,7 +349,8 @@ def prepare_root(payload):
     if not isinstance(check.get("id"), int) or check["id"] <= 0:
         raise ValueError("invalid check identifier")
     config = {"context": ctx, "baseline": baseline, "check_id": check["id"], "nonce": nonce, "python": python, "cert_fingerprint": fingerprint, "helper_sha256": helper_sha,
-              "debug_boot": ctx.get("debug_boot", False)}
+              "debug_boot": ctx.get("debug_boot", False),
+              "debug_source_identity": debug_source_identity() if ctx.get("debug_boot", False) else ""}
     private_write(directory / "config.json", json.dumps(config).encode())
     private_write(directory / "recovery.py", Path(__file__).read_bytes())
     private_write(directory / "recovery_reports.py", Path(recovery_reports.__file__).read_bytes())
@@ -400,7 +401,8 @@ def arm_root(payload):
         raise ValueError("daemon Python executable changed")
     data = plistlib.dumps({"Label": label, "ProgramArguments": [python, str(directory / "recovery.py"), "collect", str(directory)],
                            "RunAtLoad": True, "StandardOutPath": str(directory / "launchd.log"),
-                           "StandardErrorPath": str(directory / "launchd.log")})
+                           "StandardErrorPath": str(directory / "launchd.log"),
+                           **({"StartInterval": 5} if config.get("debug_boot", False) else {})})
     fd = os.open(plist, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     with os.fdopen(fd, "wb") as stream:
         stream.write(data)
@@ -432,10 +434,52 @@ PANIC_SOURCE = "dtrace:::BEGIN { panic(); }"
 
 
 def debug_boot_marker(config):
-    return {"baseline": config["baseline"], "nonce": config["nonce"], "binding": binding(config["context"])}
+    return {"baseline": config["baseline"], "nonce": config["nonce"], "binding": binding(config["context"]),
+            "source_identity": config.get("debug_source_identity", "")}
 
 
-def debug_stage_root(payload):
+def debug_source_identity():
+    return hashlib.sha256(Path(__file__).read_bytes() + b"\0" + Path(recovery_bootargs.__file__).read_bytes()).hexdigest()
+
+
+DEBUG_EVENTS = ("request", "staged", "intent", "returned", "uncertain", "aborted")
+DEBUG_REASONS = ("stage_failure", "orphan_stage", "timeout", "interrupted", "exec_error", "rollback_failed", "intent_storage_error")
+
+
+def read_debug_event(directory, config, event):
+    record = json.loads((directory / ("debug-reboot-" + event + ".json")).read_text())
+    expected = {"event": event, "binding": binding(config["context"]), "baseline": config["baseline"],
+                "nonce": config["nonce"], "source_identity": config["debug_source_identity"],
+                "actual_boot_uuid": config["baseline"]}
+    if not isinstance(record, dict) or any(record.get(key) != value for key, value in expected.items()):
+        raise ValueError("debug owner event identity mismatch")
+    result = {"event": event, "actual_boot_uuid": record["actual_boot_uuid"], "source_identity": record["source_identity"]}
+    for key in ("pid", "reboot_pid"):
+        if type(record.get(key)) is int and 0 < record[key] < 2**31:
+            result[key] = record[key]
+    if type(record.get("returncode")) is int and -128 <= record["returncode"] <= 255:
+        result["returncode"] = record["returncode"]
+    if record.get("reason") in DEBUG_REASONS:
+        result["reason"] = record["reason"]
+    if record.get("nvram_before_rollback") in ("staged", "original", "unstaged"):
+        result["nvram_before_rollback"] = record["nvram_before_rollback"]
+    return result
+
+
+def debug_event(directory, config, event, current, **details):
+    if event not in DEBUG_EVENTS or current != config["baseline"]:
+        raise ValueError("debug event scope invalid")
+    path = directory / ("debug-reboot-" + event + ".json")
+    if not path.exists():
+        record = {"event": event, "binding": binding(config["context"]), "baseline": config["baseline"],
+                  "nonce": config["nonce"], "source_identity": config["debug_source_identity"],
+                  "actual_boot_uuid": current, "pid": os.getpid(), **details}
+        private_write(path, json.dumps(record).encode())
+        sync_directory(directory)
+    return read_debug_event(directory, config, event)
+
+
+def debug_request_root(payload):
     root_only()
     ctx = payload["context"]
     require_context(ctx, "Darwin")
@@ -444,21 +488,68 @@ def debug_stage_root(payload):
     verify_root(payload)
     if (config["context"] != ctx or config.get("debug_boot") is not True or
             ctx.get("debug_boot") is not True or ctx.get("trigger") != "reboot" or
-            not recovery_bootargs.csr_allowed()):
+            config.get("debug_source_identity") != debug_source_identity()):
         raise ValueError("debug boot control not permitted")
-    recovery_bootargs.stage(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory)
-    print(json.dumps({"event": "debug_boot_staged", "debug_boot": True, "debug_mask": 0x2000}), flush=True)
+    debug_event(directory, config, "request", config["baseline"])
+    label = "com.vz.ci.recovery." + ctx["run_id"] + "." + ctx["attempt"]
+    status = "uncertain"
+    try:
+        result = subprocess.run(["/bin/launchctl", "kickstart", "system/" + label], timeout=10,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 0:
+            status = "submitted"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    print(json.dumps({"event": "debug_reboot_requested", "request_persisted": True, "kickstart_status": status}), flush=True)
 
 
-def debug_restore_root(payload):
-    root_only()
-    ctx = payload["context"]
-    require_context(ctx, "Darwin")
-    directory = root_dir(ctx)
-    config = load_config(directory)
-    if config["context"] != ctx or config.get("debug_boot") is not True or boot_uuid() != config["baseline"]:
-        raise ValueError("debug rollback identity mismatch")
-    recovery_bootargs.rollback(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory)
+def debug_reboot_child():
+    try:
+        child = subprocess.Popen(["/sbin/reboot"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return {"reason": "exec_error"}
+    try:
+        return {"returncode": child.wait(timeout=15), "reboot_pid": child.pid}
+    except subprocess.TimeoutExpired:
+        return {"reason": "timeout", "reboot_pid": child.pid}
+
+
+def debug_owner(directory, config, current):
+    if (current != config["baseline"] or config.get("debug_boot") is not True or
+            config["context"].get("trigger") != "reboot" or config.get("debug_source_identity") != debug_source_identity()):
+        raise ValueError("debug owner context mismatch")
+    read_debug_event(directory, config, "request")
+    for event in ("aborted", "intent"):
+        if (directory / ("debug-reboot-" + event + ".json")).exists():
+            read_debug_event(directory, config, event)
+            return
+    platform = recovery_bootargs.MacPlatform()
+    marker = debug_boot_marker(config)
+    reason = "orphan_stage" if (directory / "debug-boot-stage.json").exists() else "stage_failure"
+    try:
+        if reason == "orphan_stage":
+            raise ValueError("prior preintent stage interrupted")
+        if not recovery_bootargs.csr_allowed():
+            raise ValueError("kernel debugging not permitted")
+        recovery_bootargs.stage(directory, marker, platform, private_write, sync_directory)
+        debug_event(directory, config, "staged", current)
+        debug_event(directory, config, "intent", current)
+    except BaseException:
+        if (directory / "debug-reboot-intent.json").exists():
+            debug_event(directory, config, "uncertain", current, reason="intent_storage_error")
+            return
+        try:
+            state = recovery_bootargs.rollback(directory, marker, platform, private_write, sync_directory)
+            debug_event(directory, config, "aborted", current, reason=reason, nvram_before_rollback=state)
+        except BaseException:
+            debug_event(directory, config, "aborted", current, reason="rollback_failed")
+        return
+    try:
+        result = debug_reboot_child()
+    except BaseException:
+        result = {"reason": "interrupted"}
+    event = "returned" if "returncode" in result else "uncertain"
+    debug_event(directory, config, event, current, **result)
 
 
 def panic_preflight_root(payload):
@@ -645,6 +736,16 @@ def collect(directory):
                            "debugger_count": None, "debugger_inventory_status": "unavailable",
                            "network_inventory_status": "unavailable", "virtio_network_classes": [],
                            "nic_inventory_status": "unsupported", "kernel_debug_state": {}}
+        debug_facts["owner_events"] = []
+        for event in DEBUG_EVENTS:
+            if (directory / ("debug-reboot-" + event + ".json")).exists():
+                try:
+                    debug_facts["owner_events"].append(read_debug_event(directory, config, event))
+                except (OSError, ValueError):
+                    debug_facts["owner_events"].append({"event": event, "status": "invalid"})
+    elif config.get("debug_boot", False) and (directory / "debug-reboot-request.json").exists():
+        debug_owner(directory, config, current)
+        return
     token = (directory / "token").read_text()
     if not reboot_observed(config["baseline"], current):
         if not (directory / "ready.json").exists():
@@ -892,19 +993,16 @@ def main():
             if ctx.get("trigger", "reboot") != "reboot":
                 raise ValueError("wrong trigger operation")
             print(sudo_call("verify-root", {"context": ctx}), end="", flush=True)
-            try:
-                if ctx.get("debug_boot", False):
-                    print(sudo_call("debug-stage-root", {"context": ctx}), end="", flush=True)
-                os.sync()
-                subprocess.run(["/usr/bin/sudo", "-n", "/sbin/reboot"], check=True, timeout=15)
-            except BaseException:
-                if ctx.get("debug_boot", False):
-                    sudo_call("debug-restore-root", {"context": ctx})
-                raise
-    elif op in ("prepare-root", "arm-root", "verify-root", "panic-preflight-root", "panic-execute-root", "force-preflight-root", "force-execute-root", "debug-stage-root", "debug-restore-root") and len(sys.argv) == 2:
+            if ctx.get("debug_boot", False):
+                print(sudo_call("debug-request-root", {"context": ctx}), end="", flush=True)
+                time.sleep(90)
+                return
+            os.sync()
+            subprocess.run(["/usr/bin/sudo", "-n", "/sbin/reboot"], check=True, timeout=15)
+    elif op in ("prepare-root", "arm-root", "verify-root", "panic-preflight-root", "panic-execute-root", "force-preflight-root", "force-execute-root", "debug-request-root") and len(sys.argv) == 2:
         {"prepare-root": prepare_root, "arm-root": arm_root, "verify-root": verify_root, "panic-preflight-root": panic_preflight_root, "panic-execute-root": panic_execute_root,
          "force-preflight-root": force_preflight_root, "force-execute-root": force_execute_root,
-         "debug-stage-root": debug_stage_root, "debug-restore-root": debug_restore_root}[op](json.load(sys.stdin))
+         "debug-request-root": debug_request_root}[op](json.load(sys.stdin))
     elif op == "collect" and len(sys.argv) == 3:
         collect(Path(sys.argv[2]))
     else:

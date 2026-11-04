@@ -196,7 +196,7 @@ class MacPlatform:
         return result
 
 
-def restore(directory, marker, platform, save, sync, before_restore=None):
+def restore(directory, marker, platform, save, sync, before_restore=None, *, cause="unspecified", current_boot_uuid=None):
     staged = json.loads((directory / "debug-boot-stage.json").read_text())
     if staged != marker:
         raise ValueError("debug boot stage identity mismatch")
@@ -218,7 +218,9 @@ def restore(directory, marker, platform, save, sync, before_restore=None):
             raise ValueError("NVRAM restoration mismatch")
         path = directory / "debug-boot-restored.json"
         if not path.exists():
-            save(path, json.dumps({"nvram_restored": True}).encode())
+            save(path, json.dumps({"nvram_restored": True, "marker": marker, "cause": cause,
+                                   "actual_boot_uuid": current_boot_uuid or marker.get("baseline"),
+                                   "nvram_before_restore": state}).encode())
             sync(directory)
     return state
 
@@ -238,14 +240,13 @@ def stage(directory, marker, platform, save, sync):
         if platform.read() != expected:
             raise ValueError("NVRAM stage readback mismatch")
     except Exception:
-        restore(directory, marker, platform, save, sync)
+        restore(directory, marker, platform, save, sync, cause="stage_failure")
         raise
 
 
 def rollback(directory, marker, platform, save, sync):
     if (directory / "debug-boot-stage.json").exists():
-        restore(directory, marker, platform, save, sync)
-        return
+        return restore(directory, marker, platform, save, sync, cause="preintent_abort")
     original = directory / "debug-boot-original.plist"
     current = platform.read()
     if original.exists():
@@ -253,12 +254,36 @@ def rollback(directory, marker, platform, save, sync):
             raise ValueError("unstaged NVRAM differs from original")
     else:
         check_unconfigured(current.get("boot-args", b""))
+    return "unstaged"
+
+
+def receipt_summary(data):
+    if not isinstance(data, dict) or data.get("status") not in ("absent", "invalid", "observed"):
+        return {"status": "invalid"}
+    if data["status"] != "observed":
+        return {"status": data["status"]}
+    if (data.get("cause") not in ("stage_failure", "preintent_abort", "postboot") or
+            not isinstance(data.get("actual_boot_uuid"), str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", data["actual_boot_uuid"]) or
+            data.get("nvram_before_restore") not in ("staged", "original")):
+        return {"status": "invalid"}
+    return {key: data[key] for key in ("status", "cause", "actual_boot_uuid", "nvram_before_restore")}
 
 
 def finish(directory, marker, platform, save, sync, *, current_boot_uuid):
     if not isinstance(current_boot_uuid, str) or not current_boot_uuid:
         raise ValueError("observation boot identity absent")
-    facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "current_boot_uuid": current_boot_uuid}
+    facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "current_boot_uuid": current_boot_uuid,
+             "restored_marker_preexisting": (directory / "debug-boot-restored.json").exists()}
+    receipt = directory / "debug-boot-restored.json"
+    facts["restore_receipt"] = {"status": "absent"}
+    if receipt.exists():
+        facts["restore_receipt"] = {"status": "invalid"}
+        try:
+            data = json.loads(receipt.read_text())
+            if isinstance(data, dict) and data.get("marker") == marker and data.get("nvram_restored") is True:
+                facts["restore_receipt"] = receipt_summary({"status": "observed", **data})
+        except (OSError, ValueError):
+            pass
     try:
         facts["active_debug_mask"] = debug_mask(platform.active())
         facts["active_bootargs_status"] = "observed_no_debug" if facts["active_debug_mask"] is None else "observed_debug"
@@ -280,11 +305,14 @@ def finish(directory, marker, platform, save, sync, *, current_boot_uuid):
                 raise ValueError("debug observation invalid")
             if (previous["active_bootargs_status"] == "observed_debug") != (type(previous["active_debug_mask"]) is int):
                 raise ValueError("debug observation inconsistent")
-            facts.update({key: previous[key] for key in ("active_bootargs_status", "active_debug_mask", "nvram_before_restore")})
+            if type(previous.get("restored_marker_preexisting")) is not bool:
+                raise ValueError("restoration observation invalid")
+            facts.update({key: previous[key] for key in ("active_bootargs_status", "active_debug_mask", "nvram_before_restore", "restored_marker_preexisting")})
+            facts["restore_receipt"] = receipt_summary(previous.get("restore_receipt"))
         else:
             facts["nvram_before_restore"] = state
             save(path, json.dumps({"marker": marker, **facts}).encode())
             sync(directory)
 
-    restore(directory, marker, platform, save, sync, before_restore=record)
+    restore(directory, marker, platform, save, sync, before_restore=record, cause="postboot", current_boot_uuid=current_boot_uuid)
     return {**facts, "nvram_restored": True, **platform.inventory()}

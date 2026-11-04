@@ -157,10 +157,28 @@ class Bootargs(unittest.TestCase):
                     self.assertEqual(facts["active_bootargs_status"], status)
                     self.assertEqual(facts["active_debug_mask"], mask)
                     self.assertEqual(facts["nvram_before_restore"], before)
+                    self.assertFalse(facts["restored_marker_preexisting"])
                     if before == "staged":
                         self.assertLess(platform.events.index("debug-boot-observed.json"), platform.events.index("write"))
                     again = b.finish(directory, marker, platform, save, lambda _p: None, current_boot_uuid="new")
                     self.assertEqual(again["nvram_before_restore"], before)
+                    self.assertFalse(again["restored_marker_preexisting"])
+
+    def test_preexisting_restore_receipt_identifies_oldboot_writer_without_raw_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, original = Path(tmp), {"boot-args": "preempt=10"}
+            platform, marker = Platform(original), {"baseline": "old", "nonce": "n"}
+            b.stage(directory, marker, platform, self.save, lambda _p: None)
+            self.assertEqual(b.rollback(directory, marker, platform, self.save, lambda _p: None), "staged")
+            receipt = directory / "debug-boot-restored.json"
+            data = json.loads(receipt.read_text())
+            data["raw"] = "not published"
+            receipt.write_text(json.dumps(data))
+            facts = b.finish(directory, marker, platform, self.save, lambda _p: None, current_boot_uuid="new")
+            self.assertTrue(facts["restored_marker_preexisting"])
+            self.assertEqual(facts["restore_receipt"], {"status": "observed", "cause": "preintent_abort",
+                                                     "actual_boot_uuid": "old", "nvram_before_restore": "staged"})
+            self.assertNotIn("not published", str(facts))
 
     def test_invalid_debugger_plist_does_not_hide_network_class(self):
         network = plistlib.dumps([{"IOObjectClass": "AppleVirtIONetwork", "secret": "not published"}])
