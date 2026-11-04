@@ -34,7 +34,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[1-9][0-9]{0,4}", str(ctx.get("attempt", "")))) and
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               type(ctx.get("debug_boot", False)) is bool and
-              (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") == "reboot"))
+              (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
     return bool(common and machine == "x86_64" and
                 ((system == "Darwin" and str(kernel_uuid).upper() == KERNEL_UUID) or system == "Linux"))
 
@@ -477,6 +477,10 @@ def read_debug_event(directory, config, event):
         result["reason"] = record["reason"]
     if record.get("nvram_before_rollback") in ("staged", "original", "unstaged"):
         result["nvram_before_rollback"] = record["nvram_before_rollback"]
+    if isinstance(record.get("quick_return"), dict):
+        returned = safe_quick_return(json.dumps(record["quick_return"]))
+        if returned is not None:
+            result["quick_return"] = returned
     return result
 
 
@@ -501,7 +505,7 @@ def debug_request_root(payload):
     config = load_config(directory)
     verify_root(payload)
     if (config["context"] != ctx or config.get("debug_boot") is not True or
-            ctx.get("debug_boot") is not True or ctx.get("trigger") != "reboot" or
+            ctx.get("debug_boot") is not True or ctx.get("trigger") not in ("reboot", "reboot-quick") or
             config.get("debug_source_identity") != debug_source_identity()):
         raise ValueError("debug boot control not permitted")
     debug_event(directory, config, "request", config["baseline"])
@@ -530,7 +534,7 @@ def debug_reboot_child():
 
 def debug_owner(directory, config, current):
     if (current != config["baseline"] or config.get("debug_boot") is not True or
-            config["context"].get("trigger") != "reboot" or config.get("debug_source_identity") != debug_source_identity()):
+            config["context"].get("trigger") not in ("reboot", "reboot-quick") or config.get("debug_source_identity") != debug_source_identity()):
         raise ValueError("debug owner context mismatch")
     read_debug_event(directory, config, "request")
     for event in ("aborted", "intent"):
@@ -547,6 +551,7 @@ def debug_owner(directory, config, current):
             raise ValueError("kernel debugging not permitted")
         recovery_bootargs.stage(directory, marker, platform, private_write, sync_directory)
         debug_event(directory, config, "staged", current)
+        prepared = quick_prepare(directory, config) if config["context"].get("trigger") == "reboot-quick" else None
         debug_event(directory, config, "intent", current)
     except BaseException:
         if (directory / "debug-reboot-intent.json").exists():
@@ -559,11 +564,17 @@ def debug_owner(directory, config, current):
             debug_event(directory, config, "aborted", current, reason="rollback_failed")
         return
     try:
-        result = debug_reboot_child()
+        if prepared is None:
+            result = debug_reboot_child()
+        else:
+            result = quick_reboot_child(directory, config,
+                on_uncertain=lambda reason: debug_event(directory, config, "uncertain", current, reason=reason))
     except BaseException:
         result = {"reason": "interrupted"}
     event = "returned" if "returncode" in result else "uncertain"
     debug_event(directory, config, event, current, **result)
+    if result.get("quick_return") is not None:
+        quick_report_return(directory, config, prepared, result["quick_return"])
 
 
 def panic_preflight_root(payload):
@@ -715,9 +726,21 @@ def quick_execute_root(payload):
     verify_root(payload)
     if config["context"] != ctx or config.get("debug_boot", False) or boot_uuid() != config["baseline"]:
         raise ValueError("quick reboot identity mismatch")
+    prepared = quick_prepare(directory, config)
+    result = quick_reboot_child(directory, config)
+    if result.get("quick_return") is not None:
+        quick_report_return(directory, config, prepared, result["quick_return"])
+    raise RuntimeError("quick reboot helper unexpectedly returned")
+
+
+def quick_prepare(directory, config):
+    ctx = config["context"]
+    if boot_uuid() != config["baseline"]:
+        raise ValueError("quick preparation boot mismatch")
     helper = helper_checked(directory, config, "reboot-quick")
     marker = {"trigger": "reboot-quick", "binding": binding(ctx), "nonce": config["nonce"],
-              "boot_uuid": config["baseline"], "helper_sha256": config["helper_sha256"], "flags": 0x400}
+              "boot_uuid": config["baseline"], "helper_sha256": config["helper_sha256"], "flags": 0x400,
+              "debug_boot": ctx.get("debug_boot", False)}
     private_write(directory / "quick-trigger.json", json.dumps(marker).encode())
     sync_directory(directory)
     os.sync()
@@ -742,19 +765,42 @@ def quick_execute_root(payload):
             check.get("output", {}).get("summary") != output["summary"] or check["output"].get("title") != output["title"] or
             boot_uuid() != config["baseline"]):
         raise ValueError("quick reboot checkpoint acknowledgement mismatch")
+    helper_checked(directory, config, "reboot-quick")
+    return prepared
+
+
+def quick_reboot_child(directory, config, on_uncertain=None):
     helper = helper_checked(directory, config, "reboot-quick")
-    child = subprocess.Popen([str(helper), "execute"], env=helper_env(config), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    stdout, _stderr = child.communicate(timeout=30)
-    returned = safe_quick_return(stdout)
-    if returned is not None:
-        print(json.dumps(returned), flush=True)
-        failure = {**prepared, "phase": "quick_failed", "quick_return": returned}
+    try:
+        child = subprocess.Popen([str(helper), "execute"], env=helper_env(config), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError:
+        return {"reason": "exec_error"}
+    timeout, reported = 30, False
+    while True:
         try:
-            api("PATCH", url, token, {"status": "completed", "conclusion": "failure",
-                "output": {"title": "Quick reboot syscall returned", "summary": json.dumps(failure)}})
-        except (OSError, ValueError, urllib.error.URLError):
-            pass
-    raise RuntimeError("quick reboot helper unexpectedly returned")
+            stdout, _stderr = child.communicate(timeout=timeout)
+            break
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+            if not reported:
+                reported = True
+                try:
+                    if on_uncertain is not None:
+                        on_uncertain("timeout" if isinstance(error, subprocess.TimeoutExpired) else "interrupted")
+                except BaseException:
+                    pass
+            timeout = None
+    return {"returncode": child.returncode, "reboot_pid": child.pid, "quick_return": safe_quick_return(stdout)}
+
+
+def quick_report_return(directory, config, prepared, returned):
+    print(json.dumps(returned), flush=True)
+    failure = {**prepared, "phase": "quick_failed", "quick_return": returned}
+    try:
+        api("PATCH", CHECKS + "/" + str(config["check_id"]), (directory / "token").read_text(),
+            {"status": "completed", "conclusion": "failure",
+             "output": {"title": "Quick reboot syscall returned", "summary": json.dumps(failure)}})
+    except (OSError, ValueError, urllib.error.URLError):
+        pass
 
 
 def panic_capture(directory, config, current, deadline):
@@ -1123,7 +1169,12 @@ def main():
             print(sudo_call("force-preflight-root", {"context": ctx}, timeout=70), end="", flush=True)
             print(sudo_call("force-execute-root", {"context": ctx}, timeout=45), end="", flush=True)
         elif op == "trigger" and ctx.get("trigger") == "reboot-quick":
-            print(sudo_call("quick-execute-root", {"context": ctx}, timeout=90), end="", flush=True)
+            if ctx.get("debug_boot", False):
+                print(sudo_call("verify-root", {"context": ctx}), end="", flush=True)
+                print(sudo_call("debug-request-root", {"context": ctx}), end="", flush=True)
+                time.sleep(90)
+            else:
+                print(sudo_call("quick-execute-root", {"context": ctx}, timeout=90), end="", flush=True)
         else:
             if ctx.get("trigger", "reboot") != "reboot":
                 raise ValueError("wrong trigger operation")

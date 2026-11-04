@@ -1,4 +1,4 @@
-"""A reversible, normal-reboot-only debug boot-argument transaction."""
+"""A reversible debug boot-argument transaction for normal and quick reboot."""
 import ctypes
 import json
 import os
@@ -10,7 +10,7 @@ import time
 
 
 def requested(value, trigger):
-    if value not in ("", "0", "1") or (value == "1" and trigger != "reboot"):
+    if value not in ("", "0", "1") or (value == "1" and trigger not in ("reboot", "reboot-quick")):
         raise ValueError("invalid debug boot request")
     return value == "1"
 

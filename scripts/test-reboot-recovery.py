@@ -90,7 +90,7 @@ class Recovery(unittest.TestCase):
                "ref": "refs/heads/main", "event": "workflow_dispatch", "runner_environment": "github-hosted",
                "trigger": "reboot-quick", "debug_boot": False}
         self.assertTrue(r.valid_context(ctx, "Darwin", "x86_64", r.KERNEL_UUID))
-        self.assertFalse(r.valid_context(dict(ctx, debug_boot=True), "Darwin", "x86_64", r.KERNEL_UUID))
+        self.assertTrue(r.valid_context(dict(ctx, debug_boot=True), "Darwin", "x86_64", r.KERNEL_UUID))
         self.assertFalse(r.panic_mode(ctx))
         fact = r.safe_quick_return('raw-secret\n{"event":"quick_reboot_unexpected_return","result":-1,"errno":1,"token":"raw-secret"}')
         self.assertEqual(fact, {"event": "quick_reboot_unexpected_return", "result": -1, "errno": 1})
@@ -115,6 +115,21 @@ class Recovery(unittest.TestCase):
                 patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), contextlib.redirect_stdout(io.StringIO()):
             r.main()
         self.assertEqual(calls, [("quick-execute-root", 90)])
+
+    def test_debug_quick_parent_only_requests_launchd_owner(self):
+        calls = []
+        def sudo(operation, *_args, **_kwargs):
+            calls.append(operation)
+            return ""
+        def forbidden(*_args, **_kwargs):
+            self.fail("debug quick parent directly executed reset")
+        with patch.object(r.sys, "argv", ["reboot-recovery.py", "trigger"]), \
+                patch.object(r, "context_from_env", lambda: {"trigger": "reboot-quick", "debug_boot": True}), \
+                patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
+                patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), \
+                patch.object(r.time, "sleep", lambda seconds: calls.append(("wait", seconds))), contextlib.redirect_stdout(io.StringIO()):
+            r.main()
+        self.assertEqual(calls, ["verify-root", "debug-request-root", ("wait", 90)])
 
     def test_quick_prepared_ack_precedes_execute_and_return_completes_failure(self):
         for acknowledged in (True, False):
@@ -153,6 +168,7 @@ class Recovery(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, '{"event":"quick_reboot_preflight","flags":1024,"permission_verified":false}', '')
                 class Child:
                     returncode = 70
+                    pid = 1234
                     def communicate(self, timeout):
                         return ('raw-secret\n{"event":"quick_reboot_unexpected_return","result":-1,"errno":1}', '')
                 def popen(command, **kwargs):
@@ -199,8 +215,9 @@ class Recovery(unittest.TestCase):
         self.assertFalse(r.reboot_observed("abc", ""))
         self.assertTrue(r.reboot_observed("abc", "def"))
 
-    def test_debug_boot_request_is_normal_reboot_only(self):
+    def test_debug_boot_request_accepts_only_normal_reset_triggers(self):
         self.assertTrue(r.recovery_bootargs.requested("1", "reboot"))
+        self.assertTrue(r.recovery_bootargs.requested("1", "reboot-quick"))
         self.assertFalse(r.recovery_bootargs.requested("", "reboot"))
         for value, trigger in (("true", "reboot"), ("1", "panic-control"), ("1", "panic-force-reset")):
             with self.assertRaises(ValueError):
@@ -224,6 +241,11 @@ class Recovery(unittest.TestCase):
         self.assertFalse(r.boot_proof_matches(dict(data, debug_boot=False), pending, ctx))
         self.assertFalse(r.boot_proof_matches(data, pending, dict(ctx, debug_boot=False)))
         self.assertFalse(r.boot_proof_matches(dict(data, current_boot_uuid="another"), pending, ctx))
+        quick_ctx = dict(ctx, trigger="reboot-quick")
+        quick_data = dict(data, trigger="reboot-quick")
+        self.assertTrue(r.boot_proof_matches(quick_data, pending, quick_ctx))
+        self.assertFalse(r.boot_proof_matches(data, pending, quick_ctx))
+        self.assertFalse(r.boot_proof_matches(quick_data, pending, ctx))
 
     def test_debug_parent_shutdown_cannot_restore_or_reboot(self):
         calls = []
@@ -354,6 +376,66 @@ class Recovery(unittest.TestCase):
             self.assertEqual(calls, ["reboot"])
             self.assertEqual(r.read_debug_event(directory, config, "returned")["returncode"], 0)
             self.assertFalse((directory / "debug-boot-restored.json").exists())
+
+    def test_debug_quick_owner_ack_before_intent_and_no_reissue(self):
+        for acknowledged in (True, False):
+            with self.subTest(acknowledged=acknowledged), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config, platform, original = self.owner_fixture(directory)
+                config["context"]["trigger"] = "reboot-quick"
+                events = []
+                def prepare(*_args):
+                    self.assertNotEqual(platform.value, original)
+                    self.assertTrue((directory / "debug-reboot-staged.json").exists())
+                    self.assertFalse((directory / "debug-reboot-intent.json").exists())
+                    events.append("prepare_ack")
+                    if not acknowledged:
+                        raise ValueError("checkpoint not acknowledged")
+                    return {"phase": "quick_prepared"}
+                def execute(*_args, **_kwargs):
+                    self.assertTrue((directory / "debug-reboot-intent.json").exists())
+                    events.append("execute")
+                    return {"reason": "exec_error"}
+                with patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), \
+                        patch.object(r.recovery_bootargs, "csr_allowed", lambda: True), \
+                        patch.object(r, "quick_prepare", prepare), patch.object(r, "quick_reboot_child", execute), \
+                        patch.object(r, "debug_reboot_child", lambda: self.fail("normal reboot fallback")):
+                    r.debug_owner(directory, config, "old")
+                    r.debug_owner(directory, config, "old")
+                self.assertEqual(events, ["prepare_ack", "execute"] if acknowledged else ["prepare_ack"])
+                self.assertEqual(platform.value == original, not acknowledged)
+                self.assertEqual((directory / "debug-boot-restored.json").exists(), not acknowledged)
+
+    def test_quick_timeout_retains_same_child_until_exit_without_kill(self):
+        for interruption in (subprocess.TimeoutExpired("helper", 30), KeyboardInterrupt()):
+            with self.subTest(interruption=type(interruption).__name__), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config, _platform, _original = self.owner_fixture(directory)
+                config["context"].update({"actions": "true", "event": "workflow_dispatch", "repo": "Code-Hex/vz-ci-test",
+                                          "ref": "refs/heads/main", "runner_environment": "github-hosted", "trigger": "reboot-quick"})
+                helper = directory / "reboot-quick"
+                helper.write_bytes(b"synthetic helper")
+                config["helper_sha256"] = r.hashlib.sha256(helper.read_bytes()).hexdigest()
+                waits, notices, starts = [], [], []
+                class Child:
+                    returncode, pid = 70, 1234
+                    def communicate(self, timeout):
+                        waits.append(timeout)
+                        if len(waits) == 1:
+                            raise interruption
+                        return ('{"event":"quick_reboot_unexpected_return","result":-1,"errno":1}', '')
+                    def kill(self):
+                        raise AssertionError("helper killed")
+                def popen(command, **kwargs):
+                    starts.append(command)
+                    self.assertNotIn("GITHUB_TOKEN", kwargs["env"])
+                    return Child()
+                with patch.object(r.subprocess, "Popen", popen):
+                    result = r.quick_reboot_child(directory, config, notices.append)
+                self.assertEqual(waits, [30, None])
+                self.assertEqual(notices, ["timeout" if isinstance(interruption, subprocess.TimeoutExpired) else "interrupted"])
+                self.assertEqual(starts, [[str(helper), "execute"]])
+                self.assertEqual(result["quick_return"]["errno"], 1)
 
     def test_newboot_core_ack_precedes_inventory_and_failed_ack_skips_it(self):
         for acknowledged, restored in ((True, True), (False, True), (True, False)):

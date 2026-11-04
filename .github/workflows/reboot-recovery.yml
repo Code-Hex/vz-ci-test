@@ -19,7 +19,7 @@ on:
           - panic-force-reset
         default: reboot
       debug_boot:
-        description: Test panic transport registration through a normal reboot only
+        description: Inspect debug boot settings after a non-panic reboot
         required: false
         type: boolean
         default: false
