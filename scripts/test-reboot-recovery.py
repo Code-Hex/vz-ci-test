@@ -320,6 +320,33 @@ class Recovery(unittest.TestCase):
             self.assertFalse((directory / "debug-reboot-intent.json").exists())
             self.assertTrue((directory / "debug-reboot-aborted.json").exists())
 
+    def test_owner_sync_request_failure_prevents_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, _platform, original = self.owner_fixture(directory)
+            state, syncs = original.copy(), []
+            def capture(argv, *_args):
+                if argv == ["/usr/sbin/nvram", "-x", "-p"]:
+                    return r.recovery_bootargs.plistlib.dumps(state)
+                if argv[0] == "/usr/sbin/sysctl":
+                    return b"preempt=10\n"
+                if argv[1:3] == ["-x", "-f"]:
+                    state.clear()
+                    state.update(r.recovery_bootargs.parse_nvram(Path(argv[3]).read_bytes()))
+                    return b""
+                self.assertEqual(argv, ["/usr/sbin/nvram", "-s"])
+                syncs.append("sync")
+                if len(syncs) == 1:
+                    raise OSError("sync request failed")
+                return b""
+            with patch.object(r.recovery_bootargs, "capture", capture), \
+                    patch.object(r.recovery_bootargs, "csr_allowed", lambda: True), \
+                    patch.object(r, "debug_reboot_child", lambda: self.fail("reboot after failed sync")):
+                r.debug_owner(directory, config, "old")
+            self.assertFalse((directory / "debug-reboot-intent.json").exists())
+            self.assertEqual(state, original)
+            self.assertEqual(syncs, ["sync", "sync", "sync"])
+
     def test_owner_postintent_timeout_or_signal_never_kills_restores_or_retries(self):
         for failure in (subprocess.TimeoutExpired("reboot", 15), KeyboardInterrupt()):
             with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as tmp:

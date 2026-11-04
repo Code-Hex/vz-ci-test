@@ -43,6 +43,50 @@ class Bootargs(unittest.TestCase):
         with path.open("xb") as stream:
             stream.write(data)
 
+    def test_platform_write_and_delete_request_force_sync_after_mutation(self):
+        for value in ({"boot-args": b"preempt=10"}, {}):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "value.plist"
+                path.write_bytes(plistlib.dumps(value))
+                calls = []
+                with patch.object(b, "capture", lambda argv: calls.append(argv)):
+                    b.MacPlatform().write(path)
+                mutation = ["/usr/sbin/nvram", "-x", "-f", str(path)] if value else ["/usr/sbin/nvram", "-d", "boot-args"]
+                self.assertEqual(calls, [mutation, ["/usr/sbin/nvram", "-s"]])
+
+    def test_failed_force_sync_prevents_restore_proof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, marker = Path(tmp), {"baseline": "old", "nonce": "n"}
+            state, syncs = {"boot-args": b"preempt=10"}, []
+            def capture(argv, *_args):
+                if argv == ["/usr/sbin/nvram", "-x", "-p"]:
+                    return plistlib.dumps(state)
+                if argv[0] == "/usr/sbin/sysctl":
+                    return b"preempt=10\n"
+                if argv[1:3] == ["-x", "-f"]:
+                    state.clear()
+                    state.update(b.parse_nvram(Path(argv[3]).read_bytes()))
+                    return b""
+                self.assertEqual(argv, ["/usr/sbin/nvram", "-s"])
+                syncs.append("sync")
+                if len(syncs) == 2:
+                    raise OSError("sync request failed")
+                return b""
+            with patch.object(b, "capture", capture):
+                platform = b.MacPlatform()
+                b.stage(directory, marker, platform, self.save, lambda _p: None)
+                with self.assertRaises(OSError):
+                    b.finish(directory, marker, platform, self.save, lambda _p: None, current_boot_uuid="new", inventory=False)
+                self.assertFalse((directory / "debug-boot-restored.json").exists())
+                self.assertEqual(syncs, ["sync", "sync"])
+                def save(path, data):
+                    if path.name == "debug-boot-restored.json":
+                        self.assertEqual(syncs, ["sync", "sync", "sync"])
+                    self.save(path, data)
+                facts = b.finish(directory, marker, platform, save, lambda _p: None, current_boot_uuid="new", inventory=False)
+            self.assertTrue(facts["nvram_restored"])
+            self.assertTrue((directory / "debug-boot-restored.json").exists())
+
     def test_input_and_type_preservation(self):
         for original in ({}, {"boot-args": "preempt=10"}, {"boot-args": b"preempt=10"}, {"boot-args": b""}):
             staged = b.desired(original)

@@ -150,6 +150,7 @@ class MacPlatform:
         value = parse_nvram(path.read_bytes())
         command = ["/usr/sbin/nvram", "-x", "-f", str(path)] if value else ["/usr/sbin/nvram", "-d", "boot-args"]
         capture(command)
+        capture(["/usr/sbin/nvram", "-s"])
 
     def active(self):
         raw = capture(["/usr/sbin/sysctl", "-n", "kern.bootargs"], 65536)
@@ -212,8 +213,7 @@ def restore(directory, marker, platform, save, sync, before_restore=None, *, cau
         if before_restore is not None:
             before_restore(state)
     finally:
-        if state == "staged":
-            platform.write(directory / "debug-boot-original.plist")
+        platform.write(directory / "debug-boot-original.plist")
         if platform.read() != original:
             raise ValueError("NVRAM restoration mismatch")
         path = directory / "debug-boot-restored.json"
