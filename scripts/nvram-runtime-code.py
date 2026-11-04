@@ -26,15 +26,6 @@ SYMBOL = re.compile(r'^\s*[0-9a-fA-F]+\s+[Tt]\s+(__ZNK?(?:13AppleEFINVRAM|15Appl
 INTEREST = re.compile(r'sync|set|write|start|register|variable', re.I)
 
 
-def select_symbols(lines):
-    result = []
-    for line in lines:
-        match = SYMBOL.match(line)
-        if match and INTEREST.search(match.group(1)) and match.group(1) not in result:
-            result.append(match.group(1))
-    return result
-
-
 def function_instructions(text, name, start, end):
     heading = re.compile(r'^\s*(?:([0-9a-fA-F]+)\s+<)?' + re.escape(name) + r'(?:>)?:\s*$')
     another = re.compile(r'^\s*(?:[0-9a-fA-F]+\s+<[^>]+>|[A-Za-z_][A-Za-z0-9_]*)[:]{1}\s*$')
@@ -59,20 +50,103 @@ def function_instructions(text, name, start, end):
     return out if found and out and int(instruction.match(out[0]).group(1), 16) == start else []
 
 
-def symbol_bounds(text, selected):
-    entries = []
-    for line in text.splitlines():
+class SymbolCensus:
+    def __init__(self, target=None):
+        self.target = target
+        self.candidates = []
+        self.target_count = 0
+        self.pending = []
+        self.member = 0
+        self.member_bad = set()
+        self.last = None
+        self.overflow = False
+
+    def feed(self, line):
         match = re.match(r'^\s*([0-9a-fA-F]+)\s+[Tt]\s+(\S+)\s*$', line)
-        if match: entries.append((int(match.group(1), 16), match.group(2)))
-    result = {}
-    for name in selected:
-        addresses = [address for address, symbol in entries if symbol == name]
-        if len(addresses) != 1: continue
-        start = addresses[0]
-        if sum(address == start for address, _ in entries) != 1: continue
-        later = [address for address, _ in entries if address > start]
-        if later: result[name] = (start, min(later))
-    return result
+        if not match:
+            if line.strip().endswith(':') and not line[:1].isspace():
+                self.pending = []
+                self.last = None
+                self.member += 1
+            return
+        address, name = int(match.group(1), 16), match.group(2)
+        if self.last is not None and address < self.last:
+            self.member_bad.add(self.member)
+        if self.last is not None and address > self.last:
+            for candidate in self.pending:
+                candidate['end'] = address
+            self.pending = []
+        if self.last == address:
+            for candidate in self.pending:
+                candidate['ambiguous'] = True
+        wanted = bool(self.target.fullmatch(name)) if self.target else bool(SYMBOL.match(line) and INTEREST.search(name))
+        if wanted:
+            self.target_count += 1
+            if len(self.candidates) < 4096:
+                candidate = {'name': name, 'start': address, 'end': None, 'member': self.member,
+                             'ambiguous': self.last == address}
+                self.candidates.append(candidate)
+                self.pending.append(candidate)
+            else:
+                self.overflow = True
+        self.last = address
+
+    def finish(self):
+        counts = {}
+        for candidate in self.candidates:
+            counts[candidate['name']] = counts.get(candidate['name'], 0) + 1
+        for candidate in self.candidates:
+            candidate['ambiguous'] |= (counts[candidate['name']] != 1 or candidate['member'] in self.member_bad or candidate['end'] is None)
+        def rank(candidate):
+            name = candidate['name'].lower()
+            return (0 if 'setvariable' in name or 'write' in name else 1 if 'sync' in name else 2, name)
+        return {'target_count': self.target_count, 'candidates': sorted(self.candidates, key=rank)[:24],
+                'census_overflow': self.overflow}
+
+
+def nm_census(argv, deadline):
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    census = SymbolCensus()
+    buffer = b''
+    total = 0
+    status = 'ok'
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(max(remaining, 0)):
+                status = 'deadline'
+                break
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk: break
+            total += len(chunk)
+            if total > 256 * 1024 * 1024:
+                status = 'nm_output_limit'
+                break
+            buffer += chunk
+            while b'\n' in buffer:
+                line, buffer = buffer.split(b'\n', 1)
+                if len(line) > 8192:
+                    status = 'nm_line_limit'
+                    break
+                census.feed(line.decode('utf-8', 'replace'))
+            if status != 'ok': break
+            if len(buffer) > 8192:
+                status = 'nm_line_limit'
+                break
+        if status == 'ok' and buffer: census.feed(buffer.decode('utf-8', 'replace'))
+        if status != 'ok': process.kill()
+        try: code = process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+            status = 'deadline'
+        if status == 'ok' and code != 0: status = 'tool_error'
+        return status, census.finish()
+    finally:
+        selector.close()
+        process.stdout.close()
 
 
 def type_name(value):
@@ -227,25 +301,26 @@ def main():
             save()
             continue
         try:
-            status, out = command(['/usr/bin/xcrun', 'nm', '-n', path], 32 * 1024 * 1024, 35, deadline)
-            names = select_symbols(out.splitlines()) if status == 'ok' else []
-            item['status'] = status if status != 'ok' else ('observed' if names else 'unsupported')
-            bounds = symbol_bounds(out, names) if status == 'ok' else {}
+            status, census = nm_census(['/usr/bin/xcrun', 'nm', '-n', path], deadline)
+            item['target_count'] = census['target_count']
+            item['target_count_complete'] = status == 'ok'
+            item['status'] = status if status != 'ok' else ('unsupported' if not census['target_count'] else
+                'target_census_limit' if census['census_overflow'] else
+                'target_count_limited' if census['target_count'] > 24 else 'observed')
             save()
-            if len(names) > 24:
-                item['status'] = 'oversize'
-                names = []
-            for name in names:
+            candidates = census['candidates'] if status == 'ok' and not census['census_overflow'] else []
+            for candidate in candidates:
+                name = candidate['name']
                 function = {'symbol': name, 'status': 'pending', 'instructions': []}
                 item['functions'].append(function)
                 save()
                 if time.monotonic() >= deadline:
                     function['status'] = 'deadline'
                     break
-                if name not in bounds:
+                if candidate['ambiguous']:
                     function['status'] = 'unsupported'
                     continue
-                start, end = bounds[name]
+                start, end = candidate['start'], candidate['end']
                 status, disassembly = command(['/usr/bin/xcrun', 'llvm-objdump', '--macho', '--arch=x86_64', '--disassemble',
                     '--no-show-raw-insn', '--dis-symname', name, path], 64000, 15, deadline)
                 lines = function_instructions(disassembly, name, start, end) if status == 'ok' else []
