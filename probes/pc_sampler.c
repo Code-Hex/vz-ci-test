@@ -19,22 +19,54 @@
 #include <time.h>
 #include <unistd.h>
 
-#define PC_MAGIC UINT64_C(0x504353414d504c31)
+#include "wait_snapshot.h"
+
+#define PC_MAGIC WAIT_MAGIC
 enum { PC_CPUS = 4, PC_PAGE_BYTES = 4096, PC_INTERVAL_MS = 100 };
 
 struct pc_sample {
   uint64_t seq_before, timestamp_ns, kernel_pc, user_pc, pid, tid, cpu, seq_after;
 };
 
+struct wait_sample {
+  uint64_t seq_before, zero_bits;
+#define WAIT_MEMBER(context, name, index) uint64_t name;
+  WAIT_FIELD_LIST(WAIT_MEMBER, unused)
+#undef WAIT_MEMBER
+  uint64_t seq_after, invalid_count, error_seen, cpu;
+};
+
+struct reader_state {
+  uint64_t pc_sequence[PC_CPUS], wait_sequence[PC_CPUS];
+  uint64_t invalid_count[PC_CPUS];
+  bool error_seen;
+};
+
 struct pc_page {
   uint64_t magic, export_timestamp_ns, out_of_range_cpu, reserved;
   struct pc_sample samples[PC_CPUS];
+  struct wait_sample waits[PC_CPUS];
 };
 
 _Static_assert(sizeof(struct pc_sample) == 64, "DTrace sample ABI");
 _Static_assert(offsetof(struct pc_sample, seq_after) == 56, "DTrace sequence ABI");
 _Static_assert(offsetof(struct pc_page, samples) == 32, "DTrace page header ABI");
-_Static_assert(sizeof(struct pc_page) == 288, "DTrace page ABI");
+_Static_assert(offsetof(struct pc_page, waits) == WAIT_PAGE_OFFSET,
+               "DTrace wait page ABI");
+_Static_assert(sizeof(struct wait_sample) == WAIT_SLOT_BYTES, "wait slot ABI");
+#define WAIT_OFFSET(context, name, index) \
+  _Static_assert(offsetof(struct wait_sample, name) == (2 + index) * 8, \
+                 "wait field ABI: " #name);
+WAIT_FIELD_LIST(WAIT_OFFSET, unused)
+#undef WAIT_OFFSET
+_Static_assert(offsetof(struct wait_sample, seq_after) ==
+                   (2 + WAIT_FIELD_COUNT) * 8, "wait sequence ABI");
+_Static_assert(offsetof(struct wait_sample, invalid_count) ==
+                   (3 + WAIT_FIELD_COUNT) * 8, "wait counter ABI");
+_Static_assert(offsetof(struct wait_sample, error_seen) ==
+                   (4 + WAIT_FIELD_COUNT) * 8, "wait error ABI");
+_Static_assert(offsetof(struct wait_sample, cpu) ==
+                   (5 + WAIT_FIELD_COUNT) * 8, "wait CPU ABI");
 _Static_assert(sizeof(struct pc_page) <= PC_PAGE_BYTES, "page capacity");
 
 static volatile sig_atomic_t stopping;
@@ -103,10 +135,133 @@ static const char *pc_kind(const struct pc_sample *sample) {
   return "unavailable";
 }
 
-static int emit_snapshot(const struct pc_page *page, uint64_t previous[PC_CPUS],
+static bool decode_wait(const struct wait_sample *raw, struct wait_sample *out,
+                        unsigned cpu) {
+  if (raw->seq_before < 2 || (raw->seq_before & 1) ||
+      raw->seq_before != raw->seq_after || raw->cpu != cpu ||
+      (raw->zero_bits & ~WAIT_ZERO_MASK) != 0)
+    return false;
+  *out = *raw;
+#define WAIT_DECODE(context, name, index) \
+  if (raw->name == 0 || ((raw->zero_bits & (UINT64_C(1) << index)) && \
+                        raw->name != 1)) \
+    return false; \
+  out->name = (raw->zero_bits & (UINT64_C(1) << index)) ? 0 : raw->name;
+  WAIT_FIELD_LIST(WAIT_DECODE, unused)
+#undef WAIT_DECODE
+  if (raw->seq_before == 2 && raw->zero_bits != WAIT_ZERO_MASK)
+    return false;
+  return true;
+}
+
+static bool wait_facts_valid(const struct wait_sample *wait,
+                             const struct pc_sample *pc,
+                             uint64_t export_timestamp_ns) {
+  if (wait->seq_before == 2)
+    return true;
+  if (wait->sample_timestamp_ns == 0 ||
+      wait->sample_timestamp_ns > export_timestamp_ns ||
+      wait->profile_generation < 4 || (wait->profile_generation & 1) ||
+      wait->profile_generation > pc->seq_before ||
+      wait->slide > UINT64_MAX - UINT64_C(0xffffff80003f91c9) ||
+      !WAIT_SAFE_PC(wait->rip, wait->slide) || wait->frame == 0 || wait->cs != 8)
+    return false;
+  if (wait->profile_generation == pc->seq_before &&
+      (wait->sample_timestamp_ns < pc->timestamp_ns || wait->pid != pc->pid ||
+       wait->tid != pc->tid || wait->rip != pc->kernel_pc || pc->user_pc != 0))
+    return false;
+  if (wait->profile_generation < pc->seq_before &&
+      wait->sample_timestamp_ns > pc->timestamp_ns)
+    return false;
+  if (wait->base == 0 || wait->top <= wait->base ||
+      wait->top - wait->base != 16384 || (wait->rbp & 7) ||
+      wait->rbp < wait->base + 0x30 || wait->rbp > wait->top - 0x10 ||
+      wait->rsp != wait->rbp - 0x30 || (wait->parent & 7) ||
+      wait->parent < wait->base + 0x78 || wait->parent > wait->top - 0x10 ||
+      wait->parent <= wait->rbp || wait->parent - wait->rbp != 0xc0 ||
+      wait->rbx != wait->parent - 0x70)
+    return false;
+  bool mode_return =
+      (wait->mode == 0 && wait->return_pc == wait->slide + WAIT_UNSLID_SYNC_RETURN) ||
+      (wait->mode == 1 && wait->return_pc == wait->slide + WAIT_UNSLID_ASYNC_RETURN);
+  return mode_return && wait->called == wait->parent_called &&
+         (wait->called & ~wait->requested) == 0 && (wait->called & ~15ULL) == 0 &&
+         (wait->response_before & ~wait->called) == 0 &&
+         (wait->response_after & ~wait->called) == 0 &&
+         (wait->response_before & ~wait->response_after) == 0;
+}
+
+static bool wait_regressed(uint64_t previous, uint64_t current) {
+  return previous > current;
+}
+
+static int emit_waits(const struct pc_page *page, struct reader_state *state,
+                      const bool pc_accepted[PC_CPUS], bool armed) {
+  for (unsigned cpu = 0; cpu < PC_CPUS; ++cpu)
+    if (armed && page->waits[cpu].error_seen != 0)
+      state->error_seen = true;
+  if (printf("],\"wait_observer_error_seen\":%s,\"waits\":[",
+             state->error_seen ? "true" : "false") < 0)
+    return 74;
+  for (unsigned cpu = 0; cpu < PC_CPUS; ++cpu) {
+    const struct wait_sample *raw = &page->waits[cpu];
+    const struct pc_sample *pc = &page->samples[cpu];
+    struct wait_sample wait = {0};
+    bool counters = armed && pc_accepted[cpu] && raw->cpu == cpu &&
+                    raw->error_seen <= 1 &&
+                    raw->invalid_count <= (pc->seq_before - 2) / 2 &&
+                    raw->invalid_count >= state->invalid_count[cpu];
+    bool transport = armed && decode_wait(raw, &wait, cpu);
+    bool regression = transport &&
+                      wait_regressed(state->wait_sequence[cpu], wait.seq_before);
+    bool accepted = transport && !regression && counters &&
+                    wait_facts_valid(&wait, pc, page->export_timestamp_ns);
+    bool captured = accepted && wait.seq_before > 2;
+    if (printf("%s{\"cpu\":%u,\"coherent\":%s,\"trustworthy\":%s,"
+               "\"sequence_regressed\":%s,\"seq_before\":%" PRIu64
+               ",\"seq_after\":%" PRIu64 ",\"counter_transport_valid\":%s,"
+               "\"invalid_count\":%" PRIu64 ",\"error_seen\":%" PRIu64
+               ",\"captured\":%s",
+               cpu == 0 ? "" : ",", cpu, accepted ? "true" : "false",
+               accepted && !state->error_seen ? "true" : "false",
+               regression ? "true" : "false", raw->seq_before, raw->seq_after,
+               counters ? "true" : "false", raw->invalid_count, raw->error_seen,
+               captured ? "true" : "false") < 0)
+      return 74;
+    if (captured) {
+      if (printf(",\"record_kind\":\"latched_wait_sample\","
+                 "\"current_profile_generation\":%" PRIu64
+                 ",\"latest_profile_is_wait_sample\":%s,"
+                 "\"age_at_export_ns\":%" PRIu64
+                 ",\"response_stable\":%s,\"pending_before\":%" PRIu64
+                 ",\"pending_after\":%" PRIu64,
+                 pc->seq_before,
+                 wait.profile_generation == pc->seq_before ? "true" : "false",
+                 page->export_timestamp_ns - wait.sample_timestamp_ns,
+                 wait.response_before == wait.response_after ? "true" : "false",
+                 wait.called & ~wait.response_before,
+                 wait.called & ~wait.response_after) < 0)
+        return 74;
+#define WAIT_PRINT(context, name, index) \
+      if (printf(",\"" #name "\":%" PRIu64, wait.name) < 0) return 74;
+      WAIT_FIELD_LIST(WAIT_PRINT, unused)
+#undef WAIT_PRINT
+    }
+    if (accepted)
+      state->wait_sequence[cpu] = wait.seq_before;
+    if (counters)
+      state->invalid_count[cpu] = raw->invalid_count;
+    if (printf("}") < 0)
+      return 74;
+  }
+  return printf("]}\n") < 0 || fflush(stdout) != 0 ? 74 : 0;
+}
+
+static int emit_snapshot(const struct pc_page *page, struct reader_state *state,
                          uint64_t snapshot, uint64_t mach_before_write_ns,
                          uint64_t mach_after_write_ns) {
   bool armed = page->magic == PC_MAGIC;
+  bool pc_accepted[PC_CPUS] = {0};
   if (printf("{\"event\":\"pc_snapshot\",\"snapshot\":%" PRIu64
              ",\"observed_monotonic_ns\":%" PRIu64
              ",\"mach_before_write_ns\":%" PRIu64
@@ -125,10 +280,11 @@ static int emit_snapshot(const struct pc_page *page, uint64_t previous[PC_CPUS],
   for (unsigned cpu = 0; cpu < PC_CPUS; ++cpu) {
     const struct pc_sample *sample = &page->samples[cpu];
     bool stable = armed && coherent(sample, cpu, page->export_timestamp_ns);
-    bool regression = stable && previous[cpu] > sample->seq_before;
+    bool regression = stable && state->pc_sequence[cpu] > sample->seq_before;
     bool accepted = stable && !regression;
-    bool changed = accepted && sample->seq_before != previous[cpu];
-    uint64_t gap = accepted ? skipped(previous[cpu], sample->seq_before) : 0;
+    pc_accepted[cpu] = accepted;
+    bool changed = accepted && sample->seq_before != state->pc_sequence[cpu];
+    uint64_t gap = accepted ? skipped(state->pc_sequence[cpu], sample->seq_before) : 0;
     if (printf("%s{\"cpu\":%u,\"coherent\":%s,\"sequence_regressed\":%s,"
                "\"seq_before\":%" PRIu64 ",\"seq_after\":%" PRIu64
                ",\"changed\":%s,\"seq_gap\":%" PRIu64,
@@ -148,12 +304,24 @@ static int emit_snapshot(const struct pc_page *page, uint64_t previous[PC_CPUS],
                  sample->tid, sample->kernel_pc, sample->user_pc,
                  pc_kind(sample)) < 0)
         return 74;
-      previous[cpu] = sample->seq_before;
+      state->pc_sequence[cpu] = sample->seq_before;
     }
     if (printf("}") < 0)
       return 74;
   }
-  return printf("]}\n") < 0 || fflush(stdout) != 0 ? 74 : 0;
+  return emit_waits(page, state, pc_accepted, armed);
+}
+
+static struct wait_sample encode_wait_fixture(struct wait_sample wait) {
+  wait.zero_bits = 0;
+#define WAIT_ENCODE(context, name, index) \
+  if (wait.name == 0) { \
+    wait.zero_bits |= UINT64_C(1) << index; \
+    wait.name = 1; \
+  }
+  WAIT_FIELD_LIST(WAIT_ENCODE, unused)
+#undef WAIT_ENCODE
+  return wait;
 }
 
 static int self_test(void) {
@@ -174,12 +342,15 @@ static int self_test(void) {
       parse_milliseconds("10ms", 1000, &parsed))
     return 70;
   struct pc_page page = {.magic = PC_MAGIC, .export_timestamp_ns = 1000};
-  uint64_t previous[PC_CPUS] = {0};
-  for (unsigned cpu = 0; cpu < PC_CPUS; ++cpu)
+  struct reader_state state = {0};
+  for (unsigned cpu = 0; cpu < PC_CPUS; ++cpu) {
     page.samples[cpu] = (struct pc_sample){.seq_before = 2,
                                           .cpu = cpu,
                                           .seq_after = 2};
-  page.samples[0] = (struct pc_sample){4, 500, 0xffffff8000001234ULL,
+    page.waits[cpu] = encode_wait_fixture((struct wait_sample){
+        .seq_before = 2, .seq_after = 2, .cpu = cpu});
+  }
+  page.samples[0] = (struct pc_sample){4, 500, 0xffffff80003f91c2ULL,
                                       0, 17, 19, 0, 4};
   page.samples[1] = (struct pc_sample){10, 750, 0, 0x10001234, 23, 29, 1, 10};
   page.samples[2].seq_before = 5;
@@ -192,7 +363,73 @@ static int self_test(void) {
       strcmp(pc_kind(&page.samples[0]), "kernel_interrupt_pc") != 0 ||
       strcmp(pc_kind(&page.samples[1]), "user_interrupt_pc") != 0)
     return 70;
-  return emit_snapshot(&page, previous, 1, 100000, 100010);
+  struct wait_sample expected = {
+      .seq_before = 4, .seq_after = 4, .cpu = 0,
+      .sample_timestamp_ns = 510, .profile_generation = 4, .pid = 17, .tid = 19,
+      .rip = UINT64_C(0xffffff80003f91c2),
+      .base = UINT64_C(0xffffff9000000000),
+      .top = UINT64_C(0xffffff9000004000),
+      .parent = UINT64_C(0xffffff9000001000),
+      .rbp = UINT64_C(0xffffff9000000f40),
+      .rbx = UINT64_C(0xffffff9000000f90),
+      .rsp = UINT64_C(0xffffff9000000f10), .cs = 8, .rflags = 0x202,
+      .frame = UINT64_C(0xffffff9000002000),
+      .return_pc = WAIT_UNSLID_ASYNC_RETURN, .mode = 1,
+      .requested = UINT64_MAX, .called = 6, .parent_called = 6,
+      .response_before = 2, .response_after = 6,
+      .action = UINT64_MAX, .action_arg0 = 0, .action_arg1 = UINT64_MAX};
+  page.waits[0] = encode_wait_fixture(expected);
+  struct wait_sample decoded;
+  if (!decode_wait(&page.waits[0], &decoded, 0) ||
+      decoded.requested != UINT64_MAX || decoded.action != UINT64_MAX ||
+      decoded.action_arg0 != 0 || decoded.action_arg1 != UINT64_MAX ||
+      !wait_facts_valid(&decoded, &page.samples[0], 1000) ||
+      wait_facts_valid(&decoded, &page.samples[0], 499) ||
+      !wait_regressed(6, 4) || wait_regressed(4, 4) || wait_regressed(4, 6))
+    return 70;
+  struct wait_sample bad = page.waits[0];
+  bad.seq_before = 5;
+  if (decode_wait(&bad, &decoded, 0)) return 70;
+  bad = page.waits[0];
+  bad.seq_after = 6;
+  if (decode_wait(&bad, &decoded, 0) || decode_wait(&page.waits[0], &decoded, 1))
+    return 70;
+  bad = page.waits[0];
+  bad.action_arg0 = 0;
+  if (decode_wait(&bad, &decoded, 0)) return 70;
+  bad = page.waits[0];
+  bad.zero_bits |= UINT64_C(1) << WAIT_FIELD_COUNT;
+  if (decode_wait(&bad, &decoded, 0)) return 70;
+  bad = expected;
+  bad.parent++;
+  if (wait_facts_valid(&bad, &page.samples[0], 1000)) return 70;
+  bad = expected;
+  bad.response_after = 16;
+  if (wait_facts_valid(&bad, &page.samples[0], 1000)) return 70;
+  bad = expected;
+  bad.response_after = 0;
+  if (wait_facts_valid(&bad, &page.samples[0], 1000)) return 70;
+  bad = expected;
+  bad.profile_generation = 6;
+  if (wait_facts_valid(&bad, &page.samples[0], 1000)) return 70;
+  bad = expected;
+  bad.mode = 0;
+  if (wait_facts_valid(&bad, &page.samples[0], 1000)) return 70;
+  bad = expected;
+  bad.sample_timestamp_ns = 499;
+  if (wait_facts_valid(&bad, &page.samples[0], 1000)) return 70;
+  struct pc_sample later_pc = page.samples[0];
+  later_pc.seq_before = later_pc.seq_after = 6;
+  later_pc.timestamp_ns = 600;
+  later_pc.kernel_pc = 0;
+  later_pc.user_pc = 0x10001234;
+  if (!wait_facts_valid(&expected, &later_pc, 1000)) return 70;
+  bad = expected;
+  bad.sample_timestamp_ns = 601;
+  if (wait_facts_valid(&bad, &later_pc, 1000)) return 70;
+  if (!decode_wait(&page.waits[3], &decoded, 3) || decoded.rip != 0 ||
+      !wait_facts_valid(&decoded, &page.samples[3], 1000)) return 70;
+  return emit_snapshot(&page, &state, 1, 100000, 100010);
 }
 
 int main(int argc, char **argv) {
@@ -258,13 +495,15 @@ int main(int argc, char **argv) {
              "\"address\":%" PRIuPTR ",\"bytes\":%u,\"fd\":%d,"
              "\"cpu_slots\":%u,\"maximum_cpus\":%d,\"interval_ms\":%lu,"
              "\"duration_ms\":%lu,\"complete_trace\":false,"
+             "\"abi_version\":2,\"wait_slots\":4,"
              "\"requested_qos\":\"%s\","
              "\"clock_sources\":{"
              "\"observed_monotonic_ns\":\"CLOCK_MONOTONIC\","
              "\"mach_before_write_ns\":\"mach_absolute_time*timebase\","
              "\"mach_after_write_ns\":\"mach_absolute_time*timebase\","
              "\"export_timestamp_ns\":\"DTrace timestamp\","
-             "\"sample_timestamp_ns\":\"DTrace timestamp\"},"
+             "\"sample_timestamp_ns\":\"DTrace timestamp\","
+             "\"wait_sample_timestamp_ns\":\"DTrace timestamp, cached within wait clause\"},"
              "\"mach_timebase_numer\":%u,\"mach_timebase_denom\":%u}\n",
              (long)getpid(), (uintptr_t)page, PC_PAGE_BYTES, fd, PC_CPUS,
              maximum_cpus, interval_ms, duration_ms,
@@ -272,7 +511,7 @@ int main(int argc, char **argv) {
              timebase.numer, timebase.denom) < 0 ||
       fflush(stdout) != 0)
     result = 74;
-  uint64_t previous[PC_CPUS] = {0};
+  struct reader_state state = {0};
   uint64_t started = monotonic_ns();
   if (started == 0)
     result = 71;
@@ -303,7 +542,7 @@ int main(int argc, char **argv) {
     }
     // For armed exports, Mach - DTrace lies between before - export and
     // after - export. The syscall can be preempted, so retain both bounds.
-    result = emit_snapshot(page, previous, ++snapshot, mach_before_write_ns,
+    result = emit_snapshot(page, &state, ++snapshot, mach_before_write_ns,
                            mach_after_write_ns);
     if (page->magic == PC_MAGIC && page->out_of_range_cpu != 0)
       result = 77;
