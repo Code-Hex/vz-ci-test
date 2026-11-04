@@ -789,14 +789,17 @@ def controller(ctx, token):
 
 def main():
     if len(sys.argv) < 2:
-        raise ValueError("usage: reboot-recovery.py prepare|arm|trigger|reboot|controller")
+        raise ValueError("usage: reboot-recovery.py prepare|arm|trigger|reboot|controller|cleanup")
     op = sys.argv[1]
-    if op in ("prepare", "arm", "reboot", "trigger", "controller") and len(sys.argv) == 2:
+    if op in ("prepare", "arm", "reboot", "trigger", "controller", "cleanup") and len(sys.argv) == 2:
         ctx = context_from_env()
-        require_context(ctx, "Linux" if op == "controller" else "Darwin")
+        require_context(ctx, "Linux" if op in ("controller", "cleanup") else "Darwin")
         token = os.environ.pop("GITHUB_TOKEN", "") if op not in ("reboot", "trigger") else ""
         if op not in ("reboot", "trigger") and not token:
             raise ValueError("GITHUB_TOKEN missing")
+        if op == "cleanup":
+            cleanup_old_check(ctx, token, os.environ.get("RECOVERY_CLEANUP_CHECK_ID", ""))
+            return
         if op == "controller":
             cleanup_id = os.environ.get("RECOVERY_CLEANUP_CHECK_ID", "")
             if cleanup_id:

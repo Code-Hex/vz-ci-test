@@ -1,8 +1,12 @@
 import importlib.util
+import contextlib
+import io
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("recovery", Path(__file__).with_name("reboot-recovery.py"))
 r = importlib.util.module_from_spec(spec)
@@ -10,6 +14,54 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def cleanup_cli(self, *, check_id="126520221299", token="test-job-token", status="in_progress", system="Linux", repo="Code-Hex/vz-ci-test"):
+        old_sha = "a" * 40
+        check = {"id": 126520221299, "name": "Runner recovery 41814026408", "head_sha": old_sha,
+                 "external_id": "41814026408/1/" + old_sha, "app": {"slug": "github-actions", "id": 15368},
+                 "details_url": "https://github.com/Code-Hex/vz-ci-test/runs/126520221299", "status": status}
+        env = {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": repo, "GITHUB_RUN_ID": "999",
+               "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "b" * 40, "GITHUB_REF": "refs/heads/main",
+               "GITHUB_EVENT_NAME": "workflow_dispatch", "RUNNER_ENVIRONMENT": "github-hosted",
+               "GITHUB_TOKEN": token, "RECOVERY_CLEANUP_CHECK_ID": check_id}
+        calls = []
+
+        def api(method, url, credential, payload=None):
+            self.assertEqual(credential, token)
+            self.assertEqual(url, r.CHECKS + "/126520221299")
+            calls.append((method, payload))
+            if method == "GET":
+                return check
+            self.assertEqual(method, "PATCH")
+            return {}
+
+        def command(command):
+            return {("/usr/bin/uname", "-s"): system, ("/usr/bin/uname", "-m"): "x86_64",
+                    ("/usr/sbin/sysctl", "-n", "kern.uuid"): r.KERNEL_UUID}[tuple(command)]
+
+        def forbidden(*_args, **_kwargs):
+            self.fail("cleanup entered controller or sudo path")
+
+        with patch.dict(os.environ, env, clear=True), patch.object(r.sys, "argv", ["reboot-recovery.py", "cleanup"]), \
+                patch.object(r, "api", api), patch.object(r, "command_output", command), \
+                patch.object(r, "controller", forbidden), patch.object(r, "sudo_call", forbidden), \
+                contextlib.redirect_stdout(io.StringIO()):
+            r.main()
+        return calls
+
+    def test_cleanup_cli_only_cancels_verified_old_check(self):
+        self.assertEqual(self.cleanup_cli(), [("GET", None), ("PATCH", {
+            "status": "completed", "conclusion": "cancelled",
+            "output": {"title": "Prior recovery attempt cancelled", "summary": "Superseded recovery attempt."}})])
+
+    def test_cleanup_cli_completed_check_needs_no_patch(self):
+        self.assertEqual(self.cleanup_cli(status="completed"), [("GET", None)])
+
+    def test_cleanup_cli_requires_token_id_and_linux_context(self):
+        for options in ({"token": ""}, {"check_id": ""}, {"check_id": "../126520221299"},
+                        {"system": "Darwin"}, {"repo": "other"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.cleanup_cli(**options)
+
     def test_guard(self):
         ctx = {"actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "2",
                "sha": "a" * 40, "ref": "refs/heads/main", "event": "workflow_dispatch",

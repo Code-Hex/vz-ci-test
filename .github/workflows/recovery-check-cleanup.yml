@@ -1,0 +1,30 @@
+name: Close a prior recovery check
+
+on:
+  workflow_dispatch:
+    inputs:
+      check_id:
+        description: Prior recovery check identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  cleanup:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check out trusted diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Close only the matching old recovery check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RECOVERY_CLEANUP_CHECK_ID: ${{ inputs.check_id }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py cleanup
