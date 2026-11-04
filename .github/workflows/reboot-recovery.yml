@@ -15,6 +15,7 @@ on:
         options:
           - reboot
           - panic-control
+          - panic-force-reset
         default: reboot
       report_cert:
         description: Public recipient certificate for encrypted panic reports
@@ -61,10 +62,14 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Build the guarded force-reset helper
+        if: ${{ inputs.trigger == 'panic-force-reset' }}
+        run: xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -std=c11 -Wall -Wextra -Werror -O1 probes/reboot_force_reset.c -o "$RUNNER_TEMP/recovery-force-reset"
       - name: Publish the runner recovery public key
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RECOVERY_REPORT_CERT: ${{ inputs.report_cert }}
+          RECOVERY_FORCE_HELPER: ${{ runner.temp }}/recovery-force-reset
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py prepare
       - name: Receive the controller token and verify the armed reporter
         env:

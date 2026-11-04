@@ -9,6 +9,7 @@ from pathlib import Path
 import plistlib
 import re
 import secrets
+import stat
 import signal
 import subprocess
 import sys
@@ -26,12 +27,24 @@ CHECKS = API + "/check-runs"
 def valid_context(ctx, system, machine, kernel_uuid=None):
     common = (ctx.get("actions") == "true" and ctx.get("repo") == REPO and
               ctx.get("ref") == "refs/heads/main" and ctx.get("event") == "workflow_dispatch" and
-              ctx.get("runner_environment") == "github-hosted" and ctx.get("trigger", "reboot") in ("reboot", "panic-control") and
+              ctx.get("runner_environment") == "github-hosted" and ctx.get("trigger", "reboot") in ("reboot", "panic-control", "panic-force-reset") and
               bool(re.fullmatch(r"[1-9][0-9]{0,19}", str(ctx.get("run_id", "")))) and
               bool(re.fullmatch(r"[1-9][0-9]{0,4}", str(ctx.get("attempt", "")))) and
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))))
     return bool(common and machine == "x86_64" and
                 ((system == "Darwin" and str(kernel_uuid).upper() == KERNEL_UUID) or system == "Linux"))
+
+
+def force_marker(ctx, nonce):
+    run, attempt = ctx.get("run_id", ""), ctx.get("attempt", "")
+    if (not re.fullmatch(r"[1-9][0-9]{0,19}", run) or not re.fullmatch(r"[1-9][0-9]{0,4}", attempt) or
+            not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{64}", nonce)):
+        raise ValueError("force reset marker invalid")
+    return "vz-force-reset:" + run + ":" + attempt + ":" + nonce
+
+
+def panic_mode(ctx):
+    return ctx.get("trigger", "reboot") in ("panic-control", "panic-force-reset")
 
 
 def binding(ctx):
@@ -278,12 +291,29 @@ def prepare_root(payload):
         raise ValueError("daemon Python executable unavailable")
     cert = payload.get("report_cert", "").encode()
     fingerprint = ""
-    if ctx.get("trigger", "reboot") == "panic-control":
+    if panic_mode(ctx):
         fingerprint = recovery_reports.encrypt_bundle(cert, {"preflight": True}, b"synthetic")["cert_fingerprint"]
     directory = root_dir(ctx)
     directory.mkdir(mode=0o700)
     if fingerprint:
         private_write(directory / "report-cert.pem", cert)
+    if ctx.get("trigger") == "panic-force-reset":
+        helper_path = payload.get("force_helper", "")
+        if not isinstance(helper_path, str) or not os.path.isabs(helper_path) or Path(helper_path).name != "recovery-force-reset":
+            raise ValueError("force helper path invalid")
+        fd = os.open(helper_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError("force helper must be a regular file")
+            helper_data = stream.read(4 * 1024 * 1024 + 1)
+        if not helper_data or len(helper_data) > 4 * 1024 * 1024:
+            raise ValueError("force helper size invalid")
+        helper = directory / "reboot-force-reset"
+        private_write(helper, helper_data)
+        os.chmod(helper, 0o700)
+        helper_sha = hashlib.sha256(helper_data).hexdigest()
+    else:
+        helper_sha = ""
     private = directory / "key.pem"
     fd = os.open(private, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as stream:
@@ -303,7 +333,7 @@ def prepare_root(payload):
                 "output": {"title": "Awaiting controller", "summary": summary}})
     if not isinstance(check.get("id"), int) or check["id"] <= 0:
         raise ValueError("invalid check identifier")
-    config = {"context": ctx, "baseline": baseline, "check_id": check["id"], "nonce": nonce, "python": python, "cert_fingerprint": fingerprint}
+    config = {"context": ctx, "baseline": baseline, "check_id": check["id"], "nonce": nonce, "python": python, "cert_fingerprint": fingerprint, "helper_sha256": helper_sha}
     private_write(directory / "config.json", json.dumps(config).encode())
     private_write(directory / "recovery.py", Path(__file__).read_bytes())
     private_write(directory / "recovery_reports.py", Path(recovery_reports.__file__).read_bytes())
@@ -437,16 +467,110 @@ def panic_execute_root(payload):
     raise RuntimeError("panic action unexpectedly returned")
 
 
+def force_helper_env(config):
+    ctx = config["context"]
+    return {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "GITHUB_ACTIONS": ctx["actions"],
+            "GITHUB_EVENT_NAME": ctx["event"], "GITHUB_REPOSITORY": ctx["repo"], "GITHUB_REF": ctx["ref"],
+            "RUNNER_ENVIRONMENT": ctx["runner_environment"], "GITHUB_RUN_ID": ctx["run_id"],
+            "GITHUB_RUN_ATTEMPT": ctx["attempt"], "GITHUB_SHA": ctx["sha"], "RECOVERY_TRIGGER": ctx["trigger"],
+            "VZ_RECOVERY_NONCE": config["nonce"], "VZ_RECOVERY_BOOT_UUID": config["baseline"]}
+
+
+def force_helper_checked(directory, config):
+    helper = directory / "reboot-force-reset"
+    if not helper.is_file() or helper.is_symlink() or hashlib.sha256(helper.read_bytes()).hexdigest() != config.get("helper_sha256"):
+        raise ValueError("force helper identity mismatch")
+    return helper
+
+
+def force_preflight_root(payload):
+    root_only()
+    ctx = payload["context"]
+    require_context(ctx, "Darwin")
+    if ctx.get("trigger") != "panic-force-reset":
+        raise ValueError("force trigger not selected")
+    directory = root_dir(ctx)
+    config = load_config(directory)
+    verify_root(payload)
+    if config["context"] != ctx or (directory / "trigger.json").exists():
+        raise ValueError("force trigger identity or once guard")
+    helper = force_helper_checked(directory, config)
+    baseline = recovery_reports.inventory()
+    private_write(directory / "report-baseline.json", json.dumps(baseline, separators=(",", ":")).encode())
+    sync_directory(directory)
+    result = subprocess.run([str(helper), "preflight"], env=force_helper_env(config), capture_output=True,
+                            text=True, timeout=10)
+    if result.returncode != 0:
+        failure = safe_force_preflight_error(result.stderr)
+        if failure is not None:
+            print(json.dumps(failure), flush=True)
+        raise RuntimeError("force helper preflight failed")
+    fact = json.loads(result.stdout)
+    if (fact.get("event") != "force_reset_preflight" or fact.get("symbol_available") is not True or
+            fact.get("flags") != 0x2c00 or fact.get("entitlement_verified") is not False):
+        raise ValueError("force helper preflight invalid")
+    marker = force_marker(ctx, config["nonce"])
+    prepared = {"trigger": "panic-force-reset", "helper_sha256": config["helper_sha256"],
+                "marker_sha256": hashlib.sha256(marker.encode()).hexdigest(), "boot_uuid": config["baseline"]}
+    private_write(directory / "force-preflight.json", json.dumps(prepared).encode())
+    sync_directory(directory)
+    print(json.dumps({"event": "force_preflight_complete", "preboot_patch": True,
+                      "symbol_available": True, "entitlement_verified": False, "flags": 0x2c00}), flush=True)
+
+
+def force_execute_root(payload):
+    root_only()
+    ctx = payload["context"]
+    require_context(ctx, "Darwin")
+    if ctx.get("trigger") != "panic-force-reset":
+        raise ValueError("force trigger not selected")
+    directory = root_dir(ctx)
+    config = load_config(directory)
+    verify_root(payload)
+    helper = force_helper_checked(directory, config)
+    prepared = json.loads((directory / "force-preflight.json").read_text())
+    marker = force_marker(ctx, config["nonce"])
+    if (config["context"] != ctx or prepared.get("trigger") != "panic-force-reset" or
+            prepared.get("boot_uuid") != config["baseline"] or prepared.get("helper_sha256") != config["helper_sha256"] or
+            prepared.get("marker_sha256") != hashlib.sha256(marker.encode()).hexdigest()):
+        raise ValueError("force preflight changed")
+    private_write(directory / "trigger.json", json.dumps(prepared).encode())
+    sync_directory(directory)
+    os.sync()
+    result = subprocess.run([str(helper), "execute"], env=force_helper_env(config), capture_output=True,
+                            text=True, timeout=30)
+    for line in result.stderr.splitlines():
+        try:
+            fact = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(fact, dict) and fact.get("event") == "force_reset_unexpected_return" and
+                type(fact.get("result")) is int and -1 <= fact["result"] <= 0 and
+                type(fact.get("errno")) is int and 0 <= fact["errno"] <= 4095):
+            print(json.dumps({"event": "force_reset_unexpected_return", "result": fact["result"],
+                              "errno": fact["errno"]}), flush=True)
+    raise RuntimeError("force reset unexpectedly returned")
+
+
 def panic_capture(directory, config, current, deadline):
     baseline = json.loads((directory / "report-baseline.json").read_text())
     marker = json.loads((directory / "trigger.json").read_text())
-    if (marker.get("boot_uuid") != config["baseline"] or marker.get("new_timeout") != "5" or
-            marker.get("source_sha256") != hashlib.sha256(PANIC_SOURCE.encode()).hexdigest()):
+    trigger = config["context"].get("trigger", "reboot")
+    expected_marker = None
+    if trigger == "panic-control":
+        valid = (marker.get("new_timeout") == "5" and marker.get("source_sha256") == hashlib.sha256(PANIC_SOURCE.encode()).hexdigest())
+    elif trigger == "panic-force-reset":
+        expected_marker = force_marker(config["context"], config["nonce"])
+        valid = (marker.get("trigger") == trigger and marker.get("helper_sha256") == config.get("helper_sha256") and
+                 marker.get("marker_sha256") == hashlib.sha256(expected_marker.encode()).hexdigest())
+    else:
+        valid = False
+    if marker.get("boot_uuid") != config["baseline"] or not valid:
         raise ValueError("trigger marker invalid")
     capture_deadline = deadline - 45
     while time.monotonic() < capture_deadline:
         try:
-            capture = recovery_reports.select_stable(recovery_reports.ROOTS, baseline)
+            capture = recovery_reports.select_stable(recovery_reports.ROOTS, baseline, trigger=trigger, marker=expected_marker)
             metadata = {"binding": binding(config["context"]), "nonce": config["nonce"],
                         "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
                         "kernel_uuid": KERNEL_UUID, "report_sha256": capture["sha256"]}
@@ -483,7 +607,7 @@ def collect(directory):
     deadline = time.monotonic() + 180
     envelope = None
     capture_state = "boot_only"
-    if config["context"].get("trigger", "reboot") == "panic-control":
+    if panic_mode(config["context"]):
         try:
             envelope = panic_capture(directory, config, current, deadline)
             capture_state = "captured"
@@ -506,7 +630,7 @@ def collect(directory):
         output = {"title": "Panic report unavailable", "summary": json.dumps({"protocol": "vz-recovery-v1",
                   "phase": "boot_observed", "binding": binding(config["context"]), "nonce": config["nonce"],
                   "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
-                  "trigger": "panic-control", "cert_fingerprint": config.get("cert_fingerprint", ""),
+                  "trigger": config["context"].get("trigger", "reboot"), "cert_fingerprint": config.get("cert_fingerprint", ""),
                   "capture_state": "oversized"})}
     payload = {"status": "completed", "conclusion": "success" if successful else "failure", "output": output}
     while time.monotonic() < deadline:
@@ -547,10 +671,43 @@ def root_error_kind(stderr):
     return "unknown"
 
 
+def safe_force_preflight_error(output):
+    allowed = {"force_reset_guard_failed", "force_reset_symbol_unavailable"}
+    for line in reversed(output.splitlines()):
+        try:
+            fact = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(fact, dict) and isinstance(fact.get("event"), str) and fact["event"] in allowed:
+            return {"event": fact["event"]}
+    return None
+
+
+def safe_force_return(stdout):
+    for line in reversed(stdout.splitlines()):
+        try:
+            fact = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(fact, dict) and fact.get("event") == "force_reset_unexpected_return" and
+                type(fact.get("result")) is int and -1 <= fact["result"] <= 0 and
+                type(fact.get("errno")) is int and 0 <= fact["errno"] <= 4095):
+            return {"event": "force_reset_unexpected_return", "result": fact["result"], "errno": fact["errno"]}
+    return None
+
+
 def sudo_call(operation, payload, timeout=40):
     proc = subprocess.run(["/usr/bin/sudo", "-n", sys.executable, str(Path(__file__).resolve()), operation],
                           input=json.dumps(payload), text=True, capture_output=True, timeout=timeout)
     if proc.returncode != 0:
+        if operation == "force-execute-root":
+            fact = safe_force_return(proc.stdout)
+            if fact is not None:
+                print(json.dumps(fact), flush=True)
+        elif operation == "force-preflight-root":
+            fact = safe_force_preflight_error(proc.stdout)
+            if fact is not None:
+                print(json.dumps(fact), flush=True)
         print(json.dumps({"event": "root_operation_failed", "operation": operation,
                           "returncode": proc.returncode, "root_error_kind": root_error_kind(proc.stderr)}), flush=True)
         raise RuntimeError("root operation failed")
@@ -579,7 +736,7 @@ def controller(ctx, token):
                     data = json.loads(check.get("output", {}).get("summary", "{}"))
                     if check.get("status") == "completed":
                         matches = pending is not None and boot_proof_matches(data, pending, ctx)
-                        if matches and ctx.get("trigger", "reboot") == "panic-control":
+                        if matches and panic_mode(ctx):
                             matches = panic_envelope_matches(data, check.get("output", {}).get("text", ""), pending, ctx)
                         if matches and check.get("conclusion") == "success":
                             print(json.dumps({"event": "controller_boot_proof", "check_id": check_id}), flush=True)
@@ -591,7 +748,7 @@ def controller(ctx, token):
                         if not re.fullmatch(r"[0-9a-f]{64}", nonce) or not re.fullmatch(r"[0-9A-Fa-f-]{36}", baseline):
                             raise ValueError("nonce or baseline invalid")
                         fingerprint = data.get("cert_fingerprint", "")
-                        if ctx.get("trigger", "reboot") == "panic-control" and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+                        if panic_mode(ctx) and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
                             raise ValueError("certificate fingerprint invalid")
                         if ctx.get("trigger", "reboot") == "reboot" and fingerprint:
                             raise ValueError("unexpected certificate fingerprint")
@@ -647,7 +804,8 @@ def main():
             controller(ctx, token)
         elif op == "prepare":
             print(sudo_call("prepare-root", {"context": ctx, "token": token,
-                            "report_cert": os.environ.pop("RECOVERY_REPORT_CERT", "")}, timeout=120), end="", flush=True)
+                            "report_cert": os.environ.pop("RECOVERY_REPORT_CERT", ""),
+                            "force_helper": os.environ.pop("RECOVERY_FORCE_HELPER", "")}, timeout=120), end="", flush=True)
         elif op == "arm":
             print(sudo_call("arm-root", {"context": ctx, "token": token}, timeout=510), end="", flush=True)
             deadline = time.monotonic() + 20
@@ -662,14 +820,18 @@ def main():
         elif op == "trigger" and ctx.get("trigger") == "panic-control":
             print(sudo_call("panic-preflight-root", {"context": ctx}, timeout=70), end="", flush=True)
             print(sudo_call("panic-execute-root", {"context": ctx}, timeout=45), end="", flush=True)
+        elif op == "trigger" and ctx.get("trigger") == "panic-force-reset":
+            print(sudo_call("force-preflight-root", {"context": ctx}, timeout=70), end="", flush=True)
+            print(sudo_call("force-execute-root", {"context": ctx}, timeout=45), end="", flush=True)
         else:
             if ctx.get("trigger", "reboot") != "reboot":
                 raise ValueError("wrong trigger operation")
             print(sudo_call("verify-root", {"context": ctx}), end="", flush=True)
             os.sync()
             subprocess.run(["/usr/bin/sudo", "-n", "/sbin/reboot"], check=True, timeout=15)
-    elif op in ("prepare-root", "arm-root", "verify-root", "panic-preflight-root", "panic-execute-root") and len(sys.argv) == 2:
-        {"prepare-root": prepare_root, "arm-root": arm_root, "verify-root": verify_root, "panic-preflight-root": panic_preflight_root, "panic-execute-root": panic_execute_root}[op](json.load(sys.stdin))
+    elif op in ("prepare-root", "arm-root", "verify-root", "panic-preflight-root", "panic-execute-root", "force-preflight-root", "force-execute-root") and len(sys.argv) == 2:
+        {"prepare-root": prepare_root, "arm-root": arm_root, "verify-root": verify_root, "panic-preflight-root": panic_preflight_root, "panic-execute-root": panic_execute_root,
+         "force-preflight-root": force_preflight_root, "force-execute-root": force_execute_root}[op](json.load(sys.stdin))
     elif op == "collect" and len(sys.argv) == 3:
         collect(Path(sys.argv[2]))
     else:

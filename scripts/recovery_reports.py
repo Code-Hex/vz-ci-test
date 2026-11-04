@@ -61,7 +61,7 @@ def inventory(roots=ROOTS):
     return found
 
 
-def match_report(data, suffix):
+def match_report(data, suffix, trigger="panic-control", marker=None):
     text = data.decode("utf-8")
     if suffix.lower() == ".ips":
         decoder = json.JSONDecoder()
@@ -95,12 +95,21 @@ def match_report(data, suffix):
             raise ValueError("kernel UUID missing or mismatch")
     else:
         raise ValueError("report suffix invalid")
-    if not SIGNATURE.match(message):
+    if trigger == "panic-control":
+        matched = SIGNATURE.match(message)
+    elif trigger == "panic-force-reset":
+        if not isinstance(marker, str) or not re.fullmatch(r"vz-force-reset:[1-9][0-9]{0,19}:[1-9][0-9]{0,4}:[0-9a-f]{64}", marker):
+            raise ValueError("force reset marker invalid")
+        pattern = r"^panic\(cpu [0-9]+(?: caller (?:0x)?[0-9a-fA-F]+)?\): userspace panic: " + re.escape(marker) + r"(?=\r?\n|$)"
+        matched = re.match(pattern, message)
+    else:
+        raise ValueError("unknown report trigger")
+    if not matched:
         raise ValueError("panic signature mismatch")
     return True
 
 
-def select_stable(roots, baseline, interval=2):
+def select_stable(roots, baseline, interval=2, trigger="panic-control", marker=None):
     previous = None
     selected = None
     for turn in range(3):
@@ -121,7 +130,7 @@ def select_stable(roots, baseline, interval=2):
         previous, selected = identity, {"data": data, "sha256": info["sha256"]}
         if turn < 2 and interval:
             time.sleep(interval)
-    match_report(selected["data"], Path(previous[0]).suffix)
+    match_report(selected["data"], Path(previous[0]).suffix, trigger, marker)
     return selected
 
 

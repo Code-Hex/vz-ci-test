@@ -21,11 +21,35 @@ class Recovery(unittest.TestCase):
         self.assertFalse(r.valid_context(ctx, "Darwin", "arm64", r.KERNEL_UUID))
         self.assertFalse(r.valid_context(ctx, "Darwin", "x86_64", "bad"))
 
+    def test_force_preflight_errors_are_whitelisted(self):
+        self.assertEqual(r.safe_force_preflight_error('secret\n{"event":"force_reset_guard_failed","token":"secret"}'), {"event": "force_reset_guard_failed"})
+        self.assertEqual(r.safe_force_preflight_error('{"event":"force_reset_symbol_unavailable"}'), {"event": "force_reset_symbol_unavailable"})
+        self.assertIsNone(r.safe_force_preflight_error('{"event":"secret"}'))
+        self.assertIsNone(r.safe_force_preflight_error('{"event":[]}'))
+
+    def test_force_return_diagnostic_is_numeric_and_redacted(self):
+        text = 'secret\n{"event":"force_reset_unexpected_return","result":-1,"errno":1,"token":"secret"}\n'
+        self.assertEqual(r.safe_force_return(text), {"event": "force_reset_unexpected_return", "result": -1, "errno": 1})
+        self.assertIsNone(r.safe_force_return('{"event":"force_reset_unexpected_return","result":"secret","errno":1}'))
+        self.assertIsNone(r.safe_force_return('secret'))
+
     def test_root_error_kind_is_whitelisted(self):
         self.assertEqual(r.root_error_kind('noise SECRET\n{"event":"recovery_error","kind":"ValueError"}\n'), "ValueError")
         self.assertEqual(r.root_error_kind('{"event":"recovery_error","kind":"SECRET"}'), "unknown")
         self.assertEqual(r.root_error_kind('{"event":"other","kind":"ValueError"}'), "unknown")
         self.assertEqual(r.root_error_kind('unstructured SECRET'), "unknown")
+
+    def test_force_reset_marker_and_guard(self):
+        ctx = {"actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "1",
+               "sha": "a" * 40, "ref": "refs/heads/main", "event": "workflow_dispatch",
+               "runner_environment": "github-hosted", "trigger": "panic-force-reset"}
+        self.assertTrue(r.valid_context(ctx, "Darwin", "x86_64", r.KERNEL_UUID))
+        self.assertTrue(r.valid_context(dict(ctx, trigger="panic-control"), "Darwin", "x86_64", r.KERNEL_UUID))
+        self.assertTrue(r.valid_context(dict(ctx, trigger="reboot"), "Darwin", "x86_64", r.KERNEL_UUID))
+        self.assertFalse(r.valid_context(dict(ctx, trigger="unknown"), "Darwin", "x86_64", r.KERNEL_UUID))
+        self.assertEqual(r.force_marker(ctx, "b" * 64), "vz-force-reset:123:1:" + "b" * 64)
+        with self.assertRaises(ValueError):
+            r.force_marker(ctx, "not-a-nonce")
 
     def test_only_changed_nonempty_boot_is_recovery(self):
         self.assertFalse(r.reboot_observed("abc", "abc"))
@@ -77,6 +101,9 @@ class Recovery(unittest.TestCase):
         self.assertFalse(r.panic_envelope_matches(dict(data, cert_fingerprint="d" * 64), encoded, pending, ctx))
         self.assertFalse(r.panic_envelope_matches(dict(data, trigger="reboot"), encoded, pending, ctx))
         self.assertFalse(r.panic_envelope_matches(dict(data, baseline_boot_uuid="wrong"), encoded, pending, ctx))
+        force_ctx = dict(ctx, trigger="panic-force-reset")
+        self.assertTrue(r.panic_envelope_matches(dict(data, trigger="panic-force-reset"), encoded, pending, force_ctx))
+        self.assertFalse(r.panic_envelope_matches(data, encoded, pending, force_ctx))
 
     def test_old_check_cleanup_validates_canonical_binding(self):
         old_sha = "a" * 40

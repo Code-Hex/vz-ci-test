@@ -51,6 +51,20 @@ class Reports(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.match_report(json.dumps({"panicString": "panic(cpu 2): unrelated\n" + header, "kernelUUID": r.KERNEL_UUID}).encode(), ".ips")
 
+    def test_force_reset_requires_exact_run_marker(self):
+        marker = "vz-force-reset:123:1:" + "a" * 64
+        message = "panic(cpu 2 caller 0xffffff8001234567): userspace panic: " + marker
+        report = json.dumps({"panicString": message, "kernelUUID": r.KERNEL_UUID}).encode()
+        self.assertTrue(r.match_report(report, ".ips", "panic-force-reset", marker))
+        with self.assertRaises(ValueError):
+            r.match_report(json.dumps({"panicString": message + " extra", "kernelUUID": r.KERNEL_UUID}).encode(), ".ips", "panic-force-reset", marker)
+        with self.assertRaises(ValueError):
+            r.match_report(report, ".ips", "panic-force-reset", marker[:-1] + "b")
+        with self.assertRaises(ValueError):
+            r.match_report(report, ".ips", "panic-control")
+        with self.assertRaises(ValueError):
+            r.match_report(json.dumps({"panicString": "panic(cpu 0): unrelated\n" + message, "kernelUUID": r.KERNEL_UUID}).encode(), ".ips", "panic-force-reset", marker)
+
     def test_synthetic_cms_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
