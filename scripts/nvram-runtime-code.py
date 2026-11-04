@@ -27,7 +27,7 @@ PLISTS = (
     '/System/Library/CoreServices/com.apple.Boot.plist',
 )
 SYMBOL = re.compile(r'^\s*[0-9a-fA-F]+\s+[Tt]\s+(__ZNK?(?:13AppleEFINVRAM|15AppleEFIRuntime)[A-Za-z0-9_]+)\s*$')
-INTEREST = re.compile(r'sync|set|write|start|register|variable', re.I)
+INTEREST = re.compile(r'sync|set|write|start|register|variable|panic', re.I)
 
 
 def function_instructions(text, name, start, end):
@@ -143,7 +143,7 @@ class SymbolCensus:
             candidate['ambiguous'] |= (counts[candidate['name']] != 1 or candidate['member'] in self.member_bad or candidate['end'] is None)
         def rank(candidate):
             name = candidate['name'].lower()
-            return (0 if 'setvariable' in name or 'write' in name else 1 if 'sync' in name else 2, name)
+            return (0 if 'setvariable' in name or 'write' in name or 'panic' in name else 1 if 'sync' in name else 2, name)
         fixed = {}
         for candidate in self.candidates:
             if candidate['name'] in EXTRA_SYMBOLS:

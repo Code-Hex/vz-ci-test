@@ -33,6 +33,15 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(result['candidates'][0]['end'], 0x30)
         self.assertTrue(all(c['ambiguous'] for c in result['candidates'] if c['name'].endswith('4syncEv')))
 
+    def test_panic_writer_is_a_selected_class_function(self):
+        census = probe.SymbolCensus()
+        census.feed('00000010 T __ZN13AppleEFINVRAM13savePanicInfoEPhj')
+        census.feed('00000020 T _end')
+        result = census.finish()
+        self.assertEqual(result['target_count'], 1)
+        self.assertEqual(result['candidates'][0]['start'], 0x10)
+        self.assertEqual(result['candidates'][0]['end'], 0x20)
+
     def test_fixed_helpers_do_not_compete_with_class_limit(self):
         census = probe.SymbolCensus()
         for i in range(25):
