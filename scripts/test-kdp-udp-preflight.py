@@ -103,6 +103,37 @@ class Udp(unittest.TestCase):
         thread.join(2)
         self.assertFalse(thread.is_alive())
 
+    def test_mapping_audit_uses_one_socket_in_a_b_a_order(self):
+        client, first, second = (socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(3))
+        for sock in (client, first, second):
+            self.addCleanup(sock.close)
+            sock.bind(("127.0.0.1", 0))
+            sock.settimeout(2)
+        sources = []
+        def replies(server, count, port):
+            for _ in range(count):
+                data, address = server.recvfrom(1024)
+                sources.append(address)
+                server.sendto(self.response(data[8:20], port=port), address)
+        threads = [threading.Thread(target=replies, args=(first, 2, 40001)),
+                   threading.Thread(target=replies, args=(second, 1, 40002))]
+        for thread in threads:
+            thread.start()
+        endpoint, samples = r.audit_mappings(client, [first.getsockname(), second.getsockname(), first.getsockname()])
+        for thread in threads:
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(endpoint, ("1.1.1.1", 40001))
+        self.assertEqual([sample["port"] for sample in samples], [40001, 40002, 40001])
+        self.assertEqual(sources, [client.getsockname()] * 3)
+
+    def test_mapping_artifact_has_only_public_bounded_fields(self):
+        state = {"mapping_samples": [{"server_ip": "1.1.1.1", "state": "observed", "ip": "8.8.8.8", "port": 40001, "token": "secret"},
+                                     {"server_ip": "127.0.0.1", "state": "observed", "ip": "8.8.8.8", "port": 40002}]}
+        saved = r.sanitize_state(state)
+        self.assertEqual(saved["mapping_samples"], [{"server_ip": "1.1.1.1", "state": "observed", "ip": "8.8.8.8", "port": 40001}])
+        self.assertNotIn("secret", str(saved))
+
     def test_unknown_source_is_not_acknowledged(self):
         one = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         expected = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -111,7 +142,8 @@ class Udp(unittest.TestCase):
             self.addCleanup(sock.close)
             sock.bind(("127.0.0.1", 0))
         a, b = bytes(range(16)), bytes(range(16, 32))
-        thread = threading.Thread(target=lambda: r.exchange(one, expected.getsockname(), a, b, 0.4))
+        results = []
+        thread = threading.Thread(target=lambda: results.append(r.exchange(one, expected.getsockname(), a, b, 0.4)))
         thread.start()
         outsider.sendto(r.PACKET.pack(b"KDP1", 1, b, a, 7), one.getsockname())
         outsider.settimeout(0.6)
@@ -119,6 +151,9 @@ class Udp(unittest.TestCase):
             outsider.recvfrom(1024)
         thread.join(2)
         self.assertFalse(thread.is_alive())
+        self.assertEqual(results[0]["valid_peer_port_mismatches"], 1)
+        self.assertEqual(results[0]["other_peer_ports"], [outsider.getsockname()[1]])
+        self.assertFalse(results[0]["hello_received"])
 
     def test_loopback_pair_hello_ack(self):
         one = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

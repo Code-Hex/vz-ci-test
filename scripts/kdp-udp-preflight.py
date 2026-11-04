@@ -88,6 +88,24 @@ def stun_binding(sock, server):
     raise TimeoutError("STUN unavailable")
 
 
+def audit_mappings(sock, servers):
+    targets = list(dict.fromkeys(servers))[:2]
+    if not targets:
+        raise ValueError("STUN endpoint absent")
+    samples, endpoint = [], None
+    for server in targets + targets[:1]:
+        sample = {"server_ip": server[0], "state": "unavailable"}
+        try:
+            mapped = stun_binding(sock, server)
+            sample.update({"state": "observed", "ip": mapped[0], "port": mapped[1]})
+            if server == targets[0]:
+                endpoint = mapped
+        except (OSError, ValueError):
+            pass
+        samples.append(sample)
+    return endpoint, samples
+
+
 def exchange(sock, peer, own_nonce, peer_nonce, seconds):
     if len(own_nonce) != 16 or len(peer_nonce) != 16 or own_nonce == peer_nonce:
         raise ValueError("nonce invalid")
@@ -95,9 +113,10 @@ def exchange(sock, peer, own_nonce, peer_nonce, seconds):
     next_send, sequence = 0, 0
     sent_sequences = set()
     sent, hello_received, ack_received = 0, False, False
+    port_mismatches, other_ports = 0, set()
     while time.monotonic() < deadline:
         now = time.monotonic()
-        if now >= next_send and sent < 295:
+        if now >= next_send and sent < 280:
             sequence += 1
             sock.sendto(PACKET.pack(b"KDP1", 1, own_nonce, peer_nonce, sequence), peer)
             sent_sequences.add(sequence)
@@ -107,19 +126,26 @@ def exchange(sock, peer, own_nonce, peer_nonce, seconds):
         if not readable:
             continue
         data, source = sock.recvfrom(1024)
-        if source != peer or len(data) != PACKET.size:
+        if source[0] != peer[0] or len(data) != PACKET.size:
             continue
         magic, kind, sender, receiver, number = PACKET.unpack(data)
-        if magic != b"KDP1" or sender != peer_nonce or receiver != own_nonce or number == 0:
+        if (magic != b"KDP1" or sender != peer_nonce or receiver != own_nonce or number == 0
+                or kind not in (1, 2) or (kind == 2 and number not in sent_sequences)):
+            continue
+        if source != peer:
+            port_mismatches += 1
+            if len(other_ports) < 8:
+                other_ports.add(source[1])
             continue
         if kind == 1:
             hello_received = True
-            if sent < 295:
+            if sent < 280:
                 sock.sendto(PACKET.pack(b"KDP1", 2, own_nonce, peer_nonce, number), peer)
                 sent += 1
         elif kind == 2 and number in sent_sequences:
             ack_received = True
-    return {"hello_received": hello_received, "ack_received": ack_received, "sent": sent}
+    return {"hello_received": hello_received, "ack_received": ack_received, "sent": sent,
+            "valid_peer_port_mismatches": port_mismatches, "other_peer_ports": sorted(other_ports)}
 
 
 def binding(ctx, role):
@@ -230,13 +256,16 @@ def run(ctx, token):
             servers = [(item[4][0], 3478) for item in candidates if public_endpoint(item[4][0], 3478)]
             if not servers:
                 raise ValueError("no public STUN endpoint")
-            endpoint = stun_binding(sock, servers[0])
+            endpoint, mappings = audit_mappings(sock, servers)
+            state["mapping_samples"] = mappings
+            if endpoint is None:
+                raise ValueError("STUN endpoint unavailable")
         except (OSError, ValueError):
             state["reason"] = "stun_or_bind_unavailable"
             return state
         nonce = os.urandom(16)
         state = {"phase": "ready", "role": own, "binding": binding(ctx, own), "nonce": nonce.hex(),
-                 "endpoint": {"ip": endpoint[0], "port": endpoint[1]}}
+                 "endpoint": {"ip": endpoint[0], "port": endpoint[1]}, "mapping_samples": mappings}
         update(check_id, token, state)
         print(json.dumps({"event": "udp_ready", "role": own, "nonce": nonce.hex(), "endpoint": state["endpoint"]}), flush=True)
         peer = None
@@ -317,8 +346,22 @@ def sanitize_state(state):
         result["window_clock"] = state["window_clock"]
     stats = state.get("stats")
     if (isinstance(stats, dict) and type(stats.get("hello_received")) is bool and
-            type(stats.get("ack_received")) is bool and type(stats.get("sent")) is int and 0 <= stats["sent"] <= 295):
+            type(stats.get("ack_received")) is bool and type(stats.get("sent")) is int and 0 <= stats["sent"] <= 280):
         result["stats"] = {key: stats[key] for key in ("hello_received", "ack_received", "sent")}
+        count, ports = stats.get("valid_peer_port_mismatches"), stats.get("other_peer_ports")
+        if (type(count) is int and 0 <= count <= 1_000_000 and isinstance(ports, list) and len(ports) <= 8
+                and all(type(port) is int and 0 < port < 65536 for port in ports)):
+            result["stats"].update({"valid_peer_port_mismatches": count, "other_peer_ports": ports})
+    samples = state.get("mapping_samples")
+    if isinstance(samples, list) and len(samples) <= 3:
+        result["mapping_samples"] = []
+        for sample in samples:
+            if not isinstance(sample, dict) or not public_endpoint(sample.get("server_ip", ""), 3478):
+                continue
+            if sample.get("state") == "observed" and public_endpoint(sample.get("ip", ""), sample.get("port")):
+                result["mapping_samples"].append({key: sample[key] for key in ("server_ip", "state", "ip", "port")})
+            elif sample.get("state") == "unavailable":
+                result["mapping_samples"].append({"server_ip": sample["server_ip"], "state": "unavailable"})
     return result
 
 
