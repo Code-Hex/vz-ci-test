@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import sys
 from pathlib import Path
 import tempfile
 import time
@@ -116,6 +117,52 @@ class Gate(unittest.TestCase):
         self.assertEqual(parts[1]["record"]["pending_after"], 4)
         combined = dict(parts[0]["record"], **parts[1]["record"])
         self.assertEqual(combined, record)
+
+    def test_timer_retry_is_bounded_and_failure_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_probes, old_out = capture.PROBES, capture.OUT
+            capture.PROBES, capture.OUT = Path(tmp), Path(tmp)
+            try:
+                binary = Path(tmp) / "hypervisor"
+                binary.write_text("""#!%s
+import json, pathlib, sys, time
+count = pathlib.Path('attempts')
+count.write_text(count.read_text() + 'x' if count.exists() else 'x')
+def fact(api, result, a, b, c):
+    print(json.dumps(dict(api=api, edge='fact', result=result, arg0=a, arg1=b, arg2=c)), flush=True)
+if pathlib.Path('slow').exists():
+    time.sleep(3)
+if pathlib.Path('ordinary_failure').exists():
+    fact('process_result', 70, 70, 0, 0)
+    sys.exit(70)
+fact('guest_not_established', 77, 1, 256, 0)
+fact('process_result', 77, 77, 0, 0)
+sys.exit(77)
+""" % sys.executable)
+                binary.chmod(0o755)
+                old_cwd = os.getcwd()
+                os.chdir(tmp)
+                try:
+                    capture.observe(snapshot())
+                    self.assertEqual(capture.run_timer("timer-spin", 5, retry_ready=lambda: True), "retry")
+                    self.assertEqual((Path(tmp) / "attempts").read_text(), "xxx")
+                    self.assertTrue(all((Path(tmp) / f"timer-spin-attempt{i}.jsonl").is_file() for i in range(1, 4)))
+                    (Path(tmp) / "attempts").unlink()
+                    self.assertEqual(capture.run_timer("timer-spin", 5, retry_ready=lambda: False), "failure")
+                    self.assertEqual((Path(tmp) / "attempts").read_text(), "x")
+                    (Path(tmp) / "attempts").unlink()
+                    (Path(tmp) / "slow").touch()
+                    self.assertEqual(capture.run_timer("timer-spin", 0.2, retry_ready=lambda: True), "timeout")
+                    self.assertEqual((Path(tmp) / "attempts").read_text(), "x")
+                    (Path(tmp) / "attempts").unlink()
+                    (Path(tmp) / "slow").unlink()
+                    (Path(tmp) / "ordinary_failure").touch()
+                    self.assertEqual(capture.run_timer("timer-spin", 5, retry_ready=lambda: True), "failure")
+                    self.assertEqual((Path(tmp) / "attempts").read_text(), "x")
+                finally:
+                    os.chdir(old_cwd)
+            finally:
+                capture.PROBES, capture.OUT = old_probes, old_out
 
     def test_linux_invocation_uses_binary_directory_and_requires_pass(self):
         with tempfile.TemporaryDirectory() as tmp:

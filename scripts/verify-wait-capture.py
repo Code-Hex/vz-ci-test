@@ -235,27 +235,41 @@ def ready_snapshot():
                 x.get("error_seen") == 0 and sequence_valid(x, 2) for i, x in enumerate(waits)))
 
 
-def timer_fact(phase, value):
+def timer_fact(phase, attempt, value):
     if value.get("api") in {"probe_start", "owner_thread_id", "hv_vcpu_run_until", "guest_observation",
                             "timer_guest_state", "sentinel_spin_verified", "sentinel_hlt_timer_verified",
                             "guest_not_established", "phase_result", "process_result"}:
-        report({"event": "timer_fact", "phase": phase, "fact": value, "dropped": dropped})
+        report({"event": "timer_fact", "phase": phase, "attempt": attempt, "fact": value, "dropped": dropped})
 
 
-def run_timer(phase, timeout):
-    proc = start([str(PROBES / "hypervisor"), controls.PHASES[phase][0]], phase + ".jsonl",
-                 lambda x: timer_fact(phase, x))
-    start_time = time.monotonic()
-    while proc.proc.poll() is None and time.monotonic() - start_time < timeout:
-        report({"event": "timer_heartbeat", "phase": phase, "elapsed": round(time.monotonic() - start_time, 2), "dropped": dropped})
-        time.sleep(2)
-    timed_out = proc.proc.poll() is None
-    if timed_out:
-        kill_owned(proc.proc)
-    proc.thread.join(2)
-    result = controls.classify(phase, proc.records, proc.proc.poll(), timed_out)
-    report({"event": "timer_result", "phase": phase, "result": result, "exit": proc.proc.poll(), "dropped": dropped})
-    return result
+def run_timer(phase, timeout, monitors=(), retry_ready=None):
+    if retry_ready is None:
+        retry_ready = lambda: ready_snapshot() and all(reader.proc.poll() is None for reader in monitors)
+    for attempt in range(1, 4):
+        if attempt > 1 and not retry_ready():
+            report({"event": "timer_retry_blocked", "phase": phase, "attempt": attempt, "dropped": dropped})
+            return "failure"
+        proc = start([str(PROBES / "hypervisor"), controls.PHASES[phase][0]],
+                     f"{phase}-attempt{attempt}.jsonl", lambda x, n=attempt: timer_fact(phase, n, x))
+        start_time = time.monotonic()
+        next_heartbeat = start_time
+        while proc.proc.poll() is None and time.monotonic() - start_time < timeout:
+            now = time.monotonic()
+            if now >= next_heartbeat:
+                report({"event": "timer_heartbeat", "phase": phase, "attempt": attempt,
+                        "elapsed": round(now - start_time, 2), "dropped": dropped})
+                next_heartbeat = now + 2
+            time.sleep(0.05)
+        timed_out = proc.proc.poll() is None
+        if timed_out:
+            kill_owned(proc.proc)
+        proc.thread.join(2)
+        result = controls.classify(phase, proc.records, proc.proc.poll(), timed_out)
+        report({"event": "timer_result", "phase": phase, "attempt": attempt,
+                "result": result, "exit": proc.proc.poll(), "dropped": dropped})
+        if result != "retry":
+            return result
+    return "retry"
 
 
 def run_linux(binary, timeout, monitors=()):
@@ -319,13 +333,13 @@ def main():
                               str(header["pid"]), str(header["address"]), str(header["fd"])], "sampler-dtrace.jsonl")
         until(lambda: trace.root_pid and trace.proc.poll() is None and helper.proc.poll() is None and ready_snapshot() and fresh_advanced and wait_positive, 30, "fresh four-CPU / natural wait control missing")
         report({"event": "sampler_control_pass", "dropped": dropped})
-        if run_timer("timer-spin", 20) != "success":
+        if run_timer("timer-spin", 20, (helper, trace)) != "success":
             raise RuntimeError("spin control failed")
         if not ready_snapshot() or helper.proc.poll() is not None or trace.proc.poll() is not None:
             raise RuntimeError("sampler no longer ready after spin")
         if linux and time.monotonic() - helper_started > 35:
             raise RuntimeError("sampler duration insufficient for Linux timeout")
-        result = run_linux(binary, 200, (helper, trace)) if linux else run_timer("timer-hlt", 45)
+        result = run_linux(binary, 200, (helper, trace)) if linux else run_timer("timer-hlt", 45, (helper, trace))
         if result == "success" and (not ready_snapshot() or helper.proc.poll() is not None or trace.proc.poll() is not None):
             raise RuntimeError("observer invalid at workload completion")
     except (OSError, RuntimeError, subprocess.SubprocessError, KeyError, ValueError) as error:
