@@ -1,10 +1,23 @@
-name: Intel normal reboot recovery
+name: Intel reboot and panic recovery
 
 on:
   workflow_dispatch:
     inputs:
       cleanup_check:
         description: Unfinished recovery check from an earlier run
+        required: false
+        type: string
+        default: ''
+      trigger:
+        description: Recovery control to run
+        required: true
+        type: choice
+        options:
+          - reboot
+          - panic-control
+        default: reboot
+      report_cert:
+        description: Public recipient certificate for encrypted panic reports
         required: false
         type: string
         default: ''
@@ -17,6 +30,8 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    env:
+      RECOVERY_TRIGGER: ${{ inputs.trigger || 'reboot' }}
     permissions:
       contents: read
       checks: write
@@ -35,6 +50,8 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
     runs-on: macos-26-intel
     timeout-minutes: 12
+    env:
+      RECOVERY_TRIGGER: ${{ inputs.trigger || 'reboot' }}
     permissions:
       contents: read
       checks: write
@@ -47,10 +64,11 @@ jobs:
       - name: Publish the runner recovery public key
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RECOVERY_REPORT_CERT: ${{ inputs.report_cert }}
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py prepare
       - name: Receive the controller token and verify the armed reporter
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py arm
-      - name: Reboot the disposable runner and await the separate recovery check
-        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py reboot
+      - name: Run the recovery control on the disposable runner
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py trigger

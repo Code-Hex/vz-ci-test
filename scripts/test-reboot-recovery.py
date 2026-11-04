@@ -62,6 +62,22 @@ class Recovery(unittest.TestCase):
         self.assertFalse(r.boot_proof_matches(dict(proof, baseline_boot_uuid="other"), pending, ctx))
         self.assertFalse(r.boot_proof_matches(dict(proof, current_boot_uuid="first"), pending, ctx))
 
+    def test_panic_proof_requires_matching_ciphertext(self):
+        import base64
+        import hashlib
+        ctx = {"run_id": "123", "attempt": "1", "sha": "a" * 40, "trigger": "panic-control"}
+        pending = {"nonce": "b" * 64, "baseline_boot_uuid": "old", "cert_fingerprint": "c" * 64}
+        data = {"protocol": "vz-recovery-v1", "binding": r.binding(ctx), "phase": "boot_observed", "nonce": pending["nonce"],
+                "baseline_boot_uuid": "old", "current_boot_uuid": "new", "trigger": "panic-control",
+                "cert_fingerprint": pending["cert_fingerprint"], "capture_state": "captured", "cipher_sha256": hashlib.sha256(b"cipher").hexdigest()}
+        encoded = base64.b64encode(b"cipher").decode()
+        self.assertTrue(r.panic_envelope_matches(data, encoded, pending, ctx))
+        self.assertFalse(r.panic_envelope_matches(data, base64.b64encode(b"other").decode(), pending, ctx))
+        self.assertFalse(r.panic_envelope_matches(dict(data, capture_state="missing"), encoded, pending, ctx))
+        self.assertFalse(r.panic_envelope_matches(dict(data, cert_fingerprint="d" * 64), encoded, pending, ctx))
+        self.assertFalse(r.panic_envelope_matches(dict(data, trigger="reboot"), encoded, pending, ctx))
+        self.assertFalse(r.panic_envelope_matches(dict(data, baseline_boot_uuid="wrong"), encoded, pending, ctx))
+
     def test_old_check_cleanup_validates_canonical_binding(self):
         old_sha = "a" * 40
         old = {"id": 126478800449, "name": "Runner recovery 41801686112", "head_sha": old_sha,
