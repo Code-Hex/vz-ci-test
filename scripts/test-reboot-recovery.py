@@ -108,6 +108,82 @@ class Recovery(unittest.TestCase):
         self.assertFalse(r.reboot_observed("abc", ""))
         self.assertTrue(r.reboot_observed("abc", "def"))
 
+    def test_debug_boot_request_is_normal_reboot_only(self):
+        self.assertTrue(r.recovery_bootargs.requested("1", "reboot"))
+        self.assertFalse(r.recovery_bootargs.requested("", "reboot"))
+        for value, trigger in (("true", "reboot"), ("1", "panic-control"), ("1", "panic-force-reset")):
+            with self.assertRaises(ValueError):
+                r.recovery_bootargs.requested(value, trigger)
+
+    def test_debug_boot_proof_requires_mask_restore_and_mode_binding(self):
+        ctx = {"run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True}
+        pending = {"nonce": "n", "baseline_boot_uuid": "old"}
+        data = {"protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": r.binding(ctx),
+                "nonce": "n", "baseline_boot_uuid": "old", "current_boot_uuid": "new", "debug_boot": True,
+                "debug_boot_facts": {"active_debug_mask": 0x2000, "nvram_restored": True,
+                                     "debugger_count": None, "nic_inventory_status": "unsupported"}}
+        self.assertTrue(r.boot_proof_matches(data, pending, ctx))
+        for facts in ({}, {"active_debug_mask": 0x2000, "nvram_restored": False},
+                      {"active_debug_mask": 0x400, "nvram_restored": True}):
+            self.assertFalse(r.boot_proof_matches(dict(data, debug_boot_facts=facts), pending, ctx))
+        self.assertFalse(r.boot_proof_matches(dict(data, debug_boot=False), pending, ctx))
+        self.assertFalse(r.boot_proof_matches(data, pending, dict(ctx, debug_boot=False)))
+
+    def test_debug_reboot_failures_restore_once_without_reboot(self):
+        for failure in ("stage_response", "stdout", "sync"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                original = {"boot-args": b"preempt=10"}
+                state, events = dict(original), []
+                class Platform:
+                    def read(self):
+                        return state.copy()
+                    def active(self):
+                        return b"preempt=10"
+                    def write(self, path):
+                        state.clear()
+                        state.update(r.recovery_bootargs.parse_nvram(path.read_bytes()))
+                        events.append("restore" if state == original else "stage")
+                platform, marker = Platform(), {"baseline": "old", "nonce": "n"}
+                def sudo(operation, _payload, **_kwargs):
+                    if operation == "verify-root":
+                        return "ready"
+                    if operation == "debug-stage-root":
+                        r.recovery_bootargs.stage(directory, marker, platform, r.private_write, r.sync_directory)
+                        if failure == "stage_response":
+                            raise RuntimeError("stage reply lost")
+                        return "staged"
+                    self.assertEqual(operation, "debug-restore-root")
+                    r.recovery_bootargs.rollback(directory, marker, platform, r.private_write, r.sync_directory)
+                    return "restored"
+                class Output(io.StringIO):
+                    def write(self, value):
+                        if failure == "stdout" and value == "staged":
+                            raise BrokenPipeError("closed stdout")
+                        return super().write(value)
+                def sync():
+                    if failure == "sync":
+                        raise OSError("sync failed")
+                def forbidden(*_args, **_kwargs):
+                    self.fail("failed debug stage reached reboot")
+                ctx = {"trigger": "reboot", "debug_boot": True}
+                with patch.object(r.sys, "argv", ["reboot-recovery.py", "reboot"]), \
+                        patch.object(r, "context_from_env", lambda: ctx), patch.object(r, "require_context", lambda *_: None), \
+                        patch.object(r, "sudo_call", sudo), patch.object(r.os, "sync", sync), \
+                        patch.object(r.subprocess, "run", forbidden), contextlib.redirect_stdout(Output()):
+                    with self.assertRaises((OSError, RuntimeError)):
+                        r.main()
+                self.assertEqual(events, ["stage", "restore"])
+                self.assertEqual(state, original)
+
+    def test_debug_rollback_refuses_another_boot(self):
+        config = {"context": {"debug_boot": True}, "debug_boot": True, "baseline": "old"}
+        with patch.object(r, "root_only", lambda: None), patch.object(r, "require_context", lambda *_: None), \
+                patch.object(r, "root_dir", lambda _: Path("/unused")), patch.object(r, "load_config", lambda _: config), \
+                patch.object(r, "boot_uuid", lambda: "new"):
+            with self.assertRaises(ValueError):
+                r.debug_restore_root({"context": config["context"]})
+
     def test_rsa_oaep_sha256_roundtrip_and_key_size(self):
         with tempfile.TemporaryDirectory() as tmp:
             private = Path(tmp) / "key.pem"

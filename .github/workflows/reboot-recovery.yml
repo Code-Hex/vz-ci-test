@@ -17,6 +17,11 @@ on:
           - panic-control
           - panic-force-reset
         default: reboot
+      debug_boot:
+        description: Test panic transport registration through a normal reboot only
+        required: false
+        type: boolean
+        default: false
       report_cert:
         description: Public recipient certificate for encrypted panic reports
         required: false
@@ -33,6 +38,7 @@ jobs:
     timeout-minutes: 12
     env:
       RECOVERY_TRIGGER: ${{ inputs.trigger || 'reboot' }}
+      RECOVERY_DEBUG_BOOT: ${{ inputs.debug_boot && '1' || '0' }}
     permissions:
       contents: read
       checks: write
@@ -53,6 +59,7 @@ jobs:
     timeout-minutes: 12
     env:
       RECOVERY_TRIGGER: ${{ inputs.trigger || 'reboot' }}
+      RECOVERY_DEBUG_BOOT: ${{ inputs.debug_boot && '1' || '0' }}
     permissions:
       contents: read
       checks: write

@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import recovery_reports
+import recovery_bootargs
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,9 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               ctx.get("runner_environment") == "github-hosted" and ctx.get("trigger", "reboot") in ("reboot", "panic-control", "panic-force-reset") and
               bool(re.fullmatch(r"[1-9][0-9]{0,19}", str(ctx.get("run_id", "")))) and
               bool(re.fullmatch(r"[1-9][0-9]{0,4}", str(ctx.get("attempt", "")))) and
-              bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))))
+              bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
+              type(ctx.get("debug_boot", False)) is bool and
+              (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") == "reboot"))
     return bool(common and machine == "x86_64" and
                 ((system == "Darwin" and str(kernel_uuid).upper() == KERNEL_UUID) or system == "Linux"))
 
@@ -104,6 +107,8 @@ def reboot_observed(before, after):
 
 def mode_matches(data, pending, ctx):
     return (data.get("trigger", "reboot") == ctx.get("trigger", "reboot") and
+            type(data.get("debug_boot", False)) is bool and
+            data.get("debug_boot", False) == ctx.get("debug_boot", False) and
             data.get("cert_fingerprint", "") == pending.get("cert_fingerprint", ""))
 
 
@@ -124,7 +129,13 @@ def boot_proof_matches(data, pending, ctx):
     return (mode_matches(data, pending, ctx) and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx) and
             data.get("phase") == "boot_observed" and data.get("nonce") == pending["nonce"] and
             data.get("baseline_boot_uuid") == pending["baseline_boot_uuid"] and
-            reboot_observed(pending["baseline_boot_uuid"], data.get("current_boot_uuid")))
+            reboot_observed(pending["baseline_boot_uuid"], data.get("current_boot_uuid")) and
+            (not ctx.get("debug_boot", False) or debug_boot_proven(data.get("debug_boot_facts"))))
+
+
+def debug_boot_proven(facts):
+    return (isinstance(facts, dict) and type(facts.get("active_debug_mask")) is int and
+            facts["active_debug_mask"] == 0x2000 and facts.get("nvram_restored") is True)
 
 
 def panic_envelope_matches(data, ciphertext, pending, ctx):
@@ -177,11 +188,12 @@ def command_output(command):
 
 
 def context_from_env():
+    trigger = os.getenv("RECOVERY_TRIGGER", "reboot")
     return {"actions": os.getenv("GITHUB_ACTIONS", ""), "repo": os.getenv("GITHUB_REPOSITORY", ""),
             "ref": os.getenv("GITHUB_REF", ""), "event": os.getenv("GITHUB_EVENT_NAME", ""),
             "runner_environment": os.getenv("RUNNER_ENVIRONMENT", ""), "run_id": os.getenv("GITHUB_RUN_ID", ""),
             "attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""), "sha": os.getenv("GITHUB_SHA", ""),
-            "trigger": os.getenv("RECOVERY_TRIGGER", "reboot")}
+            "trigger": trigger, "debug_boot": recovery_bootargs.requested(os.getenv("RECOVERY_DEBUG_BOOT", ""), trigger)}
 
 
 def require_context(ctx, expected_system):
@@ -327,16 +339,18 @@ def prepare_root(payload):
         raise ValueError("empty boot session")
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "public_key", "binding": binding(ctx),
                           "nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public,
-                          "trigger": ctx.get("trigger", "reboot"), "cert_fingerprint": fingerprint})
+                          "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "cert_fingerprint": fingerprint})
     check = api("POST", CHECKS, token, {"name": "Runner recovery " + ctx["run_id"], "head_sha": ctx["sha"],
                 "external_id": binding(ctx), "status": "in_progress",
                 "output": {"title": "Awaiting controller", "summary": summary}})
     if not isinstance(check.get("id"), int) or check["id"] <= 0:
         raise ValueError("invalid check identifier")
-    config = {"context": ctx, "baseline": baseline, "check_id": check["id"], "nonce": nonce, "python": python, "cert_fingerprint": fingerprint, "helper_sha256": helper_sha}
+    config = {"context": ctx, "baseline": baseline, "check_id": check["id"], "nonce": nonce, "python": python, "cert_fingerprint": fingerprint, "helper_sha256": helper_sha,
+              "debug_boot": ctx.get("debug_boot", False)}
     private_write(directory / "config.json", json.dumps(config).encode())
     private_write(directory / "recovery.py", Path(__file__).read_bytes())
     private_write(directory / "recovery_reports.py", Path(recovery_reports.__file__).read_bytes())
+    private_write(directory / "recovery_bootargs.py", Path(recovery_bootargs.__file__).read_bytes())
     sync_directory(directory)
     sync_directory(directory.parent)
     print(json.dumps({"event": "recovery_public_key_ready", "check_id": check["id"], "python": python,
@@ -349,7 +363,7 @@ def verified_summary(check, config):
     if select_check([check], ctx) is None or check.get("id") != config["check_id"]:
         raise ValueError("check identity mismatch")
     data = json.loads(check.get("output", {}).get("summary", "{}"))
-    if data.get("protocol") != "vz-recovery-v1" or data.get("binding") != binding(ctx) or data.get("nonce") != config["nonce"] or data.get("baseline_boot_uuid") != config["baseline"] or data.get("trigger", "reboot") != ctx.get("trigger", "reboot") or data.get("cert_fingerprint", "") != config.get("cert_fingerprint", ""):
+    if data.get("protocol") != "vz-recovery-v1" or data.get("binding") != binding(ctx) or data.get("nonce") != config["nonce"] or data.get("baseline_boot_uuid") != config["baseline"] or not mode_matches(data, config, ctx):
         raise ValueError("check protocol mismatch")
     return data
 
@@ -412,6 +426,36 @@ def verify_root(payload):
 
 
 PANIC_SOURCE = "dtrace:::BEGIN { panic(); }"
+
+
+def debug_boot_marker(config):
+    return {"baseline": config["baseline"], "nonce": config["nonce"], "binding": binding(config["context"])}
+
+
+def debug_stage_root(payload):
+    root_only()
+    ctx = payload["context"]
+    require_context(ctx, "Darwin")
+    directory = root_dir(ctx)
+    config = load_config(directory)
+    verify_root(payload)
+    if (config["context"] != ctx or config.get("debug_boot") is not True or
+            ctx.get("debug_boot") is not True or ctx.get("trigger") != "reboot" or
+            not recovery_bootargs.csr_allowed()):
+        raise ValueError("debug boot control not permitted")
+    recovery_bootargs.stage(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory)
+    print(json.dumps({"event": "debug_boot_staged", "debug_boot": True, "debug_mask": 0x2000}), flush=True)
+
+
+def debug_restore_root(payload):
+    root_only()
+    ctx = payload["context"]
+    require_context(ctx, "Darwin")
+    directory = root_dir(ctx)
+    config = load_config(directory)
+    if config["context"] != ctx or config.get("debug_boot") is not True or boot_uuid() != config["baseline"]:
+        raise ValueError("debug rollback identity mismatch")
+    recovery_bootargs.rollback(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory)
 
 
 def panic_preflight_root(payload):
@@ -588,12 +632,20 @@ def collect(directory):
     if (directory / "completed.json").exists():
         return
     current = boot_uuid()
+    debug_facts = {}
+    if reboot_observed(config["baseline"], current) and config.get("debug_boot", False):
+        try:
+            debug_facts = recovery_bootargs.finish(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            debug_facts = {"active_debug_mask": None, "nvram_restored": False, "debugger_count": None,
+                           "virtio_network_classes": [], "nic_inventory_status": "unsupported"}
     token = (directory / "token").read_text()
     if not reboot_observed(config["baseline"], current):
         if not (directory / "ready.json").exists():
             summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "armed", "binding": binding(config["context"]),
                                   "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"],
                                   "trigger": config["context"].get("trigger", "reboot"),
+                                  "debug_boot": config.get("debug_boot", False),
                                   "cert_fingerprint": config.get("cert_fingerprint", "")})
             api("PATCH", CHECKS + "/" + str(config["check_id"]), token,
                 {"output": {"title": "Recovery daemon ready", "summary": summary}})
@@ -618,10 +670,13 @@ def collect(directory):
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": binding(config["context"]),
                           "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
                           "trigger": config["context"].get("trigger", "reboot"), "cert_fingerprint": config.get("cert_fingerprint", ""),
+                          "debug_boot": config.get("debug_boot", False), "debug_boot_facts": debug_facts,
                           "capture_state": capture_state,
                           "cipher_sha256": envelope["cipher_sha256"] if envelope else "",
                           "note": "Boot UUID changed; no stopped-CPU GPR proof."})
     successful = config["context"].get("trigger", "reboot") == "reboot" or capture_state == "captured"
+    if config.get("debug_boot", False):
+        successful = successful and debug_boot_proven(debug_facts)
     output = {"title": "Recovery observed" if successful else "Panic report unavailable", "summary": summary}
     if envelope:
         output["text"] = envelope["ciphertext"]
@@ -743,7 +798,7 @@ def controller(ctx, token):
                             proof = True
                             return
                         raise ValueError("check completed without boot proof")
-                    if data.get("phase") == "public_key" and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx) and data.get("trigger", "reboot") == ctx.get("trigger", "reboot"):
+                    if data.get("phase") == "public_key" and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx) and data.get("trigger", "reboot") == ctx.get("trigger", "reboot") and type(data.get("debug_boot", False)) is bool and data.get("debug_boot", False) == ctx.get("debug_boot", False):
                         nonce, baseline, public = data.get("nonce", ""), data.get("baseline_boot_uuid", ""), data.get("public_key", "")
                         if not re.fullmatch(r"[0-9a-f]{64}", nonce) or not re.fullmatch(r"[0-9A-Fa-f-]{36}", baseline):
                             raise ValueError("nonce or baseline invalid")
@@ -760,7 +815,8 @@ def controller(ctx, token):
                             raise ValueError("public key metadata changed")
                         sealed_summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "sealed_token", "binding": binding(ctx),
                                                      "nonce": nonce, "baseline_boot_uuid": baseline, "ciphertext": pending["ciphertext"],
-                                                     "trigger": ctx.get("trigger", "reboot"), "cert_fingerprint": fingerprint})
+                                                     "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False),
+                                                     "cert_fingerprint": fingerprint})
                         api("PATCH", CHECKS + "/" + str(check_id), token,
                             {"output": {"title": "Controller credential sealed", "summary": sealed_summary}})
                         sealed = True
@@ -830,11 +886,19 @@ def main():
             if ctx.get("trigger", "reboot") != "reboot":
                 raise ValueError("wrong trigger operation")
             print(sudo_call("verify-root", {"context": ctx}), end="", flush=True)
-            os.sync()
-            subprocess.run(["/usr/bin/sudo", "-n", "/sbin/reboot"], check=True, timeout=15)
-    elif op in ("prepare-root", "arm-root", "verify-root", "panic-preflight-root", "panic-execute-root", "force-preflight-root", "force-execute-root") and len(sys.argv) == 2:
+            try:
+                if ctx.get("debug_boot", False):
+                    print(sudo_call("debug-stage-root", {"context": ctx}), end="", flush=True)
+                os.sync()
+                subprocess.run(["/usr/bin/sudo", "-n", "/sbin/reboot"], check=True, timeout=15)
+            except BaseException:
+                if ctx.get("debug_boot", False):
+                    sudo_call("debug-restore-root", {"context": ctx})
+                raise
+    elif op in ("prepare-root", "arm-root", "verify-root", "panic-preflight-root", "panic-execute-root", "force-preflight-root", "force-execute-root", "debug-stage-root", "debug-restore-root") and len(sys.argv) == 2:
         {"prepare-root": prepare_root, "arm-root": arm_root, "verify-root": verify_root, "panic-preflight-root": panic_preflight_root, "panic-execute-root": panic_execute_root,
-         "force-preflight-root": force_preflight_root, "force-execute-root": force_execute_root}[op](json.load(sys.stdin))
+         "force-preflight-root": force_preflight_root, "force-execute-root": force_execute_root,
+         "debug-stage-root": debug_stage_root, "debug-restore-root": debug_restore_root}[op](json.load(sys.stdin))
     elif op == "collect" and len(sys.argv) == 3:
         collect(Path(sys.argv[2]))
     else:
