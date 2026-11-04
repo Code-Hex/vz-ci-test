@@ -98,8 +98,10 @@ run() (
     printf 'SUITE_ITERATION=%s\n' "$iteration"
     if [[ $workload == ci ]]; then
       make test
-    else
+    elif [[ $iteration == 1 ]]; then
       go run ./cmd/codesign "$PWD/vz.test" -test.timeout=3m -test.v
+    else
+      "$PWD/vz.test" -test.timeout=3m -test.v
     fi
     printf 'SUITE_COMPLETED=%s\n' "$iteration"
   done
