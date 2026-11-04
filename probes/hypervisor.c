@@ -13,7 +13,9 @@
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,7 +32,8 @@ enum {
   GDT = 0x400,
   TSS = 0x500,
   SENTINEL = 0x800,
-  TAG = 0xa5
+  TAG = 0xa5,
+  KERNEL_MARKER_CAPACITY = 32
 };
 
 enum guest_mode { REAL16, PROTECTED32 };
@@ -103,7 +106,8 @@ enum observer_kind {
   OBSERVER_NONE,
   OBSERVER_SENTINEL,
   OBSERVER_THREADINFO,
-  OBSERVER_INTERRUPT
+  OBSERVER_INTERRUPT,
+  OBSERVER_KERNELMARKERS
 };
 
 struct guest_case {
@@ -140,6 +144,23 @@ static const struct guest_case guests[] = {
                        .verified_fact = "sentinel_sti_hlt_verified"},
 };
 
+struct kernel_marker_body {
+  uint64_t timestamp_ns, caller_pc, arg0, arg1, tid, meta;
+};
+
+struct kernel_marker_slot {
+  struct kernel_marker_body body;
+  _Atomic uint64_t commit;
+};
+
+_Static_assert(sizeof(struct kernel_marker_body) == 48, "kernel marker body");
+_Static_assert(offsetof(struct kernel_marker_slot, commit) == 48,
+               "kernel marker commit offset");
+_Static_assert(sizeof(struct kernel_marker_slot) == 56, "kernel marker slot");
+_Static_assert(KERNEL_MARKER_CAPACITY * sizeof(struct kernel_marker_slot) <=
+                   PAGE_BYTES,
+               "kernel markers fit in one page");
+
 struct phase_case {
   const char *name;
   enum guest_kind guest;
@@ -156,6 +177,8 @@ struct observer {
   hv_vcpuid_t vcpu;
   enum observer_kind kind;
   uint64_t owner_tid;
+  const struct kernel_marker_slot *markers;
+  const atomic_bool *stop;
 };
 
 struct probe {
@@ -169,6 +192,9 @@ struct probe {
   hv_vcpuid_t vcpu;
   uint8_t *memory;
   struct observer observer;
+  struct kernel_marker_slot *markers;
+  atomic_bool observer_stop;
+  bool marker_locked;
   bool vm_created, mapped, cpu_created, cleaning, output_failed, guest_verified;
   bool observer_active;
 };
@@ -265,16 +291,58 @@ static int interrupt_vcpu(const struct observer *o) {
   return result == HV_SUCCESS ? 0 : 70;
 }
 
+static int drain_kernel_markers(const struct observer *o, size_t *next) {
+  while (*next < KERNEL_MARKER_CAPACITY) {
+    const struct kernel_marker_slot *slot = &o->markers[*next];
+    uint64_t commit = atomic_load_explicit(&slot->commit, memory_order_acquire);
+    if (commit == 0)
+      break;
+    if (commit != *next + 1)
+      return 77;
+    // Intel-only publish contract: copyout writes an aligned 8-byte commit
+    // after the body, and the producer never reuses a committed slot.
+    const struct kernel_marker_body body = slot->body;
+    uint32_t event = (uint32_t)body.meta;
+    flockfile(stderr);
+    int written = fprintf(
+        stderr,
+        "{\"actor\":\"kernel-marker-observer\",\"monotonic_ns\":%" PRIu64
+        ",\"pid\":%d,\"seq\":%zu,\"phase\":\"%s\","
+        "\"api\":\"kernel_marker\",\"edge\":\"fact\",\"result\":0,"
+        "\"sourcehash\":\"%s\",\"slot\":%zu,\"commit\":%" PRIu64
+        ",\"kernel_timestamp_ns\":%" PRIu64 ",\"caller_pc\":%" PRIu64
+        ",\"arg0\":%" PRIu64 ",\"arg1\":%" PRIu64 ",\"tid\":%" PRIu64
+        ",\"meta\":%" PRIu64 ",\"kind\":%" PRIu32
+        ",\"return\":%s,\"cpu\":%" PRIu32 "}\n",
+        observer_now(o), getpid(), *next + 1, o->phase, PROBE_SOURCE_SHA, *next,
+        commit, body.timestamp_ns, body.caller_pc, body.arg0, body.arg1,
+        body.tid, body.meta, event >> 1, (event & 1) ? "true" : "false",
+        (uint32_t)(body.meta >> 32));
+    int flushed = fflush(stderr);
+    funlockfile(stderr);
+    if (written < 0 || flushed != 0)
+      return 74;
+    ++*next;
+  }
+  return 0;
+}
+
 static void *observe_sentinel(void *argument) {
   const struct observer *o = argument;
   uint64_t started = observer_now(o), first_tag_ns = 0;
   const uint64_t samples[] = {100000000, 500000000};
   bool seen = false;
+  size_t next_marker = 0;
   for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); ++i) {
     int error = 0;
     uint64_t now;
     uint8_t actual;
     do {
+      if (o->kind == OBSERVER_KERNELMARKERS) {
+        int result = drain_kernel_markers(o, &next_marker);
+        if (result != 0)
+          return (void *)(uintptr_t)result;
+      }
       now = observer_now(o);
       actual = *(const volatile uint8_t *)(o->memory + SENTINEL);
       if (actual == TAG && !seen) {
@@ -283,7 +351,8 @@ static void *observe_sentinel(void *argument) {
       }
       if (now - started >= samples[i])
         break;
-      struct timespec delay = {.tv_nsec = 5000000};
+      struct timespec delay = {
+          .tv_nsec = o->kind == OBSERVER_KERNELMARKERS ? 1000000 : 5000000};
       if (nanosleep(&delay, NULL) != 0 && errno != EINTR)
         error = errno;
     } while (error == 0);
@@ -317,6 +386,31 @@ static void *observe_sentinel(void *argument) {
       if (result != 0)
         return (void *)(uintptr_t)result;
     }
+  }
+  if (o->kind == OBSERVER_KERNELMARKERS) {
+    while (!atomic_load_explicit(o->stop, memory_order_acquire) &&
+           observer_now(o) - started < 2000000000) {
+      int result = drain_kernel_markers(o, &next_marker);
+      if (result != 0)
+        return (void *)(uintptr_t)result;
+      struct timespec delay = {.tv_nsec = 1000000};
+      if (nanosleep(&delay, NULL) != 0 && errno != EINTR)
+        return (void *)(uintptr_t)71;
+    }
+    int result = drain_kernel_markers(o, &next_marker);
+    flockfile(stderr);
+    int written = fprintf(
+        stderr,
+        "{\"actor\":\"kernel-marker-observer\",\"api\":\"kernel_marker_window_"
+        "end\","
+        "\"edge\":\"fact\",\"result\":%d,\"pid\":%d,\"slots\":%zu,"
+        "\"elapsed_ns\":%" PRIu64
+        ",\"limit_ns\":2000000000,\"stop_requested\":%s}\n",
+        result, getpid(), next_marker, observer_now(o) - started,
+        atomic_load_explicit(o->stop, memory_order_acquire) ? "true" : "false");
+    int flushed = fflush(stderr);
+    funlockfile(stderr);
+    return (void *)(uintptr_t)(written < 0 || flushed != 0 ? 74 : result);
   }
   return NULL;
 }
@@ -538,29 +632,74 @@ static int configure(struct probe *p) {
   return p->output_failed ? 74 : 0;
 }
 
+static int prepare_kernel_markers(struct probe *p) {
+  if (!before(p, "kernel_marker_mmap", PAGE_BYTES, PROT_READ | PROT_WRITE, 0))
+    return 74;
+  void *memory = mmap(NULL, PAGE_BYTES, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON, -1, 0);
+  int error = memory == MAP_FAILED ? errno : 0;
+  fact(p, "kernel_marker_mmap", "return", error, PAGE_BYTES,
+       PROT_READ | PROT_WRITE, 0);
+  if (memory == MAP_FAILED)
+    return 71;
+  p->markers = memory;
+  memset(memory, 0, PAGE_BYTES);
+  for (size_t i = 0; i < KERNEL_MARKER_CAPACITY; ++i)
+    atomic_init(&p->markers[i].commit, 0);
+  if (!before(p, "kernel_marker_mlock", PAGE_BYTES, 0, 0))
+    return 74;
+  int rc = mlock(memory, PAGE_BYTES);
+  p->marker_locked = rc == 0;
+  fact(p, "kernel_marker_mlock", "return", rc == 0 ? 0 : errno, PAGE_BYTES, 0,
+       0);
+  if (p->output_failed)
+    return 74;
+  if (rc != 0)
+    return 77;
+  return fact(p, "kernel_marker_buffer", "fact", 0, (uintptr_t)memory,
+              KERNEL_MARKER_CAPACITY, sizeof(struct kernel_marker_slot))
+             ? 0
+             : 74;
+}
+
 static int gate(struct probe *p, const char *name) {
   // fflush proves only local output completion. The controller must receive
   // this named gate and independently check the runner before sending G.
   if (!fact(p, name, "fact", 0, 'G', 0, 0))
     return 74;
-  unsigned char command = 0;
-  ssize_t bytes;
-  do {
-    bytes = read(STDIN_FILENO, &command, 1);
-  } while (bytes < 0 && errno == EINTR);
-  if (bytes < 0) {
-    fact(p, name, "protocol_error", 71, errno, 0, 'G');
-    return 71;
+  for (;;) {
+    unsigned char command = 0;
+    ssize_t bytes;
+    do {
+      bytes = read(STDIN_FILENO, &command, 1);
+    } while (bytes < 0 && errno == EINTR);
+    if (bytes < 0) {
+      fact(p, name, "protocol_error", 71, errno, 0, 'G');
+      return 71;
+    }
+    if (bytes == 0) {
+      fact(p, name, "protocol_error", 75, 0, 0, 'G');
+      return 75;
+    }
+    if (command == 'P' && p->markers != NULL &&
+        strcmp(name, "run_ready") == 0) {
+      errno = 0;
+      ssize_t probed = write(STDOUT_FILENO, "", 0);
+      int error = probed < 0 ? errno : 0;
+      uint64_t commit =
+          atomic_load_explicit(&p->markers[0].commit, memory_order_acquire);
+      bool acknowledged = probed == 0 && commit == 1;
+      if (!fact(p, acknowledged ? "kernel_marker_ack" : "kernel_marker_unarmed",
+                "fact", 0, commit, 1, error))
+        return 74;
+      continue;
+    }
+    if (command != 'G') {
+      fact(p, name, "protocol_error", 64, command, 'G', 0);
+      return 64;
+    }
+    return fact(p, name, "released", 0, command, 0, 0) ? 0 : 74;
   }
-  if (bytes == 0) {
-    fact(p, name, "protocol_error", 75, 0, 0, 'G');
-    return 75;
-  }
-  if (command != 'G') {
-    fact(p, name, "protocol_error", 64, command, 'G', 0);
-    return 64;
-  }
-  return fact(p, name, "released", 0, command, 0, 0) ? 0 : 74;
 }
 
 static int prepare_run(struct probe *p, bool armed) {
@@ -660,7 +799,8 @@ static int run_once(struct probe *p, const struct phase_case *spec) {
 static int watched_run(struct probe *p, const struct phase_case *spec) {
   uint64_t owner_tid = 0;
   if (spec->observer == OBSERVER_THREADINFO ||
-      spec->observer == OBSERVER_INTERRUPT) {
+      spec->observer == OBSERVER_INTERRUPT ||
+      spec->observer == OBSERVER_KERNELMARKERS) {
     if (!before(p, "pthread_threadid_np", 0, 0, 0))
       return 74;
     int error = pthread_threadid_np(NULL, &owner_tid);
@@ -673,7 +813,11 @@ static int watched_run(struct probe *p, const struct phase_case *spec) {
                                   .memory = p->memory,
                                   .vcpu = p->vcpu,
                                   .kind = spec->observer,
-                                  .owner_tid = owner_tid};
+                                  .owner_tid = owner_tid,
+                                  .markers = p->markers,
+                                  .stop = &p->observer_stop};
+  if (spec->observer == OBSERVER_KERNELMARKERS)
+    atomic_init(&p->observer_stop, false);
   pthread_t thread;
   if (!before(p, "pthread_create", 0, 0, 0))
     return 74;
@@ -683,6 +827,8 @@ static int watched_run(struct probe *p, const struct phase_case *spec) {
   if (created != 0)
     return 71;
   int result = run_once(p, spec);
+  if (spec->observer == OBSERVER_KERNELMARKERS)
+    atomic_store_explicit(&p->observer_stop, true, memory_order_release);
   // After an actual API return, run_return_ready precedes this join.
   // Early errors also join before memory or vCPU cleanup.
   before(p, "pthread_join", 0, 0, 0);
@@ -748,6 +894,8 @@ static int execute(struct probe *p, int target, const struct phase_case *spec) {
   if (target == 3)
     return 0;
   p->phase = spec->name;
+  if (spec->observer == OBSERVER_KERNELMARKERS)
+    TRY(prepare_kernel_markers(p));
   TRY(prepare_run(p, spec->armed));
   return spec->observer != OBSERVER_NONE ? watched_run(p, spec)
                                          : run_once(p, spec);
@@ -791,6 +939,24 @@ static int cleanup(struct probe *p) {
     if (rc != 0)
       return 71;
     p->memory = NULL;
+  }
+  if (p->markers) {
+    if (p->marker_locked) {
+      before(p, "kernel_marker_munlock", PAGE_BYTES, 0, 0);
+      int rc = munlock(p->markers, PAGE_BYTES);
+      fact(p, "kernel_marker_munlock", "return", rc == 0 ? 0 : errno,
+           PAGE_BYTES, 0, 0);
+      if (rc != 0)
+        return 71;
+      p->marker_locked = false;
+    }
+    before(p, "kernel_marker_munmap", PAGE_BYTES, 0, 0);
+    int rc = munmap(p->markers, PAGE_BYTES);
+    fact(p, "kernel_marker_munmap", "return", rc == 0 ? 0 : errno, PAGE_BYTES,
+         0, 0);
+    if (rc != 0)
+      return 71;
+    p->markers = NULL;
   }
   fact(p, "cleanup_complete", "fact", 0, 0, 0, 0);
   return 0;
@@ -851,6 +1017,17 @@ int main(int argc, char **argv) {
        .paging = PAGING_ENABLED,
        .observer = OBSERVER_SENTINEL,
        .armed = true},
+      {.name = "armed-protected32-paging-cpuid-kernelmarkers",
+       .guest = GUEST_CPUID,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .observer = OBSERVER_KERNELMARKERS,
+       .armed = true},
+      {.name = "armed-protected32-paging-hlt-kernelmarkers",
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .observer = OBSERVER_KERNELMARKERS,
+       .armed = true},
   };
   int target = -1;
   if (argc == 2)
@@ -866,7 +1043,9 @@ int main(int argc, char **argv) {
             "armed-hlt-interrupt|armed-cpuid-interrupt|armed-sti-hlt|"
             "armed-protected32-cpuid|armed-protected32-hlt|"
             "armed-protected32-nopaging-cpuid|armed-protected32-nopaging-hlt|"
-            "armed-protected32-paging-cpuid|armed-protected32-paging-hlt\n",
+            "armed-protected32-paging-cpuid|armed-protected32-paging-hlt|"
+            "armed-protected32-paging-cpuid-kernelmarkers|"
+            "armed-protected32-paging-hlt-kernelmarkers\n",
             argv[0]);
     return 64;
   }
