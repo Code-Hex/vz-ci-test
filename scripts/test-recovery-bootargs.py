@@ -247,6 +247,37 @@ class Bootargs(unittest.TestCase):
         with patch.object(b, "capture", lambda *_args, **_kwargs: b"\n"):
             self.assertEqual(b.MacPlatform().active(), b"")
 
+    def test_core_finish_does_not_run_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, marker = Path(tmp), {"baseline": "old", "nonce": "n"}
+            platform = Platform({"boot-args": "preempt=10"})
+            b.stage(directory, marker, platform, self.save, lambda _p: None)
+            platform.events.clear()
+            facts = b.finish(directory, marker, platform, self.save, lambda _p: None, current_boot_uuid="new", inventory=False)
+            self.assertTrue(facts["nvram_restored"])
+            self.assertNotIn("inventory", platform.events)
+
+    def test_optional_inventory_started_marker_prevents_reexecution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, marker = Path(tmp), {"baseline": "old", "nonce": "n"}
+            platform = Platform({})
+            original_inventory = platform.inventory
+            def inventory():
+                saved = json.loads((directory / "debug-boot-inventory-started.json").read_text())
+                self.assertEqual(saved, {"marker": marker, "current_boot_uuid": "new"})
+                return original_inventory()
+            with patch.object(platform, "inventory", inventory):
+                b.observe_once(directory, marker, platform, self.save, lambda _p: None, current_boot_uuid="new")
+            b.observe_once(directory, marker, platform, self.save, lambda _p: None, current_boot_uuid="new")
+            self.assertEqual(platform.events, ["inventory"])
+            (directory / "debug-boot-inventory-result.json").unlink()
+            facts = b.observe_once(directory, marker, platform, self.save, lambda _p: None, current_boot_uuid="new")
+            self.assertEqual(facts["optional_inventory_status"], "uncertain")
+            self.assertEqual(platform.events, ["inventory"])
+            facts = b.observe_once(directory, marker, platform, self.save, lambda _p: None, current_boot_uuid="future")
+            self.assertEqual(facts["optional_inventory_status"], "scope_mismatch")
+            self.assertEqual(platform.events, ["inventory"])
+
     def test_saved_observation_cannot_be_reused_for_another_boot(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory, original = Path(tmp), {"boot-args": "preempt=10"}

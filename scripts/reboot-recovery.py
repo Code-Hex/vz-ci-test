@@ -721,6 +721,36 @@ def panic_capture(directory, config, current, deadline):
     raise recovery_reports.NoReport("report capture timeout")
 
 
+def publish_debug_core(directory, config, current, facts, token):
+    scope = {"marker": debug_boot_marker(config), "current_boot_uuid": current}
+    path = directory / "debug-boot-core.json"
+    if path.exists():
+        saved = json.loads(path.read_text())
+        if not isinstance(saved, dict) or saved.get("scope") != scope or not isinstance(saved.get("facts"), dict):
+            raise ValueError("boot core identity mismatch")
+        facts = saved["facts"]
+    else:
+        private_write(path, json.dumps({"scope": scope, "facts": facts}).encode())
+        sync_directory(directory)
+    if facts.get("current_boot_uuid") != current:
+        raise ValueError("boot core observation mismatch")
+    ctx = config["context"]
+    summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "boot_core", "binding": binding(ctx),
+                          "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
+                          "trigger": ctx.get("trigger", "reboot"), "cert_fingerprint": config.get("cert_fingerprint", ""),
+                          "debug_boot": True, "debug_boot_facts": facts})
+    output = {"title": "Boot core recovered", "summary": summary, "text": ""}
+    url = CHECKS + "/" + str(config["check_id"])
+    api("PATCH", url, token, {"status": "in_progress", "output": output})
+    check = api("GET", url, token)
+    verified_summary(check, config)
+    actual = check.get("output", {})
+    if (check.get("status") != "in_progress" or check.get("conclusion") is not None or
+            actual.get("title") != output["title"] or actual.get("summary") != summary or actual.get("text") not in (None, "")):
+        raise ValueError("boot core acknowledgement mismatch")
+    return facts
+
+
 def collect(directory):
     config = load_config(directory)
     if (directory / "completed.json").exists():
@@ -730,9 +760,9 @@ def collect(directory):
     if reboot_observed(config["baseline"], current) and config.get("debug_boot", False):
         try:
             debug_facts = recovery_bootargs.finish(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory,
-                                                   current_boot_uuid=current)
+                                                   current_boot_uuid=current, inventory=False)
         except (OSError, ValueError, subprocess.SubprocessError):
-            debug_facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "nvram_restored": False,
+            debug_facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "nvram_restored": False, "current_boot_uuid": current,
                            "debugger_count": None, "debugger_inventory_status": "unavailable",
                            "network_inventory_status": "unavailable", "virtio_network_classes": [],
                            "nic_inventory_status": "unsupported", "kernel_debug_state": {}}
@@ -764,6 +794,20 @@ def collect(directory):
     if ready.get("preboot_patch") is not True or ready.get("baseline") != config["baseline"] or ready.get("nonce") != config["nonce"]:
         raise ValueError("preboot confirmation missing")
     deadline = time.monotonic() + 180
+    if config.get("debug_boot", False):
+        try:
+            debug_facts = dict(publish_debug_core(directory, config, current, debug_facts, token))
+        except (OSError, ValueError, urllib.error.URLError):
+            return
+        if debug_facts.get("nvram_restored") is True:
+            try:
+                optional = recovery_bootargs.observe_once(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(),
+                                                          private_write, sync_directory, current_boot_uuid=current)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                optional = {"optional_inventory_status": "uncertain"}
+            debug_facts.update(optional)
+        else:
+            debug_facts["optional_inventory_status"] = "skipped_restore_failure"
     envelope = None
     capture_state = "boot_only"
     if panic_mode(config["context"]):
@@ -943,9 +987,12 @@ def controller(ctx, token):
                 try:
                     current = api("GET", CHECKS + "/" + str(check_id), token, timeout=5)
                     if select_check([current], ctx) is not None and current.get("status") != "completed":
+                        payload = {"status": "completed", "conclusion": "failure"}
+                        if not ctx.get("debug_boot", False):
+                            payload["output"] = {"title": "Recovery not observed",
+                                                 "summary": "Controller stopped before recovery proof; this does not prove a reboot or kernel failure."}
                         api("PATCH", CHECKS + "/" + str(check_id), token,
-                            {"status": "completed", "conclusion": "failure", "output": {"title": "Recovery not observed",
-                             "summary": "Controller stopped before recovery proof; this does not prove a reboot or kernel failure."}}, timeout=5)
+                            payload, timeout=5)
                 except (OSError, urllib.error.URLError, ValueError):
                     pass
 

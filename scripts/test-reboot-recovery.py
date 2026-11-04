@@ -124,6 +124,8 @@ class Recovery(unittest.TestCase):
                                      "current_boot_uuid": "new",
                                      "debugger_count": None, "nic_inventory_status": "unsupported"}}
         self.assertTrue(r.boot_proof_matches(data, pending, ctx))
+        core = dict(data, phase="boot_core")
+        self.assertFalse(r.boot_proof_matches(core, pending, ctx))
         for facts in ({}, {"active_debug_mask": 0x2000, "nvram_restored": False},
                       {"active_debug_mask": 0x400, "nvram_restored": True},
                       {"active_debug_mask": 0x2000, "active_bootargs_status": "invalid", "nvram_restored": True}):
@@ -262,28 +264,61 @@ class Recovery(unittest.TestCase):
             self.assertEqual(r.read_debug_event(directory, config, "returned")["returncode"], 0)
             self.assertFalse((directory / "debug-boot-restored.json").exists())
 
-    def test_newboot_collect_restores_before_inventory_and_api(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            config, platform, original = self.owner_fixture(directory)
-            config["check_id"] = 9
-            r.recovery_bootargs.stage(directory, r.debug_boot_marker(config), platform, r.private_write, r.sync_directory)
-            platform.active_value = b"preempt=10 debug=0x2000"
-            platform.events.clear()
-            r.private_write(directory / "token", b"test-token")
-            r.private_write(directory / "ready.json", r.json.dumps({"baseline": "old", "nonce": "n", "preboot_patch": True}).encode())
-            def api(*_args, **_kwargs):
-                platform.events.append("api")
-                error = r.urllib.error.HTTPError("https://api.github.com", 401, "test refusal", {}, None)
-                self.addCleanup(error.close)
-                raise error
-            with patch.object(r, "load_config", lambda _: config), patch.object(r, "boot_uuid", lambda: "new"), \
-                    patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), patch.object(r, "api", api), \
-                    patch.object(r, "debug_owner", lambda *_: self.fail("newboot invoked oldboot owner")):
-                r.collect(directory)
-            self.assertEqual(platform.value, original)
-            self.assertLess(platform.events.index("write"), platform.events.index("inventory"))
-            self.assertLess(platform.events.index("inventory"), platform.events.index("api"))
+    def test_newboot_core_ack_precedes_inventory_and_failed_ack_skips_it(self):
+        for acknowledged, restored in ((True, True), (False, True), (True, False)):
+            with self.subTest(acknowledged=acknowledged, restored=restored), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config, platform, original = self.owner_fixture(directory)
+                config["check_id"] = 9
+                r.recovery_bootargs.stage(directory, r.debug_boot_marker(config), platform, r.private_write, r.sync_directory)
+                platform.active_value = b"preempt=10 debug=0x2000"
+                platform.events.clear()
+                r.private_write(directory / "token", b"test-token")
+                r.private_write(directory / "ready.json", r.json.dumps({"baseline": "old", "nonce": "n", "preboot_patch": True}).encode())
+                output = {}
+                final_conclusions = []
+                original_finish = r.recovery_bootargs.finish
+                def finish(*args, **kwargs):
+                    if not restored:
+                        raise OSError("restoration unavailable")
+                    return original_finish(*args, **kwargs)
+                def api(method, _url, _token, payload=None, **_kwargs):
+                    if method == "PATCH" and payload.get("status") == "in_progress":
+                        platform.events.append("core_patch")
+                        output.update(payload["output"])
+                        return {}
+                    if method == "GET":
+                        platform.events.append("core_ack")
+                        ctx = config["context"]
+                        return {"id": 9, "name": "Runner recovery " + ctx["run_id"], "head_sha": ctx["sha"],
+                                "external_id": r.binding(ctx), "details_url": "https://github.com/Code-Hex/vz-ci-test/runs/9",
+                                "app": {"id": 15368 if acknowledged else 0, "slug": "github-actions"},
+                                "status": "in_progress", "conclusion": None, "output": output.copy()}
+                    platform.events.append("final_patch")
+                    final_conclusions.append(payload["conclusion"])
+                    error = r.urllib.error.HTTPError("https://api.github.com", 401, "test refusal", {}, None)
+                    self.addCleanup(error.close)
+                    raise error
+                with patch.object(r, "load_config", lambda _: config), patch.object(r, "boot_uuid", lambda: "new"), \
+                        patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), patch.object(r, "api", api), \
+                        patch.object(r.recovery_bootargs, "finish", finish), \
+                        patch.object(r, "debug_owner", lambda *_: self.fail("newboot invoked oldboot owner")):
+                    r.collect(directory)
+                if restored:
+                    self.assertEqual(platform.value, original)
+                    self.assertLess(platform.events.index("write"), platform.events.index("core_patch"))
+                self.assertTrue((directory / "debug-boot-core.json").exists())
+                self.assertEqual(r.json.loads((directory / "debug-boot-core.json").read_text())["facts"]["nvram_restored"], restored)
+                if acknowledged and restored:
+                    self.assertLess(platform.events.index("core_ack"), platform.events.index("inventory"))
+                    self.assertLess(platform.events.index("inventory"), platform.events.index("final_patch"))
+                    self.assertEqual(final_conclusions, ["success"])
+                elif acknowledged:
+                    self.assertNotIn("inventory", platform.events)
+                    self.assertEqual(final_conclusions, ["failure"])
+                else:
+                    self.assertNotIn("inventory", platform.events)
+                    self.assertNotIn("final_patch", platform.events)
 
     def test_default_reboot_path_still_uses_existing_command(self):
         calls = []
@@ -299,6 +334,30 @@ class Recovery(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             r.main()
         self.assertEqual(calls, ["verify-root", "sync", (["/usr/bin/sudo", "-n", "/sbin/reboot"], {"check": True, "timeout": 15})])
+
+    def test_debug_controller_stop_does_not_overwrite_new_core_after_stale_get(self):
+        ctx = {"run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True}
+        armed = {"id": 9, "name": "Runner recovery 123", "external_id": r.binding(ctx), "head_sha": ctx["sha"],
+                 "app": {"id": 15368, "slug": "github-actions"}, "details_url": "https://github.com/Code-Hex/vz-ci-test/runs/9",
+                 "status": "in_progress", "output": {"summary": '{"phase":"armed"}'}}
+        core = {"title": "Boot core recovered", "summary": '{"phase":"boot_core","immutable_fact":true}'}
+        server, patches = {"output": armed["output"]}, []
+        def api(method, _url, _token, payload=None, **_kwargs):
+            if method == "GET":
+                server["output"] = core.copy()
+                return armed
+            self.assertEqual(method, "PATCH")
+            patches.append(payload)
+            server.update(payload)
+            return {}
+        def stop(_seconds):
+            raise RuntimeError("controller interrupted")
+        with patch.object(r, "list_check", lambda *_: armed), patch.object(r, "api", api), \
+                patch.object(r.time, "sleep", stop), patch.object(r.signal, "signal", lambda *_: None):
+            with self.assertRaises(RuntimeError):
+                r.controller(ctx, "test-token")
+        self.assertEqual(patches, [{"status": "completed", "conclusion": "failure"}])
+        self.assertEqual(server["output"], core)
 
     def test_rsa_oaep_sha256_roundtrip_and_key_size(self):
         with tempfile.TemporaryDirectory() as tmp:

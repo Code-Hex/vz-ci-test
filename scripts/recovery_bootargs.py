@@ -269,7 +269,7 @@ def receipt_summary(data):
     return {key: data[key] for key in ("status", "cause", "actual_boot_uuid", "nvram_before_restore")}
 
 
-def finish(directory, marker, platform, save, sync, *, current_boot_uuid):
+def finish(directory, marker, platform, save, sync, *, current_boot_uuid, inventory=True):
     if not isinstance(current_boot_uuid, str) or not current_boot_uuid:
         raise ValueError("observation boot identity absent")
     facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "current_boot_uuid": current_boot_uuid,
@@ -315,4 +315,64 @@ def finish(directory, marker, platform, save, sync, *, current_boot_uuid):
             sync(directory)
 
     restore(directory, marker, platform, save, sync, before_restore=record, cause="postboot", current_boot_uuid=current_boot_uuid)
-    return {**facts, "nvram_restored": True, **platform.inventory()}
+    return {**facts, "nvram_restored": True, **(platform.inventory() if inventory else {})}
+
+
+def optional_summary(data):
+    result = {}
+    if not isinstance(data, dict):
+        return result
+    count = data.get("debugger_count")
+    if count is None or type(count) is int and 0 <= count <= 4096:
+        result["debugger_count"] = count
+    names = data.get("virtio_network_classes")
+    if isinstance(names, list):
+        result["virtio_network_classes"] = [name for name in names[:16] if isinstance(name, str) and re.fullmatch(r"AppleVirtIO[A-Za-z0-9_.-]{1,48}", name)]
+    for key in ("nic_inventory_status", "debugger_inventory_status", "network_inventory_status"):
+        if data.get(key) in ("observed", "unsupported", "unavailable", "invalid"):
+            result[key] = data[key]
+    states = data.get("kernel_debug_state")
+    if isinstance(states, dict):
+        result["kernel_debug_state"] = {}
+        for name, (_expr, maximum) in KERNEL_FIELDS.items():
+            value = states.get(name)
+            if not isinstance(value, dict) or value.get("status") not in ("observed", "unavailable", "invalid"):
+                continue
+            record = {"status": value["status"]}
+            number = value.get("value")
+            if record["status"] == "observed":
+                if maximum == 1 and type(number) is bool or maximum != 1 and type(number) is int and 0 <= number <= maximum:
+                    record["value"] = number
+                else:
+                    record["status"] = "invalid"
+            result["kernel_debug_state"][name] = record
+    return result
+
+
+def observe_once(directory, marker, platform, save, sync, *, current_boot_uuid):
+    scope = {"marker": marker, "current_boot_uuid": current_boot_uuid}
+    started = directory / "debug-boot-inventory-started.json"
+    result = directory / "debug-boot-inventory-result.json"
+    if started.exists():
+        if json.loads(started.read_text()) != scope:
+            return {"optional_inventory_status": "scope_mismatch"}
+        if not result.exists():
+            return {"optional_inventory_status": "uncertain"}
+        raw = result.read_bytes()
+        if len(raw) > 16384:
+            return {"optional_inventory_status": "invalid"}
+        saved = json.loads(raw)
+        if not isinstance(saved, dict) or saved.get("scope") != scope or not isinstance(saved.get("facts"), dict):
+            return {"optional_inventory_status": "invalid"}
+        return {"optional_inventory_status": "completed", **optional_summary(saved["facts"])}
+    if result.exists():
+        return {"optional_inventory_status": "invalid"}
+    save(started, json.dumps(scope).encode())
+    sync(directory)
+    facts = optional_summary(platform.inventory())
+    encoded = json.dumps({"scope": scope, "facts": facts}).encode()
+    if len(encoded) > 16384:
+        return {"optional_inventory_status": "invalid"}
+    save(result, encoded)
+    sync(directory)
+    return {"optional_inventory_status": "completed", **facts}
