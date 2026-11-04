@@ -73,6 +73,39 @@ def parse_network(data):
     return result
 
 
+def parse_devices(data, watchdog):
+    root = plistlib.loads(data)
+    if not isinstance(root, list) or len(root) > 64 or any(not isinstance(node, dict) for node in root):
+        raise ValueError("invalid_plist")
+    nodes = []
+    for node in root:
+        item = {}
+        for key in ("IOClass", "IOProviderClass"):
+            value = node.get(key)
+            if isinstance(value, str) and IDENTIFIER.fullmatch(value):
+                item[key] = value
+        if watchdog and type(node.get("IOWatchDogEnabled")) is bool:
+            item["IOWatchDogEnabled"] = node["IOWatchDogEnabled"]
+        nodes.append(item)
+    return {"count": len(root), "nodes": nodes}
+
+
+def parse_panic_nvram(data):
+    root = plistlib.loads(data)
+    if not isinstance(root, dict) or set(root) != {"aapl,panic-info"}:
+        raise ValueError("invalid_plist")
+    value = root["aapl,panic-info"]
+    if isinstance(value, bytes):
+        return {"type": "data", "size": len(value)}
+    if isinstance(value, str):
+        return {"type": "string", "size": len(value.encode("utf-8"))}
+    if type(value) is bool:
+        return {"type": "boolean", "size": None}
+    if type(value) is int:
+        return {"type": "integer", "size": None}
+    raise ValueError("invalid_type")
+
+
 def count_debuggers(data):
     root = plistlib.loads(data)
     if not isinstance(root, list) or len(root) > 4096:
@@ -150,6 +183,9 @@ def main():
         "sip": (["/usr/bin/csrutil", "status"], 65536, lambda x: parse_sip(x.decode("utf-8", "replace"))),
         "network": (["/usr/sbin/ioreg", "-a", "-r", "-c", "IONetworkController"], 4_000_000, parse_network),
         "debuggers": (["/usr/sbin/ioreg", "-a", "-r", "-c", "IOKernelDebugger"], 1_000_000, count_debuggers),
+        "nvram_controller": (["/usr/sbin/ioreg", "-a", "-r", "-c", "IONVRAMController"], 1_000_000, lambda x: parse_devices(x, False)),
+        "watchdog": (["/usr/sbin/ioreg", "-a", "-r", "-c", "IOWatchDogTimer"], 1_000_000, lambda x: parse_devices(x, True)),
+        "panic_nvram": (["/usr/sbin/nvram", "-x", "aapl,panic-info"], 1_000_000, parse_panic_nvram),
     }
     result = {"event": "kdp_platform_inventory", "kernel_uuid": UUID,
               "csr_allow_kernel_debugger_result": csr_result}
