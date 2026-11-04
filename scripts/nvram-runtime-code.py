@@ -66,6 +66,14 @@ def selected_entries(data):
     return [name for name in ENTRIES if name in ids]
 
 
+def loaded_uuid(text, entry):
+    pattern = re.compile(r'^\s*[0-9]+\s+[0-9]+\s+0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+\s+' +
+        re.escape(entry) + r'\s+\([^\s()]+\)\s+([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})(?:\s+<[0-9 ]*>)?\s*$')
+    candidates = [line for line in text.splitlines() if entry in line.split()]
+    match = pattern.fullmatch(candidates[0]) if len(candidates) == 1 else None
+    return {'status': 'observed', 'uuid': match.group(1).upper()} if match else {'status': 'unavailable', 'uuid': None}
+
+
 def valid_extracted(path):
     try:
         info = path.lstat()
@@ -378,10 +386,17 @@ def main():
                                 uuid_status, uuid_output = command(['/usr/bin/xcrun', 'dwarfdump', '--uuid', str(candidate)], 4096, 10, deadline)
                                 found = re.search(r'UUID: ([0-9A-Fa-f-]{36}) \(x86_64\)', uuid_output) if uuid_status == 'ok' else None
                                 unit['image_uuid'] = found.group(1).upper() if found else None
+                                loaded_status, loaded_text = command(['/usr/sbin/kextstat', '-l', '-b', name], 32768, 10, deadline)
+                                unit['loaded_image'] = loaded_uuid(loaded_text, name) if loaded_status == 'ok' else {'status': loaded_status, 'uuid': None}
+                                loaded = unit['loaded_image']['uuid']
+                                unit['runtime_match'] = ('verified' if loaded == unit['image_uuid'] else 'mismatch') if loaded and unit['image_uuid'] else 'not_verified'
                                 extracted.append((str(candidate), name))
                             save()
     except (OSError, subprocess.SubprocessError):
         extraction['status'] = 'unavailable'
+    if (len(extraction['entries']) == len(ENTRIES) and
+            all(unit.get('runtime_match') == 'verified' for unit in extraction['entries'])):
+        extraction['runtime_match'] = result['binary_loaded_status'] = 'verified'
     save()
     sources = [(path, None) for path in BINARIES]
     sources = [(path, entry) for path, entry in extracted] + sources

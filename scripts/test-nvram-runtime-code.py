@@ -56,6 +56,14 @@ class TestParsing(unittest.TestCase):
         with self.assertRaises(ValueError): probe.selected_entries({'id': 'com.apple.driver.AppleEFINVRAM'})
         with self.assertRaises(ValueError): probe.selected_entries([{'id': 'com.apple.driver.AppleEFINVRAM'}] * 2)
 
+    def test_loaded_uuid_requires_one_exact_bundle_row(self):
+        entry = 'com.apple.driver.AppleEFINVRAM'
+        row = '  23  0 0xffffff800195a000 0x9000 0x9000 ' + entry + ' (2.1) 7E2D300F-3D59-35BF-879C-EA5F7C54D47B <8 4 3>\n'
+        expected = {'status': 'observed', 'uuid': '7E2D300F-3D59-35BF-879C-EA5F7C54D47B'}
+        self.assertEqual(probe.loaded_uuid('Executing: kmutil\n' + row, entry), expected)
+        for invalid in ('', row + row, row + row.replace('7E2D300F-', 'invalid-'), row.replace(entry, entry + 'Other'), row.replace('7E2D300F-', 'invalid-')):
+            self.assertEqual(probe.loaded_uuid(invalid, entry), {'status': 'unavailable', 'uuid': None})
+
     def test_real_macho_symbol_selection(self):
         with tempfile.TemporaryDirectory() as folder:
             path = pathlib.Path(folder)
