@@ -49,6 +49,33 @@ def events_valid(data, pid, name):
     return bool(re.fullmatch(pattern, lines[1]))
 
 
+def event_facts(data, pid, name):
+    lines = [line.strip() for line in data.splitlines()]
+    hits = [line[4:].split(b':') for line in lines if line.startswith(b'HIT ')]
+    fields = hits[0] if len(hits) == 1 and len(hits[0]) == 4 else None
+    return {'ready_count': lines.count(b'READY'), 'hit_count': len(hits),
+            'provider_exact': fields[0] == ('pid' + str(pid)).encode() if fields else None,
+            'function_exact': fields[2] == name.encode() if fields else None,
+            'name_exact': fields[3] == b'entry' if fields else None}
+
+
+def stderr_kind(data):
+    lower = data.lower()
+    if not lower: return 'empty'
+    if b'permission denied' in lower or b'not permitted' in lower: return 'permission'
+    if b'failed to grab' in lower or b'failed to attach' in lower: return 'attach_failed'
+    if b'no probes' in lower or b'no probe matches' in lower: return 'no_probes'
+    if b'failed to compile' in lower or b'syntax error' in lower: return 'compile_failed'
+    return 'other'
+
+
+def write_public(path, result):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(result, stream, separators=(',', ':'))
+        stream.write('\n'); stream.flush(); os.fchmod(stream.fileno(), 0o644); os.fsync(stream.fileno())
+
+
 def command(argv, directory, label, timeout=15):
     with (directory / (label + '.stdout')).open('wb') as sink, (directory / (label + '.stderr')).open('wb') as errors:
         child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -98,19 +125,22 @@ def guard(directory):
     return True
 
 
-def observe(binary, nonce, directory):
+def observe(binary, nonce, directory, facts):
     name = 'vz_nonce_' + nonce
     helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     tracer = None
     try:
         code, listing = command(['/usr/sbin/dtrace', '-p', str(helper.pid), '-l', '-n', 'pid$target::' + name + ':entry'], directory, 'listing')
-        if code or parse_probe_list(listing.decode('utf-8', 'replace'), helper.pid, name) != 'matched': raise ValueError('probe_unavailable')
+        facts['list_exit'] = code
+        facts['list_status'] = parse_probe_list(listing.decode('utf-8', 'replace'), helper.pid, name)
+        facts['list_stderr'] = stderr_kind((directory / 'listing.stderr').read_bytes())
+        if code or facts['list_status'] != 'matched': raise ValueError('probe_unavailable')
         with (directory / 'trace.stderr').open('wb') as errors, (directory / 'trace.stdout').open('wb') as log:
             tracer = subprocess.Popen(['/usr/sbin/dtrace', '-q', '-x', 'switchrate=10hz', '-p', str(helper.pid), '-n', probe_script(nonce, False)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             selector = selectors.DefaultSelector()
             selector.register(tracer.stdout, selectors.EVENT_READ, log)
             selector.register(tracer.stderr, selectors.EVENT_READ, errors)
-            data = bytearray(); total = 0; deadline = time.monotonic() + 20; released = False
+            data = bytearray(); err_data = bytearray(); total = 0; deadline = time.monotonic() + 20; released = False
             try:
                 while selector.get_map():
                     left = deadline - time.monotonic()
@@ -125,11 +155,16 @@ def observe(binary, nonce, directory):
                         if total > LIMIT: raise ValueError('output_limit')
                         key.data.write(part); key.data.flush()
                         if key.fileobj is tracer.stdout: data.extend(part)
+                        else: err_data.extend(part)
                         if not released and bytes(data).splitlines() == [b'READY'] and data.endswith(b'\n'):
                             helper.stdin.write(b'G'); helper.stdin.flush(); helper.stdin.close(); released = True
-                if not released or tracer.wait(timeout=max(0.1, deadline-time.monotonic())) != 0 or helper.wait(timeout=2) != 0 or not events_valid(bytes(data), helper.pid, name):
+                tracer_code = tracer.wait(timeout=max(0.1, deadline-time.monotonic()))
+                helper_code = helper.wait(timeout=2) if released else helper.poll()
+                if not released or tracer_code != 0 or helper_code != 0 or not events_valid(bytes(data), helper.pid, name):
                     raise ValueError('probe_not_observed')
             finally:
+                facts.update(event_facts(bytes(data), helper.pid, name))
+                facts.update(released=released, tracer_exit=tracer.poll(), helper_exit=helper.poll(), trace_stderr=stderr_kind(bytes(err_data)))
                 selector.close(); tracer.stdout.close(); tracer.stderr.close()
         return True
     finally:
@@ -180,7 +215,11 @@ def main():
         result['helper_source_sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
         result['helper_sha256'] = hashlib.sha256(binary.read_bytes()).hexdigest()
         result['stage'] = 'probe'
-        observe(binary, nonce, directory)
+        result['probe_diagnostics'] = {'list_status': 'unavailable', 'list_exit': None, 'list_stderr': 'unavailable',
+                                       'ready_count': 0, 'hit_count': 0, 'provider_exact': None, 'function_exact': None,
+                                       'name_exact': None, 'released': False, 'tracer_exit': None, 'helper_exit': None,
+                                       'trace_stderr': 'unavailable'}
+        observe(binary, nonce, directory, result['probe_diagnostics'])
         result['stage'] = 'panic_compile_only'
         if not compile_panic(binary, nonce, directory): raise ValueError('panic_compile_failed')
         result['panic_info_getter_status'], _ = recovery_nvram_panic.read_panic_info()
@@ -191,7 +230,7 @@ def main():
         result['reason'] = str(error) if type(error) is ValueError and str(error) in reasons else (
             'timeout' if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else 'operation_failed')
     output = temp / 'debug' / 'panic-source-preflight.json'
-    output.write_text(json.dumps(result, separators=(',', ':')) + '\n')
+    write_public(output, result)
     print(json.dumps(result, separators=(',', ':')), flush=True)
     return 0 if result['status'] == 'passed' else 1
 

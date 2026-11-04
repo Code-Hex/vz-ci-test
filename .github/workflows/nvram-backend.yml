@@ -63,6 +63,7 @@ jobs:
           BOOT_CONTROL: ${{ inputs.control }}
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/debug"
           native_python=$(command -v python3)
           case "$BOOT_CONTROL" in
             bootplist-propagation) control_script=scripts/bootplist-preflight.py ;;

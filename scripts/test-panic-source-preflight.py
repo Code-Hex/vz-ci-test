@@ -43,6 +43,26 @@ class Preflight(unittest.TestCase):
                 p.command([sys.executable, '-c', 'import sys; sys.stderr.write("x" * 100000)'], root, 'large')
             self.assertLessEqual((root / 'large.stderr').stat().st_size, p.LIMIT)
 
+    def test_diagnostics_capture_actual_mismatch_without_raw_values(self):
+        name = 'vz_nonce_' + 'a' * 64
+        data = f'READY\nHIT pid456:helper:{name}:return\n'.encode()
+        result = p.event_facts(data, 456, name)
+        self.assertEqual(result, {'ready_count': 1, 'hit_count': 1, 'provider_exact': True,
+                                  'function_exact': True, 'name_exact': False})
+        self.assertNotIn(name, str(result))
+        self.assertEqual(p.stderr_kind(b'dtrace: permission denied: secret'), 'permission')
+        self.assertEqual(p.stderr_kind(b'dtrace: strange details'), 'other')
+        self.assertEqual(p.stderr_kind(b''), 'empty')
+
+    def test_public_result_is_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'result.json'
+            old = __import__('os').umask(0o077)
+            try: p.write_public(path, {'status': 'failed'})
+            finally: __import__('os').umask(old)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(__import__('json').loads(path.read_text()), {'status': 'failed'})
+
     def test_events_only_exact_once_in_order(self):
         name = 'vz_nonce_' + 'a' * 64
         hit = f'HIT pid456:helper:{name}:entry\n'.encode()
