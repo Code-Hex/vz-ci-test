@@ -1,0 +1,47 @@
+name: Intel Linux wait capture
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-26-intel
+    timeout-minutes: 8
+    steps:
+      - name: Check out diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Prepare the unchanged Linux suite
+        run: bash scripts/prepare-wait-linux.sh
+      - name: Build UUID-guarded samplers and probe
+        run: |
+          bash scripts/build-pc-sampler.sh
+          bash scripts/build-hypervisor.sh
+          xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -std=c11 -Wall -Wextra -Werror -O1 -g probes/wait-register-control.c -o "$RUNNER_TEMP/debug/probes/wait-register-control"
+          shasum -a 256 probes/wait-register-control.c probes/wait-register-control.d "$RUNNER_TEMP/debug/probes/wait-register-control"
+          sudo -n dtrace -C -I "$GITHUB_WORKSPACE/probes" -e -w -s probes/pc_sampler.d 1 4096 3
+          sudo -n dtrace -C -e -s probes/wait-register-control.d 1 1 2
+      - name: Run autonomous Linux wait capture
+        env:
+          VZ_TEST_BINARY: ${{ runner.temp }}/debug/vz-pristine/vz.test
+          GOTOOLCHAIN: go1.27.3
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify-wait-capture.py linux
+      - name: Preserve diagnostic observations
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wait-capture-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/debug/wait-capture/
+            ${{ runner.temp }}/debug/wait-linux-preparation.log
+          retention-days: 1
+          if-no-files-found: warn

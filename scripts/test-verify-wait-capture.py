@@ -58,6 +58,77 @@ class Gate(unittest.TestCase):
         self.assertFalse(capture.ready_snapshot())
         self.assertTrue(capture.wait_positive)
 
+    def test_wait_telemetry_has_joinable_bounded_lines(self):
+        import json
+        record = {
+            "cpu": 0,
+            "coherent": True,
+            "trustworthy": True,
+            "sequence_regressed": False,
+            "seq_before": 2776,
+            "seq_after": 2776,
+            "counter_transport_valid": True,
+            "invalid_count": 0,
+            "error_seen": 0,
+            "captured": True,
+            "record_kind": 'latched_wait_sample',
+            "current_profile_generation": 10516,
+            "latest_profile_is_wait_sample": False,
+            "age_at_export_ns": 2326625,
+            "response_stable": True,
+            "pending_before": 4,
+            "pending_after": 4,
+            "sample_timestamp_ns": 16842044703,
+            "profile_generation": 10512,
+            "pid": 32099,
+            "tid": 85709,
+            "rip": 18446743524055323074,
+            "rbp": 18446743876329245712,
+            "rbx": 18446743876329245792,
+            "rsp": 18446743876329245664,
+            "cs": 8,
+            "rflags": 514,
+            "frame": 18446743876329245440,
+            "base": 18446743876329230336,
+            "top": 18446743876329246720,
+            "parent": 18446743876329245904,
+            "return_pc": 18446743524055322177,
+            "requested": 18446744073709551615,
+            "called": 14,
+            "parent_called": 14,
+            "response_before": 10,
+            "response_after": 10,
+            "action": 18446743524060762240,
+            "action_arg0": 18446743876329245920,
+            "action_arg1": 0,
+            "mode": 1,
+            "slide": 97419264,
+        }
+        parts = capture.wait_events(record, {"snapshot": 1, "export_timestamp_ns": 16844371328,
+                                            "mach_before_write_ns": 123456789012345, "mach_after_write_ns": 123456789012346})
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(all(len(json.dumps(v, separators=(",", ":"), ensure_ascii=False).encode()) + 1 <= 900 for v in parts))
+        self.assertEqual(parts[0]["event"], "wait_frame")
+        self.assertEqual(parts[1]["event"], "wait_call")
+        self.assertEqual(parts[0]["sample_timestamp_ns"], parts[1]["sample_timestamp_ns"])
+        self.assertEqual(parts[0]["seq_before"], parts[1]["seq_before"])
+        self.assertEqual(parts[0]["record"]["rip"], 18446743524055323074)
+        self.assertEqual(parts[1]["record"]["pending_after"], 4)
+        combined = dict(parts[0]["record"], **parts[1]["record"])
+        self.assertEqual(combined, record)
+
+    def test_linux_invocation_uses_binary_directory_and_requires_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "fixture"
+            binary.write_text("#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$1\" \"$2\" PASS\n")
+            binary.chmod(0o755)
+            self.assertEqual(capture.run_linux(binary, 10), "success")
+            raw = (capture.OUT / "linux.log").read_text().splitlines()
+            self.assertEqual(Path(raw[0]).resolve(), binary.parent.resolve())
+            self.assertEqual(raw[1:], ["-test.timeout=3m", "-test.v", "PASS"])
+            binary.write_text("#!/bin/sh\necho 'not PASS'\n")
+            self.assertEqual(capture.run_linux(binary, 10), "failure")
+
     def test_wait_positive_requires_trust_and_no_error(self):
         wait = {"cpu": 1, "captured": True, "trustworthy": True, "seq_before": 4,
                 "invalid_count": 1, "error_seen": 0, "coherent": True, "counter_transport_valid": True,

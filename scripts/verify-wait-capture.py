@@ -27,6 +27,9 @@ traces = []
 
 def report(value):
     global dropped
+    if len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()) > 899:
+        dropped += 1
+        value = {"event": "oversized_telemetry", "original_event": value.get("event"), "dropped": dropped}
     try:
         report_queue.put_nowait(value)
     except queue.Full:
@@ -39,7 +42,7 @@ def printer():
         try:
             if item is None:
                 return
-            print(json.dumps(item, separators=(",", ":")), flush=True)
+            print(json.dumps(item, separators=(",", ":"), ensure_ascii=False), flush=True)
         finally:
             report_queue.task_done()
 
@@ -75,9 +78,9 @@ class Reader:
                         self.callback(value)
 
 
-def start(command, filename, callback=None, stdin=False):
+def start(command, filename, callback=None, stdin=False, cwd=None):
     proc = subprocess.Popen(command, stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd,
                             text=True, bufsize=1, start_new_session=True)
     children.append(proc)
     return Reader(proc, filename, callback)
@@ -159,6 +162,21 @@ fresh_first = None
 fresh_advanced = False
 
 
+FRAME_FIELDS = {"pid", "tid", "rip", "rbp", "rbx", "rsp", "cs", "rflags", "frame", "base", "top", "parent", "return_pc", "slide"}
+
+
+def wait_events(record, snapshot):
+    common = {"snapshot": snapshot.get("snapshot"), "cpu": record.get("cpu"),
+              "seq_before": record.get("seq_before"), "sample_timestamp_ns": record.get("sample_timestamp_ns"),
+              "export_timestamp_ns": snapshot.get("export_timestamp_ns"),
+              "mach_before_write_ns": snapshot.get("mach_before_write_ns"),
+              "mach_after_write_ns": snapshot.get("mach_after_write_ns"), "dropped": dropped}
+    frame = {key: value for key, value in record.items() if key in FRAME_FIELDS}
+    call = {key: value for key, value in record.items() if key not in FRAME_FIELDS}
+    return [{"event": "wait_frame", **common, "record": frame},
+            {"event": "wait_call", **common, "record": call}]
+
+
 def observe(value):
     global last_snapshot, last_report, last_received, wait_positive, fresh_first, fresh_advanced
     if value.get("event") != "pc_snapshot":
@@ -182,20 +200,21 @@ def observe(value):
             seq = item.get("seq_before", 0)
             if seq > last_wait[cpu]:
                 last_wait[cpu] = seq
-                report({"event": "latched_wait", "snapshot": value.get("snapshot"), "record": item,
-                        "export_timestamp_ns": value.get("export_timestamp_ns"), "dropped": dropped})
+                for event in wait_events(item, value):
+                    report(event)
     if time.monotonic() - last_report >= 1:
         last_report = time.monotonic()
-        report({"event": "cpu_summary", "snapshot": value.get("snapshot"),
-                "armed": value.get("armed"), "mach_before_write_ns": value.get("mach_before_write_ns"),
-                "mach_after_write_ns": value.get("mach_after_write_ns"),
-                "export_timestamp_ns": value.get("export_timestamp_ns"),
-                "error": value.get("wait_observer_error_seen"), "cpus": value.get("cpus"),
-                "wait_health": [{key: item.get(key) for key in (
-                    "cpu", "seq_before", "seq_after", "coherent", "trustworthy",
-                    "counter_transport_valid", "invalid_count", "error_seen", "captured",
-                    "age_at_export_ns", "current_profile_generation", "latest_profile_is_wait_sample")}
-                    for item in value.get("waits", [])], "dropped": dropped})
+        for item in value.get("cpus", []):
+            report({"event": "cpu_sample", "snapshot": value.get("snapshot"),
+                    "armed": value.get("armed"), "mach_before_write_ns": value.get("mach_before_write_ns"),
+                    "mach_after_write_ns": value.get("mach_after_write_ns"),
+                    "export_timestamp_ns": value.get("export_timestamp_ns"),
+                    "error": value.get("wait_observer_error_seen"), "record": item, "dropped": dropped})
+        for item in value.get("waits", []):
+            health = {key: item.get(key) for key in ("cpu", "seq_before", "seq_after", "coherent", "trustworthy",
+                      "counter_transport_valid", "invalid_count", "error_seen", "captured", "age_at_export_ns",
+                      "current_profile_generation", "latest_profile_is_wait_sample")}
+            report({"event": "wait_health", "snapshot": value.get("snapshot"), "record": health, "dropped": dropped})
 
 
 def ready_snapshot():
@@ -239,7 +258,50 @@ def run_timer(phase, timeout):
     return result
 
 
+def run_linux(binary, timeout, monitors=()):
+    saw_pass = False
+    observer_failed = False
+
+    def receive(value):
+        nonlocal saw_pass
+        line = value.get("raw")
+        if line is None:
+            line = json.dumps(value, separators=(",", ":"))
+        if line == "PASS":
+            saw_pass = True
+        report({"event": "linux_output", "text": line[:100], "truncated": len(line) > 100, "dropped": dropped})
+
+    proc = start([str(binary), "-test.timeout=3m", "-test.v"], "linux.log", receive, cwd=binary.parent)
+    started = time.monotonic()
+    while proc.proc.poll() is None and time.monotonic() - started < timeout:
+        if not observer_failed and any(reader.proc.poll() is not None for reader in monitors):
+            observer_failed = True
+            report({"event": "observer_stopped", "dropped": dropped})
+        report({"event": "linux_heartbeat", "elapsed": round(time.monotonic() - started, 2), "dropped": dropped})
+        time.sleep(2)
+    timed_out = proc.proc.poll() is None
+    if timed_out:
+        kill_owned(proc.proc)
+    proc.thread.join(2)
+    observer_failed = observer_failed or any(reader.proc.poll() is not None for reader in monitors)
+    result = "success" if not timed_out and proc.proc.poll() == 0 and saw_pass and not observer_failed else "failure"
+    report({"event": "linux_result", "result": result, "exit": proc.proc.poll(), "saw_pass": saw_pass,
+            "timed_out": timed_out, "observer_failed": observer_failed, "dropped": dropped})
+    return result
+
+
 def main():
+    if len(sys.argv) not in (1, 2) or (len(sys.argv) == 2 and sys.argv[1] != "linux"):
+        print("usage: verify-wait-capture.py [linux]", file=sys.stderr)
+        return 2
+    linux = len(sys.argv) == 2
+    binary = None
+    if linux:
+        path = os.environ.get("VZ_TEST_BINARY", "")
+        if not path or not Path(path).is_absolute() or not Path(path).is_file() or not os.access(path, os.X_OK):
+            print("VZ_TEST_BINARY must be an absolute executable path", file=sys.stderr)
+            return 2
+        binary = Path(path)
     trace = None
     result = "failure"
     try:
@@ -247,7 +309,8 @@ def main():
         if uuid != UUID:
             raise RuntimeError("kernel UUID mismatch")
         run_register_control()
-        helper = start([str(PROBES / "pc-sampler"), "120000", "10"], "snapshots.jsonl", observe)
+        helper_started = time.monotonic()
+        helper = start([str(PROBES / "pc-sampler"), "240000" if linux else "120000", "10"], "snapshots.jsonl", observe)
         until(lambda: helper.records and helper.records[0].get("event") == "pc_sampler_buffer", 5, "sampler header missing")
         header = helper.records[0]
         if header.get("bytes") != 4096 or header.get("cpu_slots") != 4:
@@ -260,8 +323,13 @@ def main():
             raise RuntimeError("spin control failed")
         if not ready_snapshot() or helper.proc.poll() is not None or trace.proc.poll() is not None:
             raise RuntimeError("sampler no longer ready after spin")
-        result = run_timer("timer-hlt", 45)
+        if linux and time.monotonic() - helper_started > 35:
+            raise RuntimeError("sampler duration insufficient for Linux timeout")
+        result = run_linux(binary, 200, (helper, trace)) if linux else run_timer("timer-hlt", 45)
+        if result == "success" and (not ready_snapshot() or helper.proc.poll() is not None or trace.proc.poll() is not None):
+            raise RuntimeError("observer invalid at workload completion")
     except (OSError, RuntimeError, subprocess.SubprocessError, KeyError, ValueError) as error:
+        result = "failure"
         report({"event": "controller_error", "error": str(error), "dropped": dropped})
     finally:
         for owned_trace in traces:
