@@ -4,6 +4,7 @@ import base64
 import hashlib
 import recovery_reports
 import recovery_bootargs
+import recovery_arrival
 import json
 import os
 from pathlib import Path
@@ -350,11 +351,14 @@ def prepare_root(payload):
         raise ValueError("invalid check identifier")
     config = {"context": ctx, "baseline": baseline, "check_id": check["id"], "nonce": nonce, "python": python, "cert_fingerprint": fingerprint, "helper_sha256": helper_sha,
               "debug_boot": ctx.get("debug_boot", False),
-              "debug_source_identity": debug_source_identity() if ctx.get("debug_boot", False) else ""}
+              "debug_source_identity": debug_source_identity() if ctx.get("debug_boot", False) else "",
+              "arrival_api_ipv4": recovery_arrival.resolve_api()}
     private_write(directory / "config.json", json.dumps(config).encode())
     private_write(directory / "recovery.py", Path(__file__).read_bytes())
     private_write(directory / "recovery_reports.py", Path(recovery_reports.__file__).read_bytes())
     private_write(directory / "recovery_bootargs.py", Path(recovery_bootargs.__file__).read_bytes())
+    private_write(directory / "recovery_arrival.py", Path(recovery_arrival.__file__).read_bytes())
+    private_write(directory / "arrival.sh", recovery_arrival.render(config, directory))
     sync_directory(directory)
     sync_directory(directory.parent)
     print(json.dumps({"event": "recovery_public_key_ready", "check_id": check["id"], "python": python,
@@ -393,13 +397,15 @@ def arm_root(payload):
         time.sleep(2)
     if token is None:
         raise ValueError("controller token timeout")
+    header = recovery_arrival.authorization_header(token)
     private_write(directory / "token", token.encode())
+    private_write(directory / "arrival.headers", header)
     label = "com.vz.ci.recovery." + ctx["run_id"] + "." + ctx["attempt"]
     plist = Path("/Library/LaunchDaemons") / (label + ".plist")
     python = config["python"]
     if not Path(python).is_file() or not os.access(python, os.X_OK) or str(Path(python).resolve()) != python:
         raise ValueError("daemon Python executable changed")
-    data = plistlib.dumps({"Label": label, "ProgramArguments": [python, str(directory / "recovery.py"), "collect", str(directory)],
+    data = plistlib.dumps({"Label": label, "ProgramArguments": ["/usr/bin/env", "-i", "/bin/sh", str(directory / "arrival.sh")],
                            "RunAtLoad": True, "StandardOutPath": str(directory / "launchd.log"),
                            "StandardErrorPath": str(directory / "launchd.log"),
                            **({"StartInterval": 5} if config.get("debug_boot", False) else {})})
@@ -845,6 +851,7 @@ def collect(directory):
                 timeout=min(10, max(0.1, deadline - time.monotonic())))
             private_write(directory / "completed.json", json.dumps({"boot_uuid": current}).encode())
             (directory / "token").unlink()
+            (directory / "arrival.headers").unlink(missing_ok=True)
             (directory / "key.pem").unlink()
             ctx = config["context"]
             plist = Path("/Library/LaunchDaemons") / ("com.vz.ci.recovery." + ctx["run_id"] + "." + ctx["attempt"] + ".plist")
