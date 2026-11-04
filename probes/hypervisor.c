@@ -167,6 +167,7 @@ struct phase_case {
   enum guest_mode mode;
   enum paging_kind paging;
   enum observer_kind observer;
+  hv_vm_options_t vm_flags;
   bool armed, control, forever;
 };
 
@@ -848,8 +849,8 @@ static int execute(struct probe *p, int target, const struct phase_case *spec) {
   if (target == 0)
     return 0;
   p->phase = "vm";
-  hv_return_t result =
-      CALL(p, "hv_vm_create", hv_vm_create(HV_VM_DEFAULT), HV_VM_DEFAULT, 0, 0);
+  hv_return_t result = CALL(p, "hv_vm_create", hv_vm_create(spec->vm_flags),
+                            spec->vm_flags, 0, 0);
   p->vm_created = result == HV_SUCCESS;
   TRY(status(p, result));
   if (target == 1)
@@ -1028,6 +1029,19 @@ int main(int argc, char **argv) {
        .paging = PAGING_ENABLED,
        .observer = OBSERVER_KERNELMARKERS,
        .armed = true},
+      {.name = "armed-protected32-paging-cpuid-accel-kernelmarkers",
+       .guest = GUEST_CPUID,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .observer = OBSERVER_KERNELMARKERS,
+       .vm_flags = HV_VM_ACCEL_APIC,
+       .armed = true},
+      {.name = "armed-protected32-paging-hlt-accel-kernelmarkers",
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .observer = OBSERVER_KERNELMARKERS,
+       .vm_flags = HV_VM_ACCEL_APIC,
+       .armed = true},
   };
   int target = -1;
   if (argc == 2)
@@ -1045,7 +1059,9 @@ int main(int argc, char **argv) {
             "armed-protected32-nopaging-cpuid|armed-protected32-nopaging-hlt|"
             "armed-protected32-paging-cpuid|armed-protected32-paging-hlt|"
             "armed-protected32-paging-cpuid-kernelmarkers|"
-            "armed-protected32-paging-hlt-kernelmarkers\n",
+            "armed-protected32-paging-hlt-kernelmarkers|"
+            "armed-protected32-paging-cpuid-accel-kernelmarkers|"
+            "armed-protected32-paging-hlt-accel-kernelmarkers\n",
             argv[0]);
     return 64;
   }
