@@ -14,7 +14,7 @@ import urllib.request
 FIELDS = {0x681e, 0x681c, 0x6820, 0x4826, 0x4824, 0x4016, 0x4000, 0x4002, 0x482e, 0x400c}
 MOV_PHASES = {"mtf-mov", "mtf-forever-mov"}
 OBSERVE_PHASES = {"mtf-hlt-observe", "mtf-forever-hlt-observe"}
-PHASES = MOV_PHASES | OBSERVE_PHASES | {"mtf-hlt-resume"}
+PHASES = MOV_PHASES | OBSERVE_PHASES | {"mtf-hlt-resume", "mtf-nop-observe"}
 API = "https://api.github.com/repos/Code-Hex/vz-ci-test/check-runs"
 KERNEL_UUID = "87453B1D-A163-31FA-B33B-0FB4BE78E6E8"
 
@@ -106,6 +106,19 @@ def phase_success(phase, records, clean, checkpoints):
         return False
     if phase in MOV_PHASES:
         return exact(records, "mtf_mov_verified", (37, 263, 165))
+    if phase == "mtf-nop-observe":
+        exits, tags = events(records, "mtf_exit"), events(records, "mtf_exit_tag")
+        gates = events(records, "mtf_mov_checkpoint_ready")
+        if (set(checkpoints) != {"mov"} or len(exits) != 2 or len(tags) != 2 or len(gates) != 1
+                or any(r.get("result") != 0 for r in exits + tags + gates)
+                or [args(r) for r in exits] != [(37, 263, 0), (37, 264, 0)]
+                or [args(r) for r in tags] != [(1, 165, 0), (2, 165, 0)]
+                or args(gates[0]) != (71, 0, 0)
+                or not exact(records, "mtf_nop_verified", (37, 264, 0))):
+            return False
+        points = [records.index(exits[0]), records.index(tags[0]), records.index(gates[0]),
+                  records.index(exits[1]), records.index(tags[1]), records.index(events(records, "mtf_nop_verified")[0])]
+        return points == sorted(set(points))
     return (set(checkpoints) == {"mov", "hlt"} and
             (phase in OBSERVE_PHASES or (phase == "mtf-hlt-resume" and resume_verified(records))))
 

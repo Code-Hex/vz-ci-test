@@ -106,7 +106,8 @@ enum guest_kind {
   GUEST_CPUID,
   GUEST_SPIN,
   GUEST_STI_HLT,
-  GUEST_HLT_TIMER
+  GUEST_HLT_TIMER,
+  GUEST_MTF_NOP
 };
 enum observer_kind {
   OBSERVER_NONE,
@@ -117,7 +118,7 @@ enum observer_kind {
 };
 
 struct guest_case {
-  uint8_t tail[2];
+  uint8_t tail[3];
   uint64_t exit_reason;
   // Zero means the asynchronous exit's instruction length is not read or gated.
   uint64_t instruction_length;
@@ -154,6 +155,7 @@ static const struct guest_case guests[] = {
                          .tail_offset = 1,
                          .activity_state = 1,
                          .verified_fact = "sentinel_hlt_timer_verified"},
+    [GUEST_MTF_NOP] = {.tail = {0x90, 0x0f, 0x0b}},
 };
 
 struct kernel_marker_body {
@@ -932,7 +934,14 @@ static int run_mtf(struct probe *p, const struct phase_case *spec) {
     return p->output_failed ? 74 : 0;
   }
   TRY(gate(p, "mtf_mov_checkpoint_ready"));
-  TRY(mtf_step(p, spec, 2, CODE + p->profile->mov_length + 1, 1));
+  TRY(mtf_step(p, spec, 2, CODE + p->profile->mov_length + 1,
+               spec->mtf_phase == 4 ? 0 : 1));
+  if (spec->mtf_phase == 4) {
+    p->guest_verified = true;
+    fact(p, "mtf_nop_verified", "fact", 0, 37,
+         CODE + p->profile->mov_length + 1, 0);
+    return p->output_failed ? 74 : 0;
+  }
   TRY(mtf_snapshot(p, 2, &before_state));
   uint64_t primary = before_state.fields[7];
   if (before_state.fields[0] != CODE + p->profile->mov_length + 1 ||
@@ -1302,6 +1311,13 @@ int main(int argc, char **argv) {
        .timer_only = true,
        .forever = true,
        .mtf_phase = 2},
+      {.name = "mtf-nop-observe",
+       .guest = GUEST_MTF_NOP,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .cr8_exits = true,
+       .timer_only = true,
+       .mtf_phase = 4},
       {.name = "mtf-hlt-resume",
        .guest = GUEST_HLT_TIMER,
        .mode = PROTECTED32,
@@ -1333,7 +1349,7 @@ int main(int argc, char **argv) {
             "armed-protected32-paging-hlt-cr8-kernelmarkers|"
             "protected32-paging-spin-cr8-timer|"
             "protected32-paging-hlt-cr8-timer|mtf-mov|mtf-hlt-observe|mtf-hlt-"
-            "resume|mtf-forever-mov|mtf-forever-hlt-observe\n",
+            "resume|mtf-forever-mov|mtf-forever-hlt-observe|mtf-nop-observe\n",
             argv[0]);
     return 64;
   }

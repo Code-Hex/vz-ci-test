@@ -79,6 +79,20 @@ class Mtf(unittest.TestCase):
         self.assertTrue(r.phase_success("mtf-forever-hlt-observe", [], True, {"mov": 1, "hlt": 2}))
         self.assertFalse(r.phase_success("mtf-hlt-resume", [], True, {"mov": 1, "hlt": 2}))
 
+    def test_nop_second_entry_requires_mov_ack_and_exact_exit(self):
+        facts = [fact("mtf_exit", 0, 37, 263, 0), fact("mtf_exit_tag", 0, 1, 165, 0),
+                 fact("mtf_mov_checkpoint_ready", 0, 71, 0, 0),
+                 fact("mtf_exit", 0, 37, 264, 0), fact("mtf_exit_tag", 0, 2, 165, 0),
+                 fact("mtf_nop_verified", 0, 37, 264, 0)]
+        self.assertTrue(r.phase_success("mtf-nop-observe", facts, True, {"mov": 1}))
+        self.assertFalse(r.phase_success("mtf-nop-observe", facts, True, {}))
+        self.assertFalse(r.phase_success("mtf-nop-observe", facts, False, {"mov": 1}))
+        facts[3]["arg0"] = 1
+        self.assertFalse(r.phase_success("mtf-nop-observe", facts, True, {"mov": 1}))
+        facts[3]["arg0"] = 37
+        facts[4]["arg1"] = 0
+        self.assertFalse(r.phase_success("mtf-nop-observe", facts, True, {"mov": 1}))
+
     def test_resume_requires_reason_rip_and_halted_activity(self):
         facts = [fact("mtf_resume_state_equal", 0, 264, 264, 1),
                  fact("mtf_resume_exit", 0, 52, 264, 1)]
