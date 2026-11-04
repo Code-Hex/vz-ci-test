@@ -1,0 +1,55 @@
+name: Intel NVRAM backing store
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-26-intel
+    timeout-minutes: 4
+    steps:
+      - name: Check out the diagnostic source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build the guarded IOKit probe
+        run: xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -std=c11 -Wall -Wextra -Werror -O1 probes/nvram_backend.c -framework IOKit -framework CoreFoundation -o "$RUNNER_TEMP/nvram-backend"
+      - name: Inspect the registry and request one synchronization
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/debug"
+          "$RUNNER_TEMP/nvram-backend" inspect | tee "$RUNNER_TEMP/debug/nvram-backend.jsonl"
+          set +e
+          sudo -n /usr/bin/env -i \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            GITHUB_REF="$GITHUB_REF" \
+            GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            GITHUB_SHA="$GITHUB_SHA" \
+            "$RUNNER_TEMP/nvram-backend" force-sync | tee -a "$RUNNER_TEMP/debug/nvram-backend.jsonl"
+          pipeline_status=("${PIPESTATUS[@]}")
+          sync_exit=${pipeline_status[0]}
+          set -e
+          if (( pipeline_status[1] != 0 )); then
+            exit "${pipeline_status[1]}"
+          fi
+          printf '{"event":"sync_process","exit":%s}\n' "$sync_exit" | tee -a "$RUNNER_TEMP/debug/nvram-backend.jsonl"
+          case "$sync_exit" in
+            0|69|70) ;;
+            *) exit "$sync_exit" ;;
+          esac
+      - name: Preserve the direct IOKit results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nvram-backend-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/debug/nvram-backend.jsonl
+          if-no-files-found: error
