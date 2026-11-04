@@ -91,6 +91,33 @@ HLT_PREFIX = """
 616602772400                            0.1              1ac0001                              0                0                0                0                6dbf               2(AP) hypervisor(8178)
 """
 
+NDJSON = """
+{ "timestampns": "949309268", "walltime": "2026-11-03T18:58:45.030388UTC", "eventname": "HV_X86_TASK_TRAP", "debugid": 28049417, "args": [ "0", "140702043610400", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "949858816", "walltime": "2026-11-03T18:58:45.030938UTC", "eventname": "HV_X86_TASK_TRAP", "debugid": 28049418, "args": [ "0", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "949956206", "walltime": "2026-11-03T18:58:45.031035UTC", "eventname": "HV_X86_TASK_TRAP", "debugid": 28049417, "args": [ "4", "140702043610392", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "949957110", "walltime": "2026-11-03T18:58:45.031036UTC", "eventname": "HV_X86_VM_MAP_TRAP", "debugid": 28049577, "args": [ "0", "4306124800", "0", "4096" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "949963025", "walltime": "2026-11-03T18:58:45.031042UTC", "eventname": "HV_X86_VM_MAP_TRAP", "debugid": 28049578, "args": [ "0", "7", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "949963096", "walltime": "2026-11-03T18:58:45.031042UTC", "eventname": "HV_X86_TASK_TRAP", "debugid": 28049418, "args": [ "4", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "949986601", "walltime": "2026-11-03T18:58:45.031066UTC", "eventname": "HV_X86_TASK_TRAP", "debugid": 28049417, "args": [ "12", "140702043610416", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "950176128", "walltime": "2026-11-03T18:58:45.031255UTC", "eventname": "HV_X86_TASK_TRAP", "debugid": 28049418, "args": [ "12", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "950465457", "walltime": "2026-11-03T18:58:45.031545UTC", "eventname": "HV_X86_THREAD_TRAP", "debugid": 28049421, "args": [ "12", "1", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "950466191", "walltime": "2026-11-03T18:58:45.031545UTC", "eventname": "HV_X86_THREAD_TRAP", "debugid": 28049422, "args": [ "12", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "950559637", "walltime": "2026-11-03T18:58:45.031639UTC", "eventname": "HV_X86_THREAD_TRAP", "debugid": 28049421, "args": [ "12", "2", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "950560353", "walltime": "2026-11-03T18:58:45.031640UTC", "eventname": "HV_X86_THREAD_TRAP", "debugid": 28049422, "args": [ "12", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "950650854", "walltime": "2026-11-03T18:58:45.031730UTC", "eventname": "HV_X86_THREAD_TRAP", "debugid": 28049421, "args": [ "12", "3", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "950651269", "walltime": "2026-11-03T18:58:45.031730UTC", "eventname": "HV_X86_THREAD_TRAP", "debugid": 28049422, "args": [ "12", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "950721632", "walltime": "2026-11-03T18:58:45.031801UTC", "eventname": "HV_X86_THREAD_TRAP", "debugid": 28049421, "args": [ "12", "4", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "950721912", "walltime": "2026-11-03T18:58:45.031801UTC", "eventname": "HV_X86_THREAD_TRAP", "debugid": 28049422, "args": [ "12", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "953920122", "walltime": "2026-11-03T18:58:45.034999UTC", "eventname": "HV_X86_THREAD_TRAP", "debugid": 28049421, "args": [ "5", "73896", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "954096049", "walltime": "2026-11-03T18:58:45.035175UTC", "eventname": "HV_X86_THREAD_TRAP", "debugid": 28049422, "args": [ "5", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "954166079", "walltime": "2026-11-03T18:58:45.035245UTC", "eventname": "HV_X86_TASK_TRAP", "debugid": 28049417, "args": [ "5", "140702043610384", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "954167285", "walltime": "2026-11-03T18:58:45.035246UTC", "eventname": "HV_X86_VM_UNMAP_TRAP", "debugid": 28049585, "args": [ "0", "0", "4096", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "954171400", "walltime": "2026-11-03T18:58:45.035251UTC", "eventname": "HV_X86_VM_UNMAP_TRAP", "debugid": 28049586, "args": [ "0", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "954171481", "walltime": "2026-11-03T18:58:45.035251UTC", "eventname": "HV_X86_TASK_TRAP", "debugid": 28049418, "args": [ "5", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "954197834", "walltime": "2026-11-03T18:58:45.035277UTC", "eventname": "HV_X86_TASK_TRAP", "debugid": 28049417, "args": [ "1", "73896", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+{ "timestampns": "956135902", "walltime": "2026-11-03T18:58:45.037215UTC", "eventname": "HV_X86_TASK_TRAP", "debugid": 28049418, "args": [ "1", "0", "0", "0" ], "cpuid": 0, "threadid": "77438", "pid": 26893, "execname": "hypervisor" }
+"""
+
 def event(timestamp=1, code="1ac0001", pid=10, tid="a", process="hypervisor"):
     return f"{timestamp} 0.1(0.1) {code} 0 0 0 0 {tid} 2(AP) {process}({pid})"
 
@@ -158,6 +185,99 @@ class TrackerTests(unittest.TestCase):
         result = self.track("\n".join(["ktrace: lost 100 events", event(1, "7020008", pid=0)]))
         self.assertEqual(result["counts"]["traceLostIndicators"], 2)
         self.assertEqual(result["counts"]["malformed"], 0)
+
+    def test_error_sample_keeps_complete_footer_within_512_characters(self):
+        line = event(process="long-process-name"*14) + " UNKNOWN_FOOTER"
+        result = self.track(line)
+        sample = result["recentErrors"][0]
+        self.assertEqual(sample["raw"], line)
+        self.assertEqual(sample["rawLength"], len(line))
+        self.assertFalse(sample["rawTruncated"])
+
+    def test_oversized_error_sample_retains_both_ends(self):
+        line = "HEAD_MARKER " + "x"*900 + " TAIL_MARKER"
+        result = self.track(line)
+        sample = result["recentErrors"][0]
+        self.assertLessEqual(len(sample["raw"]), 512)
+        self.assertTrue(sample["raw"].startswith("HEAD_MARKER "))
+        self.assertTrue(sample["raw"].endswith(" TAIL_MARKER"))
+        self.assertEqual(sample["rawLength"], len(line))
+        self.assertTrue(sample["rawTruncated"])
+
+    def test_loss_sample_retains_footer_and_snapshot_stays_bounded(self):
+        tracker = Tracker()
+        line = "ktrace: lost events " + "☃"*900 + " LOSS_FOOTER"
+        tracker.feed(line)
+        tracker.feed(line)
+        result = tracker.snapshot()
+        self.assertTrue(result["recentErrors"][-1]["raw"].endswith(" LOSS_FOOTER"))
+        self.assertEqual(result["counts"]["traceLostIndicators"], 2)
+        self.assertLessEqual(len(module.encode_snapshot(result).encode("utf-8")), 8192)
+
+    def test_native_ndjson_fixture_has_labeled_relative_clock(self):
+        result = self.track(NDJSON)
+        self.assertEqual(result["counts"]["events"], 24)
+        self.assertEqual(result["counts"]["tracked"], 20)
+        self.assertEqual(result["counts"]["balanced"], 10)
+        self.assertEqual(result["counts"]["malformed"], 0)
+        self.assertEqual(result["pendingCount"], 0)
+        self.assertEqual(result["clockCounts"], {"ktrace_text_abstime": 0, "ktrace_relative_ns": 24})
+        self.assertEqual(result["lastTimestamp"], 956135902)
+        self.assertEqual(result["lastClock"], "ktrace_relative_ns")
+        record = module.parse_event(NDJSON.strip().splitlines()[0])
+        self.assertEqual((record.pid, record.tid, record.timestamp), (26893, 77438, 949309268))
+        self.assertEqual(record.args, (0, 140702043610400, 0, 0))
+        self.assertEqual(record.clock, "ktrace_relative_ns")
+        self.assertEqual(record.walltime, "2026-11-03T18:58:45.030388UTC")
+
+    def test_different_clock_domains_cannot_form_a_pair(self):
+        native_end = NDJSON.strip().splitlines()[1]
+        result = self.track(event(1, "1ac0009", pid=26893, tid="12e7e")+"\n"+native_end)
+        self.assertEqual(result["counts"]["balanced"], 0)
+        self.assertEqual(result["counts"]["orphan"], 1)
+        self.assertEqual(result["pendingCount"], 1)
+        self.assertEqual(result["pending"][0]["clock"], "ktrace_text_abstime")
+
+    def test_unknown_native_pid_is_not_assigned_to_an_actor(self):
+        first = json.loads(NDJSON.strip().splitlines()[0])
+        tracker = Tracker()
+        for pid in [-1, None]:
+            row = dict(first, pid=pid)
+            tracker.feed(json.dumps(row))
+        row = dict(first)
+        del row["pid"]
+        tracker.feed(json.dumps(row))
+        result = tracker.snapshot()
+        self.assertEqual(result["counts"]["unknownActor"], 3)
+        self.assertEqual(result["counts"]["events"], 3)
+        self.assertEqual(result["counts"]["untracked"], 3)
+        self.assertEqual(result["counts"]["malformed"], 0)
+        self.assertEqual(result["counts"]["tracked"], 0)
+        self.assertEqual(result["pendingCount"], 0)
+        self.assertEqual(result["recentUnattributed"][-1]["kind"], "unknownActor")
+
+    def test_native_schema_rejects_invalid_types_and_ranges(self):
+        first = json.loads(NDJSON.strip().splitlines()[0])
+        invalid = [
+            ("debugid", True), ("debugid", -1), ("debugid", 1 << 32),
+            ("debugid", "28049417"), ("threadid", 77438), ("threadid", "-1"),
+            ("threadid", "0x12e7e"), ("threadid", str(1 << 64)),
+            ("timestampns", 949309268), ("timestampns", str(1 << 64)),
+            ("args", ["0", "0", "0"]), ("args", ["0", str(1 << 64), "0", "0"]),
+            ("args", ["0", True, "0", "0"]), ("pid", True),
+            ("pid", 1 << 32), ("pid", "26893"), ("execname", 3),
+            ("walltime", "not-a-time"), ("walltime", None), ("cpuid", -1),
+        ]
+        for name, value in invalid:
+            with self.subTest(field=name, value=value):
+                result = self.track(json.dumps(dict(first, **{name: value})))
+                self.assertEqual(result["counts"]["malformed"], 1)
+                self.assertEqual(result["pendingCount"], 0)
+
+    def test_json_with_a_pty_prefix_is_not_salvaged(self):
+        result = self.track("^D\b\b^D\b\b"+NDJSON.strip().splitlines()[0])
+        self.assertEqual(result["counts"]["malformed"], 1)
+        self.assertEqual(result["counts"]["events"], 0)
 
     def test_pending_storage_and_output_are_bounded(self):
         tracker = Tracker(max_pending=3)
