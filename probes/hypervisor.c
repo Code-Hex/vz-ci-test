@@ -1072,6 +1072,11 @@ int main(int argc, char **argv) {
   if (mach_timebase_info(&p.timebase) != KERN_SUCCESS || p.timebase.denom == 0)
     return 71;
   fact(&p, "probe_start", "fact", 0, (uint64_t)target, 0, 0);
+  uint64_t owner_tid = 0;
+  int owner_error = pthread_threadid_np(NULL, &owner_tid);
+  fact(&p, "owner_thread_id", "fact", owner_error, owner_tid, 0, 0);
+  if (owner_error != 0)
+    return 71;
   int primary = execute(&p, target, &phases[target]);
   fact(&p, "phase_result", "fact", primary, (uint64_t)target, p.guest_verified,
        0);
