@@ -130,12 +130,15 @@ def boot_proof_matches(data, pending, ctx):
             data.get("phase") == "boot_observed" and data.get("nonce") == pending["nonce"] and
             data.get("baseline_boot_uuid") == pending["baseline_boot_uuid"] and
             reboot_observed(pending["baseline_boot_uuid"], data.get("current_boot_uuid")) and
-            (not ctx.get("debug_boot", False) or debug_boot_proven(data.get("debug_boot_facts"))))
+            (not ctx.get("debug_boot", False) or
+             debug_boot_proven(data.get("debug_boot_facts")) and
+             data["debug_boot_facts"].get("current_boot_uuid") == data.get("current_boot_uuid")))
 
 
 def debug_boot_proven(facts):
     return (isinstance(facts, dict) and type(facts.get("active_debug_mask")) is int and
-            facts["active_debug_mask"] == 0x2000 and facts.get("nvram_restored") is True)
+            facts["active_debug_mask"] == 0x2000 and facts.get("active_bootargs_status") == "observed_debug" and
+            facts.get("nvram_restored") is True)
 
 
 def panic_envelope_matches(data, ciphertext, pending, ctx):
@@ -635,10 +638,13 @@ def collect(directory):
     debug_facts = {}
     if reboot_observed(config["baseline"], current) and config.get("debug_boot", False):
         try:
-            debug_facts = recovery_bootargs.finish(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory)
+            debug_facts = recovery_bootargs.finish(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory,
+                                                   current_boot_uuid=current)
         except (OSError, ValueError, subprocess.SubprocessError):
-            debug_facts = {"active_debug_mask": None, "nvram_restored": False, "debugger_count": None,
-                           "virtio_network_classes": [], "nic_inventory_status": "unsupported"}
+            debug_facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "nvram_restored": False,
+                           "debugger_count": None, "debugger_inventory_status": "unavailable",
+                           "network_inventory_status": "unavailable", "virtio_network_classes": [],
+                           "nic_inventory_status": "unsupported", "kernel_debug_state": {}}
     token = (directory / "token").read_text()
     if not reboot_observed(config["baseline"], current):
         if not (directory / "ready.json").exists():

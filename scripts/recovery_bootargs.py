@@ -67,19 +67,21 @@ def debug_mask(value):
             if not sep or not re.fullmatch(r"0[xX][0-9a-fA-F]+|[0-9]+", number):
                 raise ValueError("debug mask invalid")
             masks.append(int(number, 16 if number.lower().startswith("0x") else 10))
-    return masks[0] if len(masks) == 1 else None
+    if len(masks) > 1 or (masks and masks[0] > 0xffffffff):
+        raise ValueError("ambiguous debug mask")
+    return masks[0] if masks else None
 
 
-def capture(argv, limit=4_000_000):
+def capture(argv, limit=4_000_000, timeout=8):
     child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
     selector = selectors.DefaultSelector()
     try:
         selector.register(child.stdout, selectors.EVENT_READ)
-        deadline, data = time.monotonic() + 8, bytearray()
+        deadline, data = time.monotonic() + timeout, bytearray()
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not selector.select(remaining):
-                raise subprocess.TimeoutExpired(argv, 8)
+                raise subprocess.TimeoutExpired(argv, timeout)
             chunk = os.read(child.stdout.fileno(), min(65536, limit + 1 - len(data)))
             if not chunk:
                 break
@@ -105,6 +107,41 @@ def csr_allowed():
     return library.csr_check(8) == 0
 
 
+def ioreg_nodes(raw):
+    try:
+        value = plistlib.loads(raw)
+    except Exception as error:
+        raise ValueError("IORegistry plist invalid") from error
+    if not isinstance(value, list) or len(value) > 4096:
+        raise ValueError("IORegistry plist type invalid")
+    return value
+
+
+KERNEL_FIELDS = {
+    "debug_boot_arg": ("(uint32_t)`debug_boot_arg", 0xffffffff),
+    "kdp_flag": ("(uint32_t)`kdp_flag", 0xffffffff),
+    "send_registered": ("`kdp_en_send_pkt != 0", 1),
+    "receive_registered": ("`kdp_en_recv_pkt != 0", 1),
+}
+
+
+def kernel_debug_state():
+    result = {}
+    for name, (expression, maximum) in KERNEL_FIELDS.items():
+        source = 'dtrace:::BEGIN { printf("%llu\\n", (uint64_t)(' + expression + ')); exit(0); }'
+        try:
+            raw = capture(["/usr/sbin/dtrace", "-q", "-n", source], 4096, timeout=5)
+            if not re.fullmatch(rb"[0-9]{1,10}\n?", raw) or int(raw) > maximum:
+                raise ValueError("kernel debug value invalid")
+            value = bool(int(raw)) if maximum == 1 else int(raw)
+            result[name] = {"status": "observed", "value": value}
+        except (OSError, subprocess.SubprocessError):
+            result[name] = {"status": "unavailable"}
+        except ValueError:
+            result[name] = {"status": "invalid"}
+    return result
+
+
 class MacPlatform:
     def read(self):
         return parse_nvram(capture(["/usr/sbin/nvram", "-x", "-p"]))
@@ -115,15 +152,24 @@ class MacPlatform:
         capture(command)
 
     def active(self):
-        return capture(["/usr/sbin/sysctl", "-n", "kern.bootargs"], 65536).rstrip(b"\n")
+        raw = capture(["/usr/sbin/sysctl", "-n", "kern.bootargs"], 65536)
+        if not raw:
+            raise ValueError("boot argument response empty")
+        return raw.rstrip(b"\n")
 
     def inventory(self):
-        result = {"debugger_count": None, "virtio_network_classes": [], "nic_inventory_status": "unsupported"}
+        result = {"debugger_count": None, "virtio_network_classes": [], "nic_inventory_status": "unsupported",
+                  "debugger_inventory_status": "unavailable", "network_inventory_status": "unavailable"}
         try:
-            debuggers = plistlib.loads(capture(["/usr/sbin/ioreg", "-a", "-r", "-c", "IOKernelDebugger"]))
-            if isinstance(debuggers, list) and len(debuggers) <= 4096:
-                result["debugger_count"] = len(debuggers)
-            nodes = plistlib.loads(capture(["/usr/sbin/ioreg", "-a", "-r", "-c", "IONetworkController"]))
+            debuggers = ioreg_nodes(capture(["/usr/sbin/ioreg", "-a", "-r", "-c", "IOKernelDebugger"]))
+            result["debugger_count"] = len(debuggers)
+            result["debugger_inventory_status"] = "observed"
+        except (OSError, subprocess.SubprocessError):
+            pass
+        except ValueError:
+            result["debugger_inventory_status"] = "invalid"
+        try:
+            nodes = ioreg_nodes(capture(["/usr/sbin/ioreg", "-a", "-r", "-c", "IONetworkController"]))
             stack, names, seen = [nodes], set(), 0
             while stack and seen < 4096:
                 node = stack.pop()
@@ -139,14 +185,18 @@ class MacPlatform:
                     if isinstance(children, list):
                         stack.append(children)
             result["virtio_network_classes"] = sorted(names)[:16]
-            if result["debugger_count"] is not None:
-                result["nic_inventory_status"] = "observed"
-        except (OSError, ValueError, subprocess.SubprocessError):
+            result["network_inventory_status"] = "observed"
+        except (OSError, subprocess.SubprocessError):
             pass
+        except ValueError:
+            result["network_inventory_status"] = "invalid"
+        if result["debugger_inventory_status"] == result["network_inventory_status"] == "observed":
+            result["nic_inventory_status"] = "observed"
+        result["kernel_debug_state"] = kernel_debug_state()
         return result
 
 
-def restore(directory, marker, platform, save, sync):
+def restore(directory, marker, platform, save, sync, before_restore=None):
     staged = json.loads((directory / "debug-boot-stage.json").read_text())
     if staged != marker:
         raise ValueError("debug boot stage identity mismatch")
@@ -155,16 +205,22 @@ def restore(directory, marker, platform, save, sync):
     if desired(original) != expected:
         raise ValueError("debug boot stage value mismatch")
     current = platform.read()
-    if current != original:
-        if current != expected:
-            raise ValueError("NVRAM changed outside transaction")
-        platform.write(directory / "debug-boot-original.plist")
-    if platform.read() != original:
-        raise ValueError("NVRAM restoration mismatch")
-    path = directory / "debug-boot-restored.json"
-    if not path.exists():
-        save(path, json.dumps({"nvram_restored": True}).encode())
-        sync(directory)
+    state = "original" if current == original else "staged" if current == expected else None
+    if state is None:
+        raise ValueError("NVRAM changed outside transaction")
+    try:
+        if before_restore is not None:
+            before_restore(state)
+    finally:
+        if state == "staged":
+            platform.write(directory / "debug-boot-original.plist")
+        if platform.read() != original:
+            raise ValueError("NVRAM restoration mismatch")
+        path = directory / "debug-boot-restored.json"
+        if not path.exists():
+            save(path, json.dumps({"nvram_restored": True}).encode())
+            sync(directory)
+    return state
 
 
 def stage(directory, marker, platform, save, sync):
@@ -199,11 +255,36 @@ def rollback(directory, marker, platform, save, sync):
         check_unconfigured(current.get("boot-args", b""))
 
 
-def finish(directory, marker, platform, save, sync):
-    mask = None
+def finish(directory, marker, platform, save, sync, *, current_boot_uuid):
+    if not isinstance(current_boot_uuid, str) or not current_boot_uuid:
+        raise ValueError("observation boot identity absent")
+    facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "current_boot_uuid": current_boot_uuid}
     try:
-        mask = debug_mask(platform.active())
-    except (OSError, ValueError, subprocess.SubprocessError):
+        facts["active_debug_mask"] = debug_mask(platform.active())
+        facts["active_bootargs_status"] = "observed_no_debug" if facts["active_debug_mask"] is None else "observed_debug"
+    except (OSError, subprocess.SubprocessError):
         pass
-    restore(directory, marker, platform, save, sync)
-    return {"active_debug_mask": mask, "nvram_restored": True, **platform.inventory()}
+    except ValueError:
+        facts["active_bootargs_status"] = "invalid"
+
+    def record(state):
+        path = directory / "debug-boot-observed.json"
+        if path.exists():
+            previous = json.loads(path.read_text())
+            if (not isinstance(previous, dict) or previous.get("marker") != marker or
+                    previous.get("current_boot_uuid") != current_boot_uuid or previous.get("active_bootargs_status") not in
+                    ("observed_no_debug", "observed_debug", "unavailable", "invalid") or
+                    previous.get("nvram_before_restore") not in ("staged", "original") or
+                    not (previous.get("active_debug_mask") is None or
+                         type(previous["active_debug_mask"]) is int and 0 <= previous["active_debug_mask"] <= 0xffffffff)):
+                raise ValueError("debug observation invalid")
+            if (previous["active_bootargs_status"] == "observed_debug") != (type(previous["active_debug_mask"]) is int):
+                raise ValueError("debug observation inconsistent")
+            facts.update({key: previous[key] for key in ("active_bootargs_status", "active_debug_mask", "nvram_before_restore")})
+        else:
+            facts["nvram_before_restore"] = state
+            save(path, json.dumps({"marker": marker, **facts}).encode())
+            sync(directory)
+
+    restore(directory, marker, platform, save, sync, before_restore=record)
+    return {**facts, "nvram_restored": True, **platform.inventory()}

@@ -120,14 +120,17 @@ class Recovery(unittest.TestCase):
         pending = {"nonce": "n", "baseline_boot_uuid": "old"}
         data = {"protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": r.binding(ctx),
                 "nonce": "n", "baseline_boot_uuid": "old", "current_boot_uuid": "new", "debug_boot": True,
-                "debug_boot_facts": {"active_debug_mask": 0x2000, "nvram_restored": True,
+                "debug_boot_facts": {"active_debug_mask": 0x2000, "active_bootargs_status": "observed_debug", "nvram_restored": True,
+                                     "current_boot_uuid": "new",
                                      "debugger_count": None, "nic_inventory_status": "unsupported"}}
         self.assertTrue(r.boot_proof_matches(data, pending, ctx))
         for facts in ({}, {"active_debug_mask": 0x2000, "nvram_restored": False},
-                      {"active_debug_mask": 0x400, "nvram_restored": True}):
+                      {"active_debug_mask": 0x400, "nvram_restored": True},
+                      {"active_debug_mask": 0x2000, "active_bootargs_status": "invalid", "nvram_restored": True}):
             self.assertFalse(r.boot_proof_matches(dict(data, debug_boot_facts=facts), pending, ctx))
         self.assertFalse(r.boot_proof_matches(dict(data, debug_boot=False), pending, ctx))
         self.assertFalse(r.boot_proof_matches(data, pending, dict(ctx, debug_boot=False)))
+        self.assertFalse(r.boot_proof_matches(dict(data, current_boot_uuid="another"), pending, ctx))
 
     def test_debug_reboot_failures_restore_once_without_reboot(self):
         for failure in ("stage_response", "stdout", "sync"):

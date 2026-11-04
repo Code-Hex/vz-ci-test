@@ -5,6 +5,7 @@ import plistlib
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("bootargs", Path(__file__).with_name("recovery_bootargs.py"))
 b = importlib.util.module_from_spec(spec)
@@ -28,6 +29,8 @@ class Platform:
 
     def active(self):
         self.events.append("active")
+        if isinstance(self.active_value, Exception):
+            raise self.active_value
         return self.active_value
 
     def inventory(self):
@@ -68,7 +71,7 @@ class Bootargs(unittest.TestCase):
             self.assertLess(platform.events.index("sync"), platform.events.index("write"))
             platform.events.clear()
             platform.active_value = b"preempt=10 debug=0x2000"
-            facts = b.finish(directory, marker, platform, save, lambda _p: None)
+            facts = b.finish(directory, marker, platform, save, lambda _p: None, current_boot_uuid="new")
             self.assertEqual(platform.value, original)
             self.assertEqual(facts["active_debug_mask"], 0x2000)
             self.assertTrue(facts["nvram_restored"])
@@ -93,7 +96,7 @@ class Bootargs(unittest.TestCase):
             platform, marker = Platform(original), {"baseline": "old", "nonce": "n"}
             b.stage(directory, marker, platform, self.save, lambda _p: None)
             platform.active_value = b"debug=invalid"
-            facts = b.finish(directory, marker, platform, self.save, lambda _p: None)
+            facts = b.finish(directory, marker, platform, self.save, lambda _p: None, current_boot_uuid="new")
             self.assertIsNone(facts["active_debug_mask"])
             self.assertTrue(facts["nvram_restored"])
             self.assertEqual(platform.value, original)
@@ -107,7 +110,7 @@ class Bootargs(unittest.TestCase):
             platform.events.clear()
             for identity in (marker, {"baseline": "other", "nonce": "n"}):
                 with self.assertRaises(ValueError):
-                    b.finish(directory, identity, platform, self.save, lambda _p: None)
+                    b.finish(directory, identity, platform, self.save, lambda _p: None, current_boot_uuid="new")
             self.assertNotIn("write", platform.events)
             self.assertNotIn("inventory", platform.events)
 
@@ -132,6 +135,111 @@ class Bootargs(unittest.TestCase):
             with self.assertRaises(ValueError):
                 b.rollback(directory, marker, platform, self.save, lambda _p: None)
             self.assertNotIn("write", platform.events)
+
+    def test_active_status_and_nvram_before_restore_are_distinct(self):
+        for value, status, mask in ((b"preempt=10", "observed_no_debug", None),
+                                    (b"debug=0x2000", "observed_debug", 0x2000),
+                                    (OSError("unavailable"), "unavailable", None),
+                                    (b"debug=invalid", "invalid", None)):
+            for before in ("staged", "original"):
+                with self.subTest(status=status, before=before), tempfile.TemporaryDirectory() as tmp:
+                    directory, original = Path(tmp), {"boot-args": b"preempt=10"}
+                    platform, marker = Platform(original), {"baseline": "old", "nonce": "n"}
+                    b.stage(directory, marker, platform, self.save, lambda _p: None)
+                    if before == "original":
+                        platform.value = original
+                    platform.active_value = value
+                    platform.events.clear()
+                    def save(path, data):
+                        self.save(path, data)
+                        platform.events.append(path.name)
+                    facts = b.finish(directory, marker, platform, save, lambda _p: None, current_boot_uuid="new")
+                    self.assertEqual(facts["active_bootargs_status"], status)
+                    self.assertEqual(facts["active_debug_mask"], mask)
+                    self.assertEqual(facts["nvram_before_restore"], before)
+                    if before == "staged":
+                        self.assertLess(platform.events.index("debug-boot-observed.json"), platform.events.index("write"))
+                    again = b.finish(directory, marker, platform, save, lambda _p: None, current_boot_uuid="new")
+                    self.assertEqual(again["nvram_before_restore"], before)
+
+    def test_invalid_debugger_plist_does_not_hide_network_class(self):
+        network = plistlib.dumps([{"IOObjectClass": "AppleVirtIONetwork", "secret": "not published"}])
+        def capture(argv, *_args, **_kwargs):
+            if argv[-1] == "IOKernelDebugger":
+                return b""
+            if argv[-1] == "IONetworkController":
+                return network
+            raise OSError("optional unavailable")
+        with patch.object(b, "capture", capture):
+            facts = b.MacPlatform().inventory()
+        self.assertIsNone(facts["debugger_count"])
+        self.assertEqual(facts["debugger_inventory_status"], "invalid")
+        self.assertEqual(facts["network_inventory_status"], "observed")
+        self.assertEqual(facts["virtio_network_classes"], ["AppleVirtIONetwork"])
+        self.assertNotIn("not published", str(facts))
+
+    def test_empty_ioreg_array_is_observed_zero(self):
+        def capture(argv, *_args, **_kwargs):
+            if argv[0] == "/usr/sbin/dtrace":
+                raise OSError("unavailable")
+            return plistlib.dumps([])
+        with patch.object(b, "capture", capture):
+            facts = b.MacPlatform().inventory()
+        self.assertEqual(facts["debugger_count"], 0)
+        self.assertEqual(facts["debugger_inventory_status"], "observed")
+        self.assertEqual(facts["network_inventory_status"], "observed")
+        self.assertTrue(all(value == {"status": "unavailable"} for value in facts["kernel_debug_state"].values()))
+
+    def test_kernel_debug_state_has_only_allowed_numeric_fields(self):
+        def capture(argv, *_args, **_kwargs):
+            source = argv[-1]
+            if "`debug_boot_arg" in source:
+                return b"8192\n"
+            if "`kdp_flag" in source:
+                return b"129\n"
+            raise OSError("static symbol unavailable")
+        with patch.object(b, "capture", capture):
+            facts = b.kernel_debug_state()
+        self.assertEqual(facts, {"debug_boot_arg": {"status": "observed", "value": 8192},
+                                 "kdp_flag": {"status": "observed", "value": 129},
+                                 "send_registered": {"status": "unavailable"}, "receive_registered": {"status": "unavailable"}})
+        with patch.object(b, "capture", lambda *_args, **_kwargs: b"secret"):
+            invalid = b.kernel_debug_state()
+        self.assertTrue(all(value == {"status": "invalid"} for value in invalid.values()))
+        self.assertNotIn("secret", str(invalid))
+
+    def test_observation_save_failure_still_restores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, original = Path(tmp), {"boot-args": "preempt=10"}
+            platform, marker = Platform(original), {"baseline": "old", "nonce": "n"}
+            b.stage(directory, marker, platform, self.save, lambda _p: None)
+            def save(path, data):
+                if path.name == "debug-boot-observed.json":
+                    raise OSError("observation storage unavailable")
+                self.save(path, data)
+            with self.assertRaises(OSError):
+                b.finish(directory, marker, platform, save, lambda _p: None, current_boot_uuid="new")
+            self.assertEqual(platform.value, original)
+            self.assertTrue(json.loads((directory / "debug-boot-restored.json").read_text())["nvram_restored"])
+
+    def test_active_distinguishes_empty_output_from_empty_bootargs(self):
+        with patch.object(b, "capture", lambda *_args, **_kwargs: b""):
+            with self.assertRaises(ValueError):
+                b.MacPlatform().active()
+        with patch.object(b, "capture", lambda *_args, **_kwargs: b"\n"):
+            self.assertEqual(b.MacPlatform().active(), b"")
+
+    def test_saved_observation_cannot_be_reused_for_another_boot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, original = Path(tmp), {"boot-args": "preempt=10"}
+            platform, marker = Platform(original), {"baseline": "old", "nonce": "n"}
+            b.stage(directory, marker, platform, self.save, lambda _p: None)
+            platform.active_value = b"debug=0x2000"
+            b.finish(directory, marker, platform, self.save, lambda _p: None, current_boot_uuid="first")
+            self.assertEqual(platform.value, original)
+            platform.active_value = b"preempt=10"
+            with self.assertRaises(ValueError):
+                b.finish(directory, marker, platform, self.save, lambda _p: None, current_boot_uuid="second")
 
 
 if __name__ == "__main__":
