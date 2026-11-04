@@ -12,6 +12,12 @@ case "$iterations" in
   *) printf '%s\n' 'iteration count must be 1 or 2' >&2; exit 2 ;;
 esac
 
+workload=${2:-package}
+case "$workload" in
+  package|ci) ;;
+  *) printf '%s\n' 'workload must be package or ci' >&2; exit 2 ;;
+esac
+
 debug_dir="$RUNNER_TEMP/debug"
 mkdir -p "$debug_dir" || exit 1
 log="$debug_dir/vz-pristine-output.log"
@@ -77,12 +83,18 @@ run() (
     '336421443dbdba32f11762a8d9d4bd1db21abf9e722ea43ffffcd0478b4c11f3  testdata/Image' \
     '145bb21b8f66affc83da22f64b5597d8279b6a94529afbb39881361a7e28e2d6  testdata/initramfs.cpio.gz' |
     shasum -a 256 -c -
-  go test -c -o vz.test .
+  if [[ $workload == package ]]; then
+    go test -c -o vz.test .
+  fi
   python3 -u -c 'import json,time; exec("while True:\n print(json.dumps({\"event\":\"host_heartbeat\",\"monotonic_ns\":time.monotonic_ns()}),flush=True)\n time.sleep(2)")' &
   heartbeat_pid=$!
   for ((iteration = 1; iteration <= iterations; iteration++)); do
     printf 'SUITE_ITERATION=%s\n' "$iteration"
-    go run ./cmd/codesign "$PWD/vz.test" -test.timeout=3m -test.v
+    if [[ $workload == ci ]]; then
+      make test
+    else
+      go run ./cmd/codesign "$PWD/vz.test" -test.timeout=3m -test.v
+    fi
     printf 'SUITE_COMPLETED=%s\n' "$iteration"
   done
 )

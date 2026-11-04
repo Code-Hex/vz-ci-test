@@ -9,6 +9,12 @@ on:
         options: ['1', '2']
         default: '1'
 
+      workload:
+        description: Test command
+        type: choice
+        options: ['package', 'ci']
+        default: 'package'
+
 permissions:
   contents: read
 
@@ -29,7 +35,8 @@ jobs:
       - name: Run the unchanged Linux suite
         env:
           ITERATIONS: ${{ inputs.iterations }}
-        run: bash scripts/verify-vz-pristine.sh "$ITERATIONS"
+          WORKLOAD: ${{ inputs.workload }}
+        run: bash scripts/verify-vz-pristine.sh "$ITERATIONS" "$WORKLOAD"
       - name: Preserve test output
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
