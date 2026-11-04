@@ -11,6 +11,7 @@ on:
         options:
           - staged-sync
           - bootplist-propagation
+          - panic-source-preflight
 
 permissions:
   contents: read
@@ -27,10 +28,10 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Build the guarded IOKit probe
-        if: ${{ inputs.control != 'bootplist-propagation' }}
+        if: ${{ inputs.control == 'staged-sync' }}
         run: xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -std=c11 -Wall -Wextra -Werror -O1 probes/nvram_backend.c -framework IOKit -framework CoreFoundation -o "$RUNNER_TEMP/nvram-backend"
       - name: Inspect the registry and request one synchronization
-        if: ${{ inputs.control != 'bootplist-propagation' }}
+        if: ${{ inputs.control == 'staged-sync' }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/debug"
@@ -65,6 +66,7 @@ jobs:
           native_python=$(command -v python3)
           case "$BOOT_CONTROL" in
             bootplist-propagation) control_script=scripts/bootplist-preflight.py ;;
+            panic-source-preflight) control_script=scripts/panic-source-preflight.py ;;
             staged-sync|'') control_script=scripts/nvram-staged-sync.py ;;
             *) exit 64 ;;
           esac
@@ -90,4 +92,5 @@ jobs:
             ${{ runner.temp }}/debug/nvram-backend.jsonl
             ${{ runner.temp }}/debug/nvram-staged-sync.json
             ${{ runner.temp }}/debug/bootplist-preflight.json
+            ${{ runner.temp }}/debug/panic-source-preflight.json
           if-no-files-found: error
