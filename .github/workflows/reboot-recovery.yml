@@ -14,6 +14,7 @@ on:
         type: choice
         options:
           - reboot
+          - reboot-quick
           - panic-control
           - panic-force-reset
         default: reboot
@@ -72,11 +73,15 @@ jobs:
       - name: Build the guarded force-reset helper
         if: ${{ inputs.trigger == 'panic-force-reset' }}
         run: xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -std=c11 -Wall -Wextra -Werror -O1 probes/reboot_force_reset.c -o "$RUNNER_TEMP/recovery-force-reset"
+      - name: Build the guarded quick-reboot helper
+        if: ${{ inputs.trigger == 'reboot-quick' }}
+        run: xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -std=c11 -Wall -Wextra -Werror -O1 probes/reboot_quick.c -o "$RUNNER_TEMP/recovery-quick-reboot"
       - name: Publish the runner recovery public key
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RECOVERY_REPORT_CERT: ${{ inputs.report_cert }}
           RECOVERY_FORCE_HELPER: ${{ runner.temp }}/recovery-force-reset
+          RECOVERY_QUICK_HELPER: ${{ runner.temp }}/recovery-quick-reboot
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py prepare
       - name: Receive the controller token and verify the armed reporter
         env:

@@ -85,6 +85,97 @@ class Recovery(unittest.TestCase):
         self.assertIsNone(r.safe_force_return('{"event":"force_reset_unexpected_return","result":"secret","errno":1}'))
         self.assertIsNone(r.safe_force_return('secret'))
 
+    def test_quick_trigger_and_return_facts_are_bound_and_redacted(self):
+        ctx = {"actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "1", "sha": "a" * 40,
+               "ref": "refs/heads/main", "event": "workflow_dispatch", "runner_environment": "github-hosted",
+               "trigger": "reboot-quick", "debug_boot": False}
+        self.assertTrue(r.valid_context(ctx, "Darwin", "x86_64", r.KERNEL_UUID))
+        self.assertFalse(r.valid_context(dict(ctx, debug_boot=True), "Darwin", "x86_64", r.KERNEL_UUID))
+        self.assertFalse(r.panic_mode(ctx))
+        fact = r.safe_quick_return('raw-secret\n{"event":"quick_reboot_unexpected_return","result":-1,"errno":1,"token":"raw-secret"}')
+        self.assertEqual(fact, {"event": "quick_reboot_unexpected_return", "result": -1, "errno": 1})
+        self.assertIsNone(r.safe_quick_return('{"event":"quick_reboot_unexpected_return","result":true,"errno":1}'))
+        self.assertFalse(r.mode_matches({"trigger": "reboot"}, {}, ctx))
+        pending = {"nonce": "n", "baseline_boot_uuid": "old"}
+        data = {"protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": r.binding(ctx),
+                "nonce": "n", "baseline_boot_uuid": "old", "current_boot_uuid": "new", "trigger": "reboot-quick"}
+        self.assertTrue(r.boot_proof_matches(data, pending, ctx))
+        self.assertFalse(r.boot_proof_matches(dict(data, phase="quick_prepared"), pending, ctx))
+
+    def test_quick_main_only_routes_to_root_rpc(self):
+        calls = []
+        def sudo(operation, *_args, **kwargs):
+            calls.append((operation, kwargs["timeout"]))
+            return ""
+        def forbidden(*_args, **_kwargs):
+            self.fail("quick trigger used the normal reboot path")
+        with patch.object(r.sys, "argv", ["reboot-recovery.py", "trigger"]), \
+                patch.object(r, "context_from_env", lambda: {"trigger": "reboot-quick", "debug_boot": False}), \
+                patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
+                patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), contextlib.redirect_stdout(io.StringIO()):
+            r.main()
+        self.assertEqual(calls, [("quick-execute-root", 90)])
+
+    def test_quick_prepared_ack_precedes_execute_and_return_completes_failure(self):
+        for acknowledged in (True, False):
+            with self.subTest(acknowledged=acknowledged), tempfile.TemporaryDirectory() as tmp:
+                directory, events, output = Path(tmp), [], io.StringIO()
+                ctx = {"actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "1", "sha": "a" * 40,
+                       "ref": "refs/heads/main", "event": "workflow_dispatch", "runner_environment": "github-hosted",
+                       "trigger": "reboot-quick", "debug_boot": False}
+                helper = directory / "reboot-quick"
+                helper.write_bytes(b"synthetic helper")
+                config = {"context": ctx, "baseline": "old", "nonce": "n", "check_id": 9, "cert_fingerprint": "",
+                          "helper_sha256": r.hashlib.sha256(helper.read_bytes()).hexdigest()}
+                r.private_write(directory / "token", b"private-token")
+                initial = {"protocol": "vz-recovery-v1", "phase": "armed", "binding": r.binding(ctx), "nonce": "n",
+                           "baseline_boot_uuid": "old", "trigger": "reboot-quick", "debug_boot": False, "cert_fingerprint": ""}
+                check = {"id": 9, "name": "Runner recovery 123", "external_id": r.binding(ctx), "head_sha": ctx["sha"],
+                         "app": {"id": 15368, "slug": "github-actions"}, "details_url": "https://github.com/Code-Hex/vz-ci-test/runs/9",
+                         "status": "in_progress", "output": {"summary": r.json.dumps(initial)}}
+                def api(method, _url, token, payload=None, **_kwargs):
+                    self.assertEqual(token, "private-token")
+                    if method == "GET":
+                        events.append("ack" if "prepared" in events else "get")
+                        result = dict(check)
+                        if "prepared" in events and not acknowledged:
+                            result["status"] = "completed"
+                        return result
+                    check.update(payload)
+                    events.append("failed" if payload.get("status") == "completed" else "prepared")
+                    return check
+                def run(command, **kwargs):
+                    self.assertEqual(command, [str(helper), "preflight"])
+                    self.assertTrue((directory / "quick-trigger.json").exists())
+                    self.assertEqual(kwargs["env"]["RECOVERY_TRIGGER"], "reboot-quick")
+                    self.assertNotIn("GITHUB_TOKEN", kwargs["env"])
+                    events.append("preflight")
+                    return subprocess.CompletedProcess(command, 0, '{"event":"quick_reboot_preflight","flags":1024,"permission_verified":false}', '')
+                class Child:
+                    returncode = 70
+                    def communicate(self, timeout):
+                        return ('raw-secret\n{"event":"quick_reboot_unexpected_return","result":-1,"errno":1}', '')
+                def popen(command, **kwargs):
+                    self.assertEqual(command, [str(helper), "execute"])
+                    self.assertEqual(events[-1], "ack")
+                    self.assertNotIn("GITHUB_TOKEN", kwargs["env"])
+                    events.append("execute")
+                    return Child()
+                with patch.object(r, "root_only", lambda: None), patch.object(r, "require_context", lambda *_: None), \
+                        patch.object(r, "root_dir", lambda _: directory), patch.object(r, "load_config", lambda _: config), \
+                        patch.object(r, "verify_root", lambda _: None), patch.object(r, "boot_uuid", lambda: "old"), \
+                        patch.object(r.os, "sync", lambda: events.append("sync")), patch.object(r.subprocess, "run", run), \
+                        patch.object(r.subprocess, "Popen", popen), patch.object(r, "api", api), contextlib.redirect_stdout(output):
+                    with self.assertRaises((RuntimeError, ValueError)):
+                        r.quick_execute_root({"context": ctx})
+                self.assertEqual(events[:2], ["sync", "preflight"])
+                self.assertNotIn("raw-secret", output.getvalue())
+                if acknowledged:
+                    self.assertEqual(events[-2:], ["execute", "failed"])
+                    self.assertEqual(check["conclusion"], "failure")
+                else:
+                    self.assertNotIn("execute", events)
+
     def test_root_error_kind_is_whitelisted(self):
         self.assertEqual(r.root_error_kind('noise SECRET\n{"event":"recovery_error","kind":"ValueError"}\n'), "ValueError")
         self.assertEqual(r.root_error_kind('{"event":"recovery_error","kind":"SECRET"}'), "unknown")

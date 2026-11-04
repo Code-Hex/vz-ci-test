@@ -29,7 +29,7 @@ CHECKS = API + "/check-runs"
 def valid_context(ctx, system, machine, kernel_uuid=None):
     common = (ctx.get("actions") == "true" and ctx.get("repo") == REPO and
               ctx.get("ref") == "refs/heads/main" and ctx.get("event") == "workflow_dispatch" and
-              ctx.get("runner_environment") == "github-hosted" and ctx.get("trigger", "reboot") in ("reboot", "panic-control", "panic-force-reset") and
+              ctx.get("runner_environment") == "github-hosted" and ctx.get("trigger", "reboot") in ("reboot", "reboot-quick", "panic-control", "panic-force-reset") and
               bool(re.fullmatch(r"[1-9][0-9]{0,19}", str(ctx.get("run_id", "")))) and
               bool(re.fullmatch(r"[1-9][0-9]{0,4}", str(ctx.get("attempt", "")))) and
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
@@ -256,6 +256,11 @@ def list_check(ctx, token):
 def diagnostic_sysctls():
     result = {}
     try:
+        value = command_output(["/usr/bin/fdesetup", "status"])
+        result["filevault_status"] = {"FileVault is Off.": "Off", "FileVault is On.": "On"}.get(value, "unknown")
+    except (OSError, subprocess.SubprocessError):
+        result["filevault_status"] = "unknown"
+    try:
         value = command_output(["/usr/sbin/sysctl", "-n", "machdep.misc.panic_restart_timeout"])
         result["panic_restart_timeout"] = int(value) if re.fullmatch(r"-?[0-9]+", value) else "unavailable"
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -313,18 +318,21 @@ def prepare_root(payload):
     directory.mkdir(mode=0o700)
     if fingerprint:
         private_write(directory / "report-cert.pem", cert)
-    if ctx.get("trigger") == "panic-force-reset":
-        helper_path = payload.get("force_helper", "")
-        if not isinstance(helper_path, str) or not os.path.isabs(helper_path) or Path(helper_path).name != "recovery-force-reset":
-            raise ValueError("force helper path invalid")
+    helper_kind = {"panic-force-reset": ("force_helper", "recovery-force-reset", "reboot-force-reset"),
+                   "reboot-quick": ("quick_helper", "recovery-quick-reboot", "reboot-quick")}.get(ctx.get("trigger"))
+    if helper_kind:
+        key, basename, installed = helper_kind
+        helper_path = payload.get(key, "")
+        if not isinstance(helper_path, str) or not os.path.isabs(helper_path) or Path(helper_path).name != basename:
+            raise ValueError("recovery helper path invalid")
         fd = os.open(helper_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                raise ValueError("force helper must be a regular file")
+                raise ValueError("recovery helper must be a regular file")
             helper_data = stream.read(4 * 1024 * 1024 + 1)
         if not helper_data or len(helper_data) > 4 * 1024 * 1024:
-            raise ValueError("force helper size invalid")
-        helper = directory / "reboot-force-reset"
+            raise ValueError("recovery helper size invalid")
+        helper = directory / installed
         private_write(helper, helper_data)
         os.chmod(helper, 0o700)
         helper_sha = hashlib.sha256(helper_data).hexdigest()
@@ -611,7 +619,7 @@ def panic_execute_root(payload):
     raise RuntimeError("panic action unexpectedly returned")
 
 
-def force_helper_env(config):
+def helper_env(config):
     ctx = config["context"]
     return {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "GITHUB_ACTIONS": ctx["actions"],
             "GITHUB_EVENT_NAME": ctx["event"], "GITHUB_REPOSITORY": ctx["repo"], "GITHUB_REF": ctx["ref"],
@@ -620,10 +628,10 @@ def force_helper_env(config):
             "VZ_RECOVERY_NONCE": config["nonce"], "VZ_RECOVERY_BOOT_UUID": config["baseline"]}
 
 
-def force_helper_checked(directory, config):
-    helper = directory / "reboot-force-reset"
+def helper_checked(directory, config, name):
+    helper = directory / name
     if not helper.is_file() or helper.is_symlink() or hashlib.sha256(helper.read_bytes()).hexdigest() != config.get("helper_sha256"):
-        raise ValueError("force helper identity mismatch")
+        raise ValueError("recovery helper identity mismatch")
     return helper
 
 
@@ -638,11 +646,11 @@ def force_preflight_root(payload):
     verify_root(payload)
     if config["context"] != ctx or (directory / "trigger.json").exists():
         raise ValueError("force trigger identity or once guard")
-    helper = force_helper_checked(directory, config)
+    helper = helper_checked(directory, config, "reboot-force-reset")
     baseline = recovery_reports.inventory()
     private_write(directory / "report-baseline.json", json.dumps(baseline, separators=(",", ":")).encode())
     sync_directory(directory)
-    result = subprocess.run([str(helper), "preflight"], env=force_helper_env(config), capture_output=True,
+    result = subprocess.run([str(helper), "preflight"], env=helper_env(config), capture_output=True,
                             text=True, timeout=10)
     if result.returncode != 0:
         failure = safe_force_preflight_error(result.stderr)
@@ -671,7 +679,7 @@ def force_execute_root(payload):
     directory = root_dir(ctx)
     config = load_config(directory)
     verify_root(payload)
-    helper = force_helper_checked(directory, config)
+    helper = helper_checked(directory, config, "reboot-force-reset")
     prepared = json.loads((directory / "force-preflight.json").read_text())
     marker = force_marker(ctx, config["nonce"])
     if (config["context"] != ctx or prepared.get("trigger") != "panic-force-reset" or
@@ -681,7 +689,7 @@ def force_execute_root(payload):
     private_write(directory / "trigger.json", json.dumps(prepared).encode())
     sync_directory(directory)
     os.sync()
-    result = subprocess.run([str(helper), "execute"], env=force_helper_env(config), capture_output=True,
+    result = subprocess.run([str(helper), "execute"], env=helper_env(config), capture_output=True,
                             text=True, timeout=30)
     for line in result.stderr.splitlines():
         try:
@@ -694,6 +702,59 @@ def force_execute_root(payload):
             print(json.dumps({"event": "force_reset_unexpected_return", "result": fact["result"],
                               "errno": fact["errno"]}), flush=True)
     raise RuntimeError("force reset unexpectedly returned")
+
+
+def quick_execute_root(payload):
+    root_only()
+    ctx = payload["context"]
+    require_context(ctx, "Darwin")
+    if ctx.get("trigger") != "reboot-quick" or ctx.get("debug_boot", False):
+        raise ValueError("quick reboot trigger rejected")
+    directory = root_dir(ctx)
+    config = load_config(directory)
+    verify_root(payload)
+    if config["context"] != ctx or config.get("debug_boot", False) or boot_uuid() != config["baseline"]:
+        raise ValueError("quick reboot identity mismatch")
+    helper = helper_checked(directory, config, "reboot-quick")
+    marker = {"trigger": "reboot-quick", "binding": binding(ctx), "nonce": config["nonce"],
+              "boot_uuid": config["baseline"], "helper_sha256": config["helper_sha256"], "flags": 0x400}
+    private_write(directory / "quick-trigger.json", json.dumps(marker).encode())
+    sync_directory(directory)
+    os.sync()
+    preflight = subprocess.run([str(helper), "preflight"], env=helper_env(config), capture_output=True, text=True, check=True, timeout=10)
+    fact = json.loads(preflight.stdout)
+    if (not isinstance(fact, dict) or fact.get("event") != "quick_reboot_preflight" or
+            type(fact.get("flags")) is not int or fact["flags"] != 0x400 or fact.get("permission_verified") is not False):
+        raise ValueError("quick reboot preflight invalid")
+    token = (directory / "token").read_text()
+    url = CHECKS + "/" + str(config["check_id"])
+    check = api("GET", url, token)
+    prepared = verified_summary(check, config)
+    if check.get("status") != "in_progress" or prepared.get("phase") != "armed":
+        raise ValueError("quick reboot armed checkpoint absent")
+    prepared = {**prepared, "phase": "quick_prepared", "quick_flags": 0x400,
+                "helper_sha256": config["helper_sha256"], "permission_verified": False}
+    output = {"title": "Quick reboot prepared", "summary": json.dumps(prepared), "text": ""}
+    api("PATCH", url, token, {"status": "in_progress", "output": output})
+    check = api("GET", url, token)
+    verified_summary(check, config)
+    if (check.get("status") != "in_progress" or check.get("conclusion") is not None or
+            check.get("output", {}).get("summary") != output["summary"] or check["output"].get("title") != output["title"] or
+            boot_uuid() != config["baseline"]):
+        raise ValueError("quick reboot checkpoint acknowledgement mismatch")
+    helper = helper_checked(directory, config, "reboot-quick")
+    child = subprocess.Popen([str(helper), "execute"], env=helper_env(config), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stdout, _stderr = child.communicate(timeout=30)
+    returned = safe_quick_return(stdout)
+    if returned is not None:
+        print(json.dumps(returned), flush=True)
+        failure = {**prepared, "phase": "quick_failed", "quick_return": returned}
+        try:
+            api("PATCH", url, token, {"status": "completed", "conclusion": "failure",
+                "output": {"title": "Quick reboot syscall returned", "summary": json.dumps(failure)}})
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+    raise RuntimeError("quick reboot helper unexpectedly returned")
 
 
 def panic_capture(directory, config, current, deadline):
@@ -831,7 +892,7 @@ def collect(directory):
                           "capture_state": capture_state,
                           "cipher_sha256": envelope["cipher_sha256"] if envelope else "",
                           "note": "Boot UUID changed; no stopped-CPU GPR proof."})
-    successful = config["context"].get("trigger", "reboot") == "reboot" or capture_state == "captured"
+    successful = config["context"].get("trigger", "reboot") in ("reboot", "reboot-quick") or capture_state == "captured"
     if config.get("debug_boot", False):
         successful = successful and debug_boot_proven(debug_facts)
     output = {"title": "Recovery observed" if successful else "Panic report unavailable", "summary": summary}
@@ -909,6 +970,19 @@ def safe_force_return(stdout):
     return None
 
 
+def safe_quick_return(stdout):
+    for line in reversed(stdout.splitlines()):
+        try:
+            fact = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(fact, dict) and fact.get("event") == "quick_reboot_unexpected_return" and
+                type(fact.get("result")) is int and -1 <= fact["result"] <= 0 and
+                type(fact.get("errno")) is int and 0 <= fact["errno"] <= 4095):
+            return {"event": "quick_reboot_unexpected_return", "result": fact["result"], "errno": fact["errno"]}
+    return None
+
+
 def sudo_call(operation, payload, timeout=40):
     proc = subprocess.run(["/usr/bin/sudo", "-n", sys.executable, str(Path(__file__).resolve()), operation],
                           input=json.dumps(payload), text=True, capture_output=True, timeout=timeout)
@@ -919,6 +993,10 @@ def sudo_call(operation, payload, timeout=40):
                 print(json.dumps(fact), flush=True)
         elif operation == "force-preflight-root":
             fact = safe_force_preflight_error(proc.stdout)
+            if fact is not None:
+                print(json.dumps(fact), flush=True)
+        elif operation == "quick-execute-root":
+            fact = safe_quick_return(proc.stdout)
             if fact is not None:
                 print(json.dumps(fact), flush=True)
         print(json.dumps({"event": "root_operation_failed", "operation": operation,
@@ -963,7 +1041,7 @@ def controller(ctx, token):
                         fingerprint = data.get("cert_fingerprint", "")
                         if panic_mode(ctx) and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
                             raise ValueError("certificate fingerprint invalid")
-                        if ctx.get("trigger", "reboot") == "reboot" and fingerprint:
+                        if not panic_mode(ctx) and fingerprint:
                             raise ValueError("unexpected certificate fingerprint")
                         if pending is None:
                             ciphertext = encrypt_token(public.encode(), token)
@@ -995,7 +1073,7 @@ def controller(ctx, token):
                     current = api("GET", CHECKS + "/" + str(check_id), token, timeout=5)
                     if select_check([current], ctx) is not None and current.get("status") != "completed":
                         payload = {"status": "completed", "conclusion": "failure"}
-                        if not ctx.get("debug_boot", False):
+                        if not ctx.get("debug_boot", False) and ctx.get("trigger") != "reboot-quick":
                             payload["output"] = {"title": "Recovery not observed",
                                                  "summary": "Controller stopped before recovery proof; this does not prove a reboot or kernel failure."}
                         api("PATCH", CHECKS + "/" + str(check_id), token,
@@ -1025,7 +1103,8 @@ def main():
         elif op == "prepare":
             print(sudo_call("prepare-root", {"context": ctx, "token": token,
                             "report_cert": os.environ.pop("RECOVERY_REPORT_CERT", ""),
-                            "force_helper": os.environ.pop("RECOVERY_FORCE_HELPER", "")}, timeout=120), end="", flush=True)
+                            "force_helper": os.environ.pop("RECOVERY_FORCE_HELPER", ""),
+                            "quick_helper": os.environ.pop("RECOVERY_QUICK_HELPER", "")}, timeout=120), end="", flush=True)
         elif op == "arm":
             print(sudo_call("arm-root", {"context": ctx, "token": token}, timeout=510), end="", flush=True)
             deadline = time.monotonic() + 20
@@ -1043,6 +1122,8 @@ def main():
         elif op == "trigger" and ctx.get("trigger") == "panic-force-reset":
             print(sudo_call("force-preflight-root", {"context": ctx}, timeout=70), end="", flush=True)
             print(sudo_call("force-execute-root", {"context": ctx}, timeout=45), end="", flush=True)
+        elif op == "trigger" and ctx.get("trigger") == "reboot-quick":
+            print(sudo_call("quick-execute-root", {"context": ctx}, timeout=90), end="", flush=True)
         else:
             if ctx.get("trigger", "reboot") != "reboot":
                 raise ValueError("wrong trigger operation")
@@ -1053,10 +1134,10 @@ def main():
                 return
             os.sync()
             subprocess.run(["/usr/bin/sudo", "-n", "/sbin/reboot"], check=True, timeout=15)
-    elif op in ("prepare-root", "arm-root", "verify-root", "panic-preflight-root", "panic-execute-root", "force-preflight-root", "force-execute-root", "debug-request-root") and len(sys.argv) == 2:
+    elif op in ("prepare-root", "arm-root", "verify-root", "panic-preflight-root", "panic-execute-root", "force-preflight-root", "force-execute-root", "debug-request-root", "quick-execute-root") and len(sys.argv) == 2:
         {"prepare-root": prepare_root, "arm-root": arm_root, "verify-root": verify_root, "panic-preflight-root": panic_preflight_root, "panic-execute-root": panic_execute_root,
          "force-preflight-root": force_preflight_root, "force-execute-root": force_execute_root,
-         "debug-request-root": debug_request_root}[op](json.load(sys.stdin))
+         "debug-request-root": debug_request_root, "quick-execute-root": quick_execute_root}[op](json.load(sys.stdin))
     elif op == "collect" and len(sys.argv) == 3:
         collect(Path(sys.argv[2]))
     else:
