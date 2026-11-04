@@ -1,0 +1,29 @@
+name: Intel finite timer verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-26-intel
+    timeout-minutes: 5
+    steps:
+      - name: Check out diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the signed native probe
+        run: bash scripts/build-hypervisor.sh
+      - name: Verify timer exit with running and halted guests
+        run: python3 scripts/verify-cr8-controls.py "$RUNNER_TEMP/debug/probes/hypervisor" timer
+      - name: Preserve timer observations
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: timer-controls-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/debug/timer-controls/
+          retention-days: 1
+          if-no-files-found: warn

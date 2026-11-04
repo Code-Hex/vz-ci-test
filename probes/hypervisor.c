@@ -101,7 +101,13 @@ static const struct paging_profile paging_profiles[] = {
 static const uint32_t page_directory[] = {PAGE_TABLE | 3};
 static const uint32_t page_table[] = {3, PAGE_DIRECTORY | 3, PAGE_TABLE | 3};
 
-enum guest_kind { GUEST_HLT, GUEST_CPUID, GUEST_SPIN, GUEST_STI_HLT };
+enum guest_kind {
+  GUEST_HLT,
+  GUEST_CPUID,
+  GUEST_SPIN,
+  GUEST_STI_HLT,
+  GUEST_HLT_TIMER
+};
 enum observer_kind {
   OBSERVER_NONE,
   OBSERVER_SENTINEL,
@@ -115,7 +121,7 @@ struct guest_case {
   uint64_t exit_reason;
   // Zero means the asynchronous exit's instruction length is not read or gated.
   uint64_t instruction_length;
-  uint64_t tail_offset;
+  uint64_t tail_offset, activity_state;
   const char *verified_fact;
 };
 
@@ -142,6 +148,12 @@ static const struct guest_case guests[] = {
                        .instruction_length = 1,
                        .tail_offset = 1,
                        .verified_fact = "sentinel_sti_hlt_verified"},
+    [GUEST_HLT_TIMER] = {.tail = {0xf4, 0x90},
+                         .exit_reason = 52,
+                         .instruction_length = 0,
+                         .tail_offset = 1,
+                         .activity_state = 1,
+                         .verified_fact = "sentinel_hlt_timer_verified"},
 };
 
 struct kernel_marker_body {
@@ -168,7 +180,7 @@ struct phase_case {
   enum paging_kind paging;
   enum observer_kind observer;
   hv_vm_options_t vm_flags;
-  bool armed, control, forever, cr8_exits;
+  bool armed, control, forever, cr8_exits, timer_only;
 };
 
 struct observer {
@@ -197,7 +209,7 @@ struct probe {
   atomic_bool observer_stop;
   bool marker_locked;
   bool vm_created, mapped, cpu_created, cleaning, output_failed, guest_verified;
-  bool observer_active, cr8_exits;
+  bool observer_active, cr8_exits, timer_only;
 };
 
 static uint64_t observer_now(const struct observer *o) {
@@ -539,14 +551,18 @@ static int configure(struct probe *p) {
   // Intel SDM vol. 3C, 24.6: activate secondary controls (31), HLT exiting (7),
   // EPT (secondary 1), unrestricted guest (secondary 7). See
   // https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
-  TRY(control(p, VMCS_CTRL_PIN_BASED, 0, 0, &applied));
-  uint64_t primary = (1ULL << 31) | (1ULL << 7);
+  // run_until enables the timer before applying pending controls; keep it on.
+  TRY(control(p, VMCS_CTRL_PIN_BASED, p->timer_only ? (1ULL << 6) : 0, 0,
+              &applied));
+  uint64_t primary = (1ULL << 31) | (p->timer_only ? 0 : (1ULL << 7));
   // AppleHV 25G76 prepare_cond_vmcs applies primary controls only with
   // both CR8 exits or TPR shadow. This phase tests that coupled condition.
   if (p->cr8_exits)
     primary |= (1ULL << 19) | (1ULL << 20);
   TRY(control(p, VMCS_CTRL_CPU_BASED, primary,
-              (1ULL << 2) | (1ULL << 22) | (1ULL << 27), &applied));
+              (1ULL << 2) | (1ULL << 22) | (1ULL << 27) |
+                  (p->timer_only ? (1ULL << 7) : 0),
+              &applied));
   TRY(control(p, VMCS_CTRL_CPU_BASED2, (1ULL << 1) | (1ULL << 7), 1ULL << 14,
               &applied));
   TRY(control(p, VMCS_CTRL_VMENTRY_CONTROLS, 0,
@@ -781,13 +797,14 @@ static int run_once(struct probe *p, const struct phase_case *spec) {
                        VMCS_RO_VMEXIT_INSTR_LEN, 0, 0)));
   uint8_t actual = *(volatile uint8_t *)(p->memory + SENTINEL);
   fact(p, "guest_observation", "fact", 0, actual, rip, length);
-  if (spec->observer == OBSERVER_INTERRUPT) {
-    uint64_t activity = 0;
+  uint64_t activity = 0;
+  if (spec->observer == OBSERVER_INTERRUPT || spec->timer_only) {
     TRY(status(p, CALL(p, "hv_vmx_vcpu_read_vmcs",
                        hv_vmx_vcpu_read_vmcs(p->vcpu, VMCS_GUEST_ACTIVITY_STATE,
                                              &activity),
                        VMCS_GUEST_ACTIVITY_STATE, 0, 0)));
-    fact(p, "interrupt_guest_state", "fact", 0, reason, rip, activity);
+    fact(p, spec->timer_only ? "timer_guest_state" : "interrupt_guest_state",
+         "fact", 0, reason, rip, activity);
   }
   // SDM appendix C: bit 31 marks VM-entry failure.
   bool length_matches = p->guest->instruction_length == 0 ||
@@ -796,7 +813,8 @@ static int run_once(struct probe *p, const struct phase_case *spec) {
       !(reason & (1ULL << 31)) && (reason & 0xffff) == p->guest->exit_reason &&
       actual == TAG &&
       rip == CODE + p->profile->mov_length + p->guest->tail_offset &&
-      length_matches;
+      length_matches &&
+      (!spec->timer_only || activity == p->guest->activity_state);
   fact(p, p->guest_verified ? p->guest->verified_fact : "guest_not_established",
        "fact", p->guest_verified ? 0 : 77, reason, rip, length);
   return p->guest_verified ? 0 : 77;
@@ -1060,6 +1078,18 @@ int main(int argc, char **argv) {
        .observer = OBSERVER_KERNELMARKERS,
        .armed = true,
        .cr8_exits = true},
+      {.name = "protected32-paging-spin-cr8-timer",
+       .guest = GUEST_SPIN,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .cr8_exits = true,
+       .timer_only = true},
+      {.name = "protected32-paging-hlt-cr8-timer",
+       .guest = GUEST_HLT_TIMER,
+       .mode = PROTECTED32,
+       .paging = PAGING_ENABLED,
+       .cr8_exits = true,
+       .timer_only = true},
   };
   int target = -1;
   if (argc == 2)
@@ -1081,7 +1111,9 @@ int main(int argc, char **argv) {
             "armed-protected32-paging-cpuid-accel-kernelmarkers|"
             "armed-protected32-paging-hlt-accel-kernelmarkers|"
             "armed-protected32-paging-cpuid-cr8-kernelmarkers|"
-            "armed-protected32-paging-hlt-cr8-kernelmarkers\n",
+            "armed-protected32-paging-hlt-cr8-kernelmarkers|"
+            "protected32-paging-spin-cr8-timer|"
+            "protected32-paging-hlt-cr8-timer\n",
             argv[0]);
     return 64;
   }
@@ -1089,7 +1121,8 @@ int main(int argc, char **argv) {
                     .guest = &guests[phases[target].guest],
                     .profile = &profiles[phases[target].mode],
                     .paging = &paging_profiles[phases[target].paging],
-                    .cr8_exits = phases[target].cr8_exits};
+                    .cr8_exits = phases[target].cr8_exits,
+                    .timer_only = phases[target].timer_only};
   if (mach_timebase_info(&p.timebase) != KERN_SUCCESS || p.timebase.denom == 0)
     return 71;
   fact(&p, "probe_start", "fact", 0, (uint64_t)target, 0, 0);
