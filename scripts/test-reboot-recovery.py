@@ -101,6 +101,7 @@ class Recovery(unittest.TestCase):
                 "nonce": "n", "baseline_boot_uuid": "old", "current_boot_uuid": "new", "trigger": "reboot-quick"}
         self.assertTrue(r.boot_proof_matches(data, pending, ctx))
         self.assertFalse(r.boot_proof_matches(dict(data, phase="quick_prepared"), pending, ctx))
+        self.assertFalse(r.boot_proof_matches(dict(data, phase="quick_intent"), pending, ctx))
 
     def test_quick_main_only_routes_to_root_rpc(self):
         calls = []
@@ -407,8 +408,8 @@ class Recovery(unittest.TestCase):
             self.assertFalse((directory / "debug-boot-restored.json").exists())
 
     def test_debug_quick_owner_ack_before_intent_and_no_reissue(self):
-        for acknowledged in (True, False):
-            with self.subTest(acknowledged=acknowledged), tempfile.TemporaryDirectory() as tmp:
+        for acknowledged, intent_acknowledged in ((True, True), (True, False), (False, True)):
+            with self.subTest(acknowledged=acknowledged, intent_acknowledged=intent_acknowledged), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 config, platform, original = self.owner_fixture(directory)
                 config["context"]["trigger"] = "reboot-quick"
@@ -421,6 +422,13 @@ class Recovery(unittest.TestCase):
                     if not acknowledged:
                         raise ValueError("checkpoint not acknowledged")
                     return {"phase": "quick_prepared"}
+                def intent_ack(*_args):
+                    self.assertTrue((directory / "debug-reboot-intent.json").exists())
+                    self.assertFalse((directory / "debug-boot-restored.json").exists())
+                    events.append("intent_ack")
+                    if not intent_acknowledged:
+                        raise ValueError("intent checkpoint not acknowledged")
+                    return _args[2]
                 def execute(*_args, **_kwargs):
                     self.assertTrue((directory / "debug-reboot-intent.json").exists())
                     events.append("execute")
@@ -428,12 +436,61 @@ class Recovery(unittest.TestCase):
                 with patch.object(r.recovery_bootargs, "MacPlatform", lambda: platform), \
                         patch.object(r.recovery_bootargs, "csr_allowed", lambda: True), \
                         patch.object(r, "quick_prepare", prepare), patch.object(r, "quick_reboot_child", execute), \
+                        patch.object(r, "quick_intent_ack", intent_ack), \
                         patch.object(r, "debug_reboot_child", lambda: self.fail("normal reboot fallback")):
                     r.debug_owner(directory, config, "old")
                     r.debug_owner(directory, config, "old")
-                self.assertEqual(events, ["prepare_ack", "execute"] if acknowledged else ["prepare_ack"])
+                expected = ["prepare_ack"] + (["intent_ack"] if acknowledged else [])
+                if acknowledged and intent_acknowledged:
+                    expected.append("execute")
+                self.assertEqual(events, expected)
                 self.assertEqual(platform.value == original, not acknowledged)
                 self.assertEqual((directory / "debug-boot-restored.json").exists(), not acknowledged)
+                if acknowledged and not intent_acknowledged:
+                    self.assertEqual(r.read_debug_event(directory, config, "uncertain")["reason"], "intent_ack_failure")
+
+    def test_quick_intent_canonical_ack_preserves_prepared_and_filters_owner_fields(self):
+        for acknowledged in (True, False):
+            with self.subTest(acknowledged=acknowledged), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config, _platform, _original = self.owner_fixture(directory)
+                config["context"]["trigger"] = "reboot-quick"
+                config["check_id"] = 9
+                ctx = config["context"]
+                prepared = {"protocol": "vz-recovery-v1", "phase": "quick_prepared", "binding": r.binding(ctx),
+                            "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "trigger": "reboot-quick",
+                            "debug_boot": True, "cert_fingerprint": "", "quick_flags": 1024, "helper_sha256": "c" * 64,
+                            "permission_verified": False}
+                r.private_write(directory / "token", b"synthetic-token")
+                for event in ("staged", "intent"):
+                    r.debug_event(directory, config, event, "old")
+                path = directory / "debug-reboot-staged.json"
+                raw = r.json.loads(path.read_text())
+                path.write_text(r.json.dumps({**raw, "raw": "private-not-published"}))
+                sent, operations = {}, []
+                def api(method, _url, token, payload=None):
+                    self.assertEqual(token, "synthetic-token")
+                    operations.append(method)
+                    if method == "PATCH":
+                        sent.update(payload)
+                        return {}
+                    return {"id": 9, "name": "Runner recovery 123", "external_id": r.binding(ctx), "head_sha": ctx["sha"],
+                            "app": {"id": 15368 if acknowledged else 0, "slug": "github-actions"},
+                            "details_url": "https://github.com/Code-Hex/vz-ci-test/runs/9", "status": "in_progress",
+                            "conclusion": None, "output": sent["output"]}
+                with patch.object(r, "api", api), patch.object(r, "boot_uuid", lambda: "old"):
+                    if acknowledged:
+                        result = r.quick_intent_ack(directory, config, prepared)
+                        self.assertEqual(result["phase"], "quick_intent")
+                    else:
+                        with self.assertRaises(ValueError):
+                            r.quick_intent_ack(directory, config, prepared)
+                self.assertEqual(operations, ["PATCH", "GET"])
+                summary = r.json.loads(sent["output"]["summary"])
+                self.assertEqual({key: summary[key] for key in prepared if key != "phase"},
+                                 {key: value for key, value in prepared.items() if key != "phase"})
+                self.assertEqual([event["event"] for event in summary["owner_events"]], ["staged", "intent"])
+                self.assertNotIn("private-not-published", sent["output"]["summary"])
 
     def test_quick_timeout_retains_same_child_until_exit_without_kill(self):
         for interruption in (subprocess.TimeoutExpired("helper", 30), KeyboardInterrupt()):

@@ -457,7 +457,7 @@ def debug_source_identity():
 
 
 DEBUG_EVENTS = ("request", "staged", "intent", "returned", "uncertain", "aborted")
-DEBUG_REASONS = ("stage_failure", "orphan_stage", "timeout", "interrupted", "exec_error", "rollback_failed", "intent_storage_error")
+DEBUG_REASONS = ("stage_failure", "orphan_stage", "timeout", "interrupted", "exec_error", "rollback_failed", "intent_storage_error", "intent_ack_failure")
 
 
 def read_debug_event(directory, config, event):
@@ -563,6 +563,12 @@ def debug_owner(directory, config, current):
         except BaseException:
             debug_event(directory, config, "aborted", current, reason="rollback_failed")
         return
+    if prepared is not None:
+        try:
+            prepared = quick_intent_ack(directory, config, prepared)
+        except BaseException:
+            debug_event(directory, config, "uncertain", current, reason="intent_ack_failure")
+            return
     try:
         if prepared is None:
             result = debug_reboot_child()
@@ -767,6 +773,26 @@ def quick_prepare(directory, config):
         raise ValueError("quick reboot checkpoint acknowledgement mismatch")
     helper_checked(directory, config, "reboot-quick")
     return prepared
+
+
+def quick_intent_ack(directory, config, prepared):
+    if (config.get("debug_boot") is not True or config["context"].get("trigger") != "reboot-quick" or
+            prepared.get("phase") != "quick_prepared"):
+        raise ValueError("quick intent context mismatch")
+    intent = {**prepared, "phase": "quick_intent",
+              "owner_events": [read_debug_event(directory, config, event) for event in ("staged", "intent")]}
+    output = {"title": "Quick reboot intent durable", "summary": json.dumps(intent), "text": ""}
+    url = CHECKS + "/" + str(config["check_id"])
+    token = (directory / "token").read_text()
+    api("PATCH", url, token, {"status": "in_progress", "output": output})
+    check = api("GET", url, token)
+    verified_summary(check, config)
+    actual = check.get("output", {})
+    if (check.get("status") != "in_progress" or check.get("conclusion") is not None or
+            actual.get("title") != output["title"] or actual.get("summary") != output["summary"] or
+            actual.get("text") not in (None, "") or boot_uuid() != config["baseline"]):
+        raise ValueError("quick intent acknowledgement mismatch")
+    return intent
 
 
 def quick_reboot_child(directory, config, on_uncertain=None):
