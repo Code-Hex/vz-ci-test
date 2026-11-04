@@ -33,6 +33,26 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(result['candidates'][0]['end'], 0x30)
         self.assertTrue(all(c['ambiguous'] for c in result['candidates'] if c['name'].endswith('4syncEv')))
 
+    def test_fixed_helpers_do_not_compete_with_class_limit(self):
+        census = probe.SymbolCensus()
+        for i in range(25):
+            census.feed(f'{i:08x} T __ZN13AppleEFINVRAM11setVariable{i}Ev')
+        for i, name in enumerate(sorted(probe.EXTRA_SYMBOLS), 25):
+            census.feed(f'{i:08x} T {name}')
+        census.feed('00000040 T _end')
+        result = census.finish()
+        names = [candidate['name'] for candidate in result['candidates']]
+        self.assertTrue(probe.EXTRA_SYMBOLS <= set(names))
+        self.assertEqual(len(names), 24 + len(probe.EXTRA_SYMBOLS))
+        self.assertEqual(result['target_count'], 25 + len(probe.EXTRA_SYMBOLS))
+        duplicate = sorted(probe.EXTRA_SYMBOLS)[0]
+        census.feed('00000050 T ' + duplicate)
+        census.feed('00000060 T _last')
+        result = census.finish()
+        self.assertLessEqual(len(result['candidates']), 30)
+        self.assertEqual(len([c for c in result['candidates'] if c['name'] == duplicate]), 1)
+        self.assertTrue(next(c for c in result['candidates'] if c['name'] == duplicate)['ambiguous'])
+
     def test_candidate_limit_and_order_reversal(self):
         census = probe.SymbolCensus()
         for i in range(25):

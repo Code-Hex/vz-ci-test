@@ -55,6 +55,14 @@ def function_instructions(text, name, start, end):
 
 
 ENTRIES = ('com.apple.driver.AppleEFINVRAM', 'com.apple.driver.AppleEFIRuntime')
+EXTRA_SYMBOLS = frozenset((
+    '__ZL19IsMagicVariableNamePKc',
+    '__ZL27MagicVariableNameWithSuffixPKc',
+    '__ZL17ParseVariableNamePKcP8EFI_GUIDPS0_',
+    '__ZNK13AppleEFINVRAM16skipCacheForGUIDEPK8EFI_GUID',
+    '__ZN13AppleEFINVRAM14backupBootPathEv',
+    '__ZN13AppleEFINVRAM16restorePanicInfoEv',
+))
 
 
 def selected_entries(data):
@@ -115,7 +123,7 @@ class SymbolCensus:
         if self.last == address:
             for candidate in self.pending:
                 candidate['ambiguous'] = True
-        wanted = bool(self.target.fullmatch(name)) if self.target else bool(SYMBOL.match(line) and INTEREST.search(name))
+        wanted = bool(self.target.fullmatch(name)) if self.target else bool(name in EXTRA_SYMBOLS or SYMBOL.match(line) and INTEREST.search(name))
         if wanted:
             self.target_count += 1
             if len(self.candidates) < 4096:
@@ -136,7 +144,13 @@ class SymbolCensus:
         def rank(candidate):
             name = candidate['name'].lower()
             return (0 if 'setvariable' in name or 'write' in name else 1 if 'sync' in name else 2, name)
-        return {'target_count': self.target_count, 'candidates': sorted(self.candidates, key=rank)[:24],
+        fixed = {}
+        for candidate in self.candidates:
+            if candidate['name'] in EXTRA_SYMBOLS:
+                fixed.setdefault(candidate['name'], candidate)
+        selected = list(fixed.values())
+        selected += sorted((candidate for candidate in self.candidates if candidate['name'] not in EXTRA_SYMBOLS), key=rank)[:24]
+        return {'target_count': self.target_count, 'candidates': selected,
                 'census_overflow': self.overflow}
 
 
@@ -418,7 +432,7 @@ def main():
             item['target_count_complete'] = status == 'ok'
             item['status'] = status if status != 'ok' else ('unsupported' if not census['target_count'] else
                 'target_census_limit' if census['census_overflow'] else
-                'target_count_limited' if census['target_count'] > 24 else 'observed')
+                'target_count_limited' if census['target_count'] > len(census['candidates']) else 'observed')
             save()
             candidates = census['candidates'] if status == 'ok' and not census['census_overflow'] else []
             for candidate in candidates:
