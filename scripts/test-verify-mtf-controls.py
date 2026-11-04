@@ -48,6 +48,29 @@ class Mtf(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.valid_snapshot(facts)
 
+    def test_mov_checkpoint_rejects_malformed_repeated_and_wrong_order(self):
+        gate = fact("mtf_mov_checkpoint_ready", 0, 71, 0, 0)
+        facts = [fact("mtf_exit", 0, 37, 263, 0), fact("mtf_exit_tag", 0, 1, 165, 0), gate]
+        self.assertEqual(r.checkpoint_state(facts, set())["stage"], "mov")
+        with self.assertRaises(ValueError):
+            r.checkpoint_state(facts, {"mov"})
+        with self.assertRaises(ValueError):
+            r.checkpoint_state([facts[1], facts[0], gate], set())
+        wrong = [dict(x) for x in facts]
+        wrong[1]["arg1"] = 0
+        with self.assertRaises(ValueError):
+            r.checkpoint_state(wrong, set())
+
+    def test_hlt_checkpoint_requires_first_ack_and_correct_order(self):
+        facts = snapshot()
+        facts.insert(2, fact("mtf_mov_checkpoint_ready", 0, 71, 0, 0))
+        facts.append(fact("mtf_checkpoint_ready", 0, 71, 0, 0))
+        with self.assertRaises(ValueError):
+            r.checkpoint_state(facts, set())
+        self.assertEqual(r.checkpoint_state(facts, {"mov"})["stage"], "hlt")
+        with self.assertRaises(ValueError):
+            r.checkpoint_state(facts, {"mov", "hlt"})
+
     def test_resume_requires_reason_rip_and_halted_activity(self):
         facts = [fact("mtf_resume_state_equal", 0, 264, 264, 1),
                  fact("mtf_resume_exit", 0, 52, 264, 1)]
@@ -66,6 +89,8 @@ class Mtf(unittest.TestCase):
         self.assertEqual(r.attempt_classification(facts, 77, False), "failure")
         facts[0]["arg0"] = 1
         facts.insert(1, fact("mtf_checkpoint_ready"))
+        self.assertEqual(r.attempt_classification(facts, 77, False), "failure")
+        facts[1] = fact("mtf_mov_checkpoint_ready")
         self.assertEqual(r.attempt_classification(facts, 77, False), "failure")
 
 

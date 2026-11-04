@@ -925,6 +925,7 @@ static int run_mtf(struct probe *p, const struct phase_case *spec) {
          TAG);
     return p->output_failed ? 74 : 0;
   }
+  TRY(gate(p, "mtf_mov_checkpoint_ready"));
   TRY(mtf_step(p, 2, CODE + p->profile->mov_length + 1, 1));
   TRY(mtf_snapshot(p, 2, &before_state));
   uint64_t primary = before_state.fields[7];

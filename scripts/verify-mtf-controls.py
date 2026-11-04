@@ -66,6 +66,34 @@ def valid_snapshot(records):
             "timer_saved_on_exit": bool(vmcs[0x400c] & (1 << 22))}
 
 
+def checkpoint_state(records, accepted):
+    if not records:
+        raise ValueError("checkpoint_gate")
+    gate = records[-1]
+    if gate.get("edge") != "fact" or gate.get("result") != 0 or args(gate) != (71, 0, 0):
+        raise ValueError("checkpoint_gate")
+    if gate.get("api") == "mtf_mov_checkpoint_ready":
+        exits, tags = events(records, "mtf_exit"), events(records, "mtf_exit_tag")
+        if (accepted or len(events(records, "mtf_mov_checkpoint_ready")) != 1
+                or len(exits) != 1 or len(tags) != 1 or exits[0].get("result") != 0
+                or tags[0].get("result") != 0 or args(exits[0]) != (37, 263, 0)
+                or args(tags[0]) != (1, 165, 0)
+                or not records.index(exits[0]) < records.index(tags[0]) < len(records) - 1):
+            raise ValueError("mov_invalid")
+        return {"stage": "mov", "scope": "synthetic_guest_not_host",
+                "exit_reason": 37, "rip": 263, "activity": 0, "tag": 165}
+    if gate.get("api") == "mtf_checkpoint_ready":
+        mov = events(records, "mtf_mov_checkpoint_ready")
+        exits = events(records, "mtf_exit")
+        if (accepted != {"mov"} or len(mov) != 1 or len(events(records, "mtf_checkpoint_ready")) != 1
+                or len(exits) != 2 or not records.index(mov[0]) < records.index(exits[1])):
+            raise ValueError("checkpoint_order")
+        state = valid_snapshot(records)
+        state["stage"] = "hlt"
+        return state
+    raise ValueError("checkpoint_gate")
+
+
 def resume_verified(records):
     return (exact(records, "mtf_resume_state_equal", (264, 264, 1))
             and exact(records, "mtf_resume_exit", (52, 264, 1)))
@@ -78,7 +106,8 @@ def attempt_classification(records, exit_code, timed_out):
     if (exit_code == 77 and len(failed) == len(end) == 1 and failed[0].get("result") == 77
             and failed[0].get("arg0") == 1 and failed[0].get("arg1") in (1, 2)
             and end[0].get("result") == 77 and args(end[0]) == (77, 0, 0)
-            and not events(records, "mtf_checkpoint_ready")):
+            and not events(records, "mtf_checkpoint_ready")
+            and not events(records, "mtf_mov_checkpoint_ready")):
         return "retry"
     return "failure"
 
@@ -97,10 +126,11 @@ def request(method, url, token, body=None):
         return json.loads(response.read(65537))
 
 
-def checkpoint(state, phase, token):
+def checkpoint(state, phase, number, token):
     run, attempt, sha = (os.environ[k] for k in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA"))
-    name = "MTF snapshot " + phase + " " + run
-    external = "/".join(("mtf", run, attempt, phase))
+    stage = state["stage"]
+    name = "MTF " + stage + " " + phase + " " + run
+    external = "/".join(("mtf", run, attempt, phase, str(number), stage))
     summary = json.dumps({"run": run, "attempt": attempt, "phase": phase, "state": state}, separators=(",", ":"))
     body = {"name": name, "head_sha": sha, "external_id": external, "status": "completed",
             "conclusion": "neutral", "output": {"title": "Synthetic guest MTF snapshot", "summary": summary}}
@@ -127,7 +157,7 @@ def emit(record):
 
 
 def run_attempt(binary, directory, phase, number, token):
-    records, pending, checkpoint_id = [], b"", None
+    records, pending, checkpoints = [], b"", {}
     timed_out, invalid = False, False
     path = directory / (phase + "-attempt" + str(number) + ".jsonl")
     env = dict(os.environ)
@@ -167,10 +197,10 @@ def run_attempt(binary, directory, phase, number, token):
                             raise ValueError("child_output")
                         emit(record)
                         records.append(record)
-                        if record.get("api") == "mtf_checkpoint_ready" and record.get("edge") == "fact":
-                            if phase == "mtf-mov" or checkpoint_id is not None or record.get("result") != 0 or args(record) != (71, 0, 0):
+                        if record.get("api") in ("mtf_mov_checkpoint_ready", "mtf_checkpoint_ready") and record.get("edge") == "fact":
+                            if phase == "mtf-mov":
                                 raise ValueError("checkpoint_gate")
-                            state = valid_snapshot(records)
+                            state = checkpoint_state(records, set(checkpoints))
                             state["kernel_uuid"] = KERNEL_UUID
                             identity = (record.get("pid"), record.get("sourcehash"))
                             relevant = [r for r in records if str(r.get("api", "")).startswith("mtf_")]
@@ -185,8 +215,9 @@ def run_attempt(binary, directory, phase, number, token):
                                 raise ValueError("snapshot_identity")
                             state["owner_pid"], state["source_sha256"] = identity
                             state["owner_tid"] = owner[0]["arg0"]
-                            checkpoint_id = checkpoint(state, phase, token)
-                            emit({"event": "checkpoint_ack", "check_id": checkpoint_id, "phase": phase})
+                            checkpoint_id = checkpoint(state, phase, number, token)
+                            checkpoints[state["stage"]] = checkpoint_id
+                            emit({"event": "checkpoint_ack", "check_id": checkpoint_id, "phase": phase, "stage": state["stage"]})
                             if time.monotonic() >= deadline:
                                 timed_out = True
                                 raise TimeoutError("checkpoint_deadline")
@@ -225,11 +256,11 @@ def run_attempt(binary, directory, phase, number, token):
     clean = exit_code == 0 and exact(records, "process_result", (0, 0, 1)) and not invalid and not pending
     if clean and phase == "mtf-mov" and exact(records, "mtf_mov_verified", (37, 263, 165)):
         result = "success"
-    if clean and phase != "mtf-mov" and checkpoint_id is not None:
+    if clean and phase != "mtf-mov" and set(checkpoints) == {"mov", "hlt"}:
         if phase == "mtf-hlt-observe" or resume_verified(records):
             result = "success"
     emit({"event": "attempt_result", "phase": phase, "attempt": number, "result": result,
-          "exit": exit_code, "checkpoint_id": checkpoint_id})
+          "exit": exit_code, "checkpoints": checkpoints})
     return result
 
 
