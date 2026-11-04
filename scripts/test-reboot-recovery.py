@@ -283,7 +283,7 @@ class Recovery(unittest.TestCase):
 
     def owner_fixture(self, directory):
         config = {"context": {"run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True, "trigger": "reboot"},
-                  "debug_boot": True, "baseline": "old", "nonce": "n", "debug_source_identity": r.debug_source_identity()}
+                  "debug_boot": True, "baseline": "old", "nonce": "b" * 64, "debug_source_identity": r.debug_source_identity()}
         original = {"boot-args": b"preempt=10"}
         class Platform:
             fail_write = False
@@ -295,7 +295,7 @@ class Recovery(unittest.TestCase):
                 return self.value.copy()
             def active(self):
                 return self.active_value
-            def write(self, path):
+            def write(self, path, owned_canary, expected_previous):
                 self.events.append("write")
                 self.value = r.recovery_bootargs.parse_nvram(path.read_bytes())
                 if self.fail_write:
@@ -331,8 +331,10 @@ class Recovery(unittest.TestCase):
                 if argv[0] == "/usr/sbin/sysctl":
                     return b"preempt=10\n"
                 if argv[1:3] == ["-x", "-f"]:
-                    state.clear()
                     state.update(r.recovery_bootargs.parse_nvram(Path(argv[3]).read_bytes()))
+                    return b""
+                if argv[1] == "-d":
+                    state.pop(argv[2], None)
                     return b""
                 self.assertEqual(argv, ["/usr/sbin/nvram", "-s"])
                 syncs.append("sync")
@@ -474,7 +476,7 @@ class Recovery(unittest.TestCase):
                 platform.active_value = b"preempt=10 debug=0x2000"
                 platform.events.clear()
                 r.private_write(directory / "token", b"test-token")
-                r.private_write(directory / "ready.json", r.json.dumps({"baseline": "old", "nonce": "n", "preboot_patch": True}).encode())
+                r.private_write(directory / "ready.json", r.json.dumps({"baseline": "old", "nonce": config["nonce"], "preboot_patch": True}).encode())
                 output = {}
                 final_conclusions = []
                 original_finish = r.recovery_bootargs.finish
@@ -509,6 +511,9 @@ class Recovery(unittest.TestCase):
                     self.assertLess(platform.events.index("write"), platform.events.index("core_patch"))
                 self.assertTrue((directory / "debug-boot-core.json").exists())
                 self.assertEqual(r.json.loads((directory / "debug-boot-core.json").read_text())["facts"]["nvram_restored"], restored)
+                if not restored:
+                    self.assertEqual(r.json.loads((directory / "debug-boot-core.json").read_text())["facts"]["nvram_key_states"],
+                                     {"boot_args": "unavailable", "canary": "unavailable"})
                 if acknowledged and restored:
                     self.assertLess(platform.events.index("core_ack"), platform.events.index("inventory"))
                     self.assertLess(platform.events.index("inventory"), platform.events.index("final_patch"))

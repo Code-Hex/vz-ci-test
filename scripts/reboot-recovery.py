@@ -475,7 +475,7 @@ def read_debug_event(directory, config, event):
         result["returncode"] = record["returncode"]
     if record.get("reason") in DEBUG_REASONS:
         result["reason"] = record["reason"]
-    if record.get("nvram_before_rollback") in ("staged", "original", "unstaged"):
+    if record.get("nvram_before_rollback") in ("staged", "original", "partial", "unstaged"):
         result["nvram_before_rollback"] = record["nvram_before_rollback"]
     if isinstance(record.get("quick_return"), dict):
         returned = safe_quick_return(json.dumps(record["quick_return"]))
@@ -876,6 +876,7 @@ def collect(directory):
                                                    current_boot_uuid=current, inventory=False)
         except (OSError, ValueError, subprocess.SubprocessError):
             debug_facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "nvram_restored": False, "current_boot_uuid": current,
+                           "nvram_before_restore": "unavailable", "nvram_key_states": {"boot_args": "unavailable", "canary": "unavailable"},
                            "debugger_count": None, "debugger_inventory_status": "unavailable",
                            "network_inventory_status": "unavailable", "virtio_network_classes": [],
                            "nic_inventory_status": "unsupported", "kernel_debug_state": {}}

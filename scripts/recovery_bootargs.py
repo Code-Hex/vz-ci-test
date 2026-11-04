@@ -8,6 +8,13 @@ import selectors
 import subprocess
 import time
 
+CANARY_KEY = "vz-ci-persistence-probe"
+OWNED_KEYS = ("boot-args", CANARY_KEY)
+
+
+class ForeignNVRAM(ValueError):
+    pass
+
 
 def requested(value, trigger):
     if value not in ("", "0", "1") or (value == "1" and trigger not in ("reboot", "reboot-quick")):
@@ -33,12 +40,11 @@ def parse_nvram(raw):
         raise ValueError("NVRAM plist invalid") from error
     if not isinstance(values, dict):
         raise ValueError("NVRAM plist type invalid")
-    if any(key.endswith(":boot-args") for key in values):
+    if any(isinstance(key, str) and any(key.endswith(":" + owned) for owned in OWNED_KEYS) for key in values):
         raise ValueError("ambiguous NVRAM boot arguments")
-    if "boot-args" not in values:
-        return {}
-    text(values["boot-args"])
-    return {"boot-args": values["boot-args"]}
+    if "boot-args" in values:
+        text(values["boot-args"])
+    return {key: values[key] for key in OWNED_KEYS if key in values}
 
 
 def check_unconfigured(value):
@@ -48,12 +54,43 @@ def check_unconfigured(value):
             raise ValueError("existing debugging configuration")
 
 
-def desired(original):
+def canary_value(marker):
+    binding, nonce = marker.get("binding", ""), marker.get("nonce", "")
+    if (not isinstance(binding, str) or not re.fullmatch(r"[1-9][0-9]{0,19}/[1-9][0-9]{0,4}/[0-9a-f]{40}", binding) or
+            not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{64}", nonce)):
+        raise ValueError("canary scope invalid")
+    run, attempt, _sha = binding.split("/")
+    return ("v1:" + run + ":" + attempt + ":" + nonce).encode("ascii")
+
+
+def desired(original, marker):
+    if CANARY_KEY in original:
+        raise ValueError("existing persistence canary")
     value = original.get("boot-args", b"")
     check_unconfigured(value)
     result = text(value) + (" " if text(value) else "") + "debug=0x2000"
     text(result)
-    return {"boot-args": result if isinstance(value, str) else result.encode("ascii")}
+    return {"boot-args": result if isinstance(value, str) else result.encode("ascii"), CANARY_KEY: canary_value(marker)}
+
+
+def key_states(original, staged, current):
+    def same(left, right, key):
+        return (key in left) == (key in right) and (key not in left or
+                type(left[key]) is type(right[key]) and left[key] == right[key])
+    states = {name: "original" if same(current, original, key) else "staged" if same(current, staged, key) else "other"
+              for name, key in (("boot_args", "boot-args"), ("canary", CANARY_KEY))}
+    return whole_state(states), states
+
+
+def whole_state(states):
+    return "other" if "other" in states.values() else \
+           "original" if all(value == "original" for value in states.values()) else \
+           "staged" if all(value == "staged" for value in states.values()) else "partial"
+
+
+def valid_key_states(states, allow_other=False):
+    return (isinstance(states, dict) and set(states) == {"boot_args", "canary"} and
+            all(value in (("original", "staged", "other") if allow_other else ("original", "staged")) for value in states.values()))
 
 
 def debug_mask(value):
@@ -146,10 +183,19 @@ class MacPlatform:
     def read(self):
         return parse_nvram(capture(["/usr/sbin/nvram", "-x", "-p"]))
 
-    def write(self, path):
+    def write(self, path, owned_canary, expected_previous):
         value = parse_nvram(path.read_bytes())
-        command = ["/usr/sbin/nvram", "-x", "-f", str(path)] if value else ["/usr/sbin/nvram", "-d", "boot-args"]
-        capture(command)
+        current = self.read()
+        if key_states(expected_previous, expected_previous, current)[0] != "original":
+            raise ForeignNVRAM("NVRAM changed before write")
+        for record in (current, value):
+            if CANARY_KEY in record and (type(record[CANARY_KEY]) is not bytes or record[CANARY_KEY] != owned_canary):
+                raise ForeignNVRAM("foreign persistence canary")
+        if value:
+            capture(["/usr/sbin/nvram", "-x", "-f", str(path)])
+        for key in OWNED_KEYS:
+            if key in current and key not in value:
+                capture(["/usr/sbin/nvram", "-d", key])
         capture(["/usr/sbin/nvram", "-s"])
 
     def active(self):
@@ -203,24 +249,26 @@ def restore(directory, marker, platform, save, sync, before_restore=None, *, cau
         raise ValueError("debug boot stage identity mismatch")
     original = parse_nvram((directory / "debug-boot-original.plist").read_bytes())
     expected = parse_nvram((directory / "debug-boot-staged.plist").read_bytes())
-    if desired(original) != expected:
+    if desired(original, marker) != expected:
         raise ValueError("debug boot stage value mismatch")
     current = platform.read()
-    state = "original" if current == original else "staged" if current == expected else None
-    if state is None:
-        raise ValueError("NVRAM changed outside transaction")
+    state, states = key_states(original, expected, current)
+    if not valid_key_states(states):
+        if before_restore is not None:
+            before_restore(state, states)
+        raise ForeignNVRAM("NVRAM changed outside transaction")
     try:
         if before_restore is not None:
-            before_restore(state)
+            before_restore(state, states)
     finally:
-        platform.write(directory / "debug-boot-original.plist")
+        platform.write(directory / "debug-boot-original.plist", canary_value(marker), current)
         if platform.read() != original:
             raise ValueError("NVRAM restoration mismatch")
         path = directory / "debug-boot-restored.json"
         if not path.exists():
             save(path, json.dumps({"nvram_restored": True, "marker": marker, "cause": cause,
                                    "actual_boot_uuid": current_boot_uuid or marker.get("baseline"),
-                                   "nvram_before_restore": state}).encode())
+                                   "nvram_before_restore": state, "nvram_key_states": states}).encode())
             sync(directory)
     return state
 
@@ -229,14 +277,14 @@ def stage(directory, marker, platform, save, sync):
     if (directory / "debug-boot-stage.json").exists():
         raise FileExistsError("debug boot already staged")
     original = platform.read()
-    expected = desired(original)
+    expected = desired(original, marker)
     check_unconfigured(platform.active())
     save(directory / "debug-boot-original.plist", plistlib.dumps(original))
     save(directory / "debug-boot-staged.plist", plistlib.dumps(expected))
     save(directory / "debug-boot-stage.json", json.dumps(marker).encode())
     sync(directory)
     try:
-        platform.write(directory / "debug-boot-staged.plist")
+        platform.write(directory / "debug-boot-staged.plist", canary_value(marker), original)
         if platform.read() != expected:
             raise ValueError("NVRAM stage readback mismatch")
     except Exception:
@@ -254,6 +302,8 @@ def rollback(directory, marker, platform, save, sync):
             raise ValueError("unstaged NVRAM differs from original")
     else:
         check_unconfigured(current.get("boot-args", b""))
+        if CANARY_KEY in current:
+            raise ValueError("unstaged persistence canary")
     return "unstaged"
 
 
@@ -264,9 +314,9 @@ def receipt_summary(data):
         return {"status": data["status"]}
     if (data.get("cause") not in ("stage_failure", "preintent_abort", "postboot") or
             not isinstance(data.get("actual_boot_uuid"), str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", data["actual_boot_uuid"]) or
-            data.get("nvram_before_restore") not in ("staged", "original")):
+            not valid_key_states(data.get("nvram_key_states")) or data.get("nvram_before_restore") != whole_state(data["nvram_key_states"])):
         return {"status": "invalid"}
-    return {key: data[key] for key in ("status", "cause", "actual_boot_uuid", "nvram_before_restore")}
+    return {key: data[key] for key in ("status", "cause", "actual_boot_uuid", "nvram_before_restore", "nvram_key_states")}
 
 
 def finish(directory, marker, platform, save, sync, *, current_boot_uuid, inventory=True):
@@ -292,14 +342,15 @@ def finish(directory, marker, platform, save, sync, *, current_boot_uuid, invent
     except ValueError:
         facts["active_bootargs_status"] = "invalid"
 
-    def record(state):
+    def record(state, states):
         path = directory / "debug-boot-observed.json"
         if path.exists():
             previous = json.loads(path.read_text())
             if (not isinstance(previous, dict) or previous.get("marker") != marker or
                     previous.get("current_boot_uuid") != current_boot_uuid or previous.get("active_bootargs_status") not in
                     ("observed_no_debug", "observed_debug", "unavailable", "invalid") or
-                    previous.get("nvram_before_restore") not in ("staged", "original") or
+                    not valid_key_states(previous.get("nvram_key_states"), allow_other=True) or
+                    previous.get("nvram_before_restore") != whole_state(previous["nvram_key_states"]) or
                     not (previous.get("active_debug_mask") is None or
                          type(previous["active_debug_mask"]) is int and 0 <= previous["active_debug_mask"] <= 0xffffffff)):
                 raise ValueError("debug observation invalid")
@@ -307,14 +358,18 @@ def finish(directory, marker, platform, save, sync, *, current_boot_uuid, invent
                 raise ValueError("debug observation inconsistent")
             if type(previous.get("restored_marker_preexisting")) is not bool:
                 raise ValueError("restoration observation invalid")
-            facts.update({key: previous[key] for key in ("active_bootargs_status", "active_debug_mask", "nvram_before_restore", "restored_marker_preexisting")})
+            facts.update({key: previous[key] for key in ("active_bootargs_status", "active_debug_mask", "nvram_before_restore", "nvram_key_states", "restored_marker_preexisting")})
             facts["restore_receipt"] = receipt_summary(previous.get("restore_receipt"))
         else:
             facts["nvram_before_restore"] = state
+            facts["nvram_key_states"] = states
             save(path, json.dumps({"marker": marker, **facts}).encode())
             sync(directory)
 
-    restore(directory, marker, platform, save, sync, before_restore=record, cause="postboot", current_boot_uuid=current_boot_uuid)
+    try:
+        restore(directory, marker, platform, save, sync, before_restore=record, cause="postboot", current_boot_uuid=current_boot_uuid)
+    except ForeignNVRAM:
+        return {**facts, "nvram_restored": False}
     return {**facts, "nvram_restored": True, **(platform.inventory() if inventory else {})}
 
 
