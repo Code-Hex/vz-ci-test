@@ -2,6 +2,7 @@ import importlib.util
 import os
 from pathlib import Path
 import plistlib
+import stat
 import subprocess
 import sys
 import tempfile
@@ -69,7 +70,7 @@ class Preflight(unittest.TestCase):
             time.sleep(0.01)
             os.chmod(path, before['mode'] ^ 0o100)
             os.chmod(path, before['mode'])
-            with self.assertRaises(ValueError): p.replace_if_expected(path, before, b'staged')
+            with self.assertRaises(ValueError): p.write_if_expected(path, before, b'staged')
             self.assertEqual(path.read_bytes(), b'original')
 
     def test_snapshot_restores_original_timestamps_after_readback(self):
@@ -77,26 +78,58 @@ class Preflight(unittest.TestCase):
             root = Path(tmp).resolve(); path = root / 'boot.plist'
             path.write_bytes(b'original')
             before = p.snapshot(path)
-            staged = p.replace_if_expected(path, before, b'staged')
-            restored = p.replace_if_expected(path, staged, b'original')
+            staged = p.write_if_expected(path, before, b'staged')
+            restored = p.write_if_expected(path, staged, b'original')
+            self.assertTrue(p.metadata_preserved(before, restored))
             self.assertTrue(p.restore_times(path, restored, before['atime_ns'], before['mtime_ns']))
             after = path.stat()
             self.assertEqual((after.st_atime_ns, after.st_mtime_ns), (before['atime_ns'], before['mtime_ns']))
 
-    def test_existing_xattr_is_not_clean(self):
+    def test_xattrs_benign_flag_group_and_inode_survive(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp).resolve() / 'file'
             path.write_bytes(b'fixture')
             subprocess.run(['/usr/bin/xattr', '-w', 'com.example.fixture', 'value', str(path)], check=True, capture_output=True)
-            self.assertFalse(p.clean_metadata(path, p.snapshot(path)))
+            os.chflags(path, stat.UF_NODUMP)
+            before = p.snapshot(path)
+            staged = p.write_if_expected(path, before, b'changed')
+            self.assertEqual(staged['ino'], before['ino'])
+            self.assertEqual(staged['gid'], before['gid'])
+            self.assertEqual(staged['flags'], before['flags'])
+            self.assertEqual((staged['xattr_count'], staged['xattr_sha256']), (before['xattr_count'], before['xattr_sha256']))
+            subprocess.run(['/usr/bin/xattr', '-w', 'com.example.fixture', 'foreign', str(path)], check=True, capture_output=True)
+            with self.assertRaises(ValueError): p.write_if_expected(path, staged, b'original')
+
+    def test_compressed_flags_or_attribute_are_rejected(self):
+        checks = {'uid_root': True, 'mode_0644': True, 'nlink_one': True, 'write_blocking_flags_absent': True,
+                  'compression_absent': True, 'xattrs_bounded': True, 'acl_empty': True, 'identity_stable': True}
+        self.assertTrue(p.metadata_allowed({'checks': checks, 'observed': {'gid': 20, 'flags': 1}}))
+        self.assertFalse(p.metadata_allowed({'checks': {**checks, 'compression_absent': False}, 'observed': {'gid': 20, 'flags': 32}}))
+
+    def test_oversize_new_content_is_rejected_before_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp).resolve() / 'file'; path.write_bytes(b'original')
+            before = p.snapshot(path)
+            with self.assertRaises(ValueError): p.write_if_expected(path, before, b'x' * (1024 * 1024 + 1))
+            self.assertEqual(path.read_bytes(), b'original')
+
+    def test_partial_write_is_uncertain_and_never_self_restores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp).resolve() / 'file'; path.write_bytes(b'original')
+            before = p.snapshot(path)
+            def partial(fd, data, offset):
+                os.pwrite(fd, data[:1], offset)
+                raise OSError('simulated partial write')
+            with self.assertRaises(p.WriteUncertain): p.write_if_expected(path, before, b'changed', writer=partial)
+            self.assertNotEqual(path.read_bytes(), b'original')
 
     def test_no_symlink_or_foreign_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve(); path = root / 'boot.plist'
             old = b'original'; path.write_bytes(old); before = p.snapshot(path)
-            staged = p.replace_if_expected(path, before, b'staged')
+            staged = p.write_if_expected(path, before, b'staged')
             path.write_bytes(b'foreign')
-            with self.assertRaises(ValueError): p.replace_if_expected(path, staged, old)
+            with self.assertRaises(ValueError): p.write_if_expected(path, staged, old)
             self.assertEqual(path.read_bytes(), b'foreign')
             (root / 'link').symlink_to(path)
             with self.assertRaises(OSError): p.snapshot(root / 'link')

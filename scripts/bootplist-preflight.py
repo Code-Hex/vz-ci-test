@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
+import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
 import plistlib
 import re
-import secrets
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -28,7 +29,7 @@ class UpdateUncertain(Exception):
         self.returncode = returncode
 
 
-class ReplacementUncertain(Exception):
+class WriteUncertain(Exception):
     pass
 
 
@@ -77,20 +78,59 @@ def parent_fd(path):
         os.close(fd); raise
 
 
+def xattr_fingerprint(fd):
+    libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    libc.flistxattr.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc.flistxattr.restype = ctypes.c_ssize_t
+    libc.fgetxattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+    libc.fgetxattr.restype = ctypes.c_ssize_t
+    length = libc.flistxattr(fd, None, 0, 0x20)
+    if length < 0: raise OSError(ctypes.get_errno(), 'flistxattr')
+    if length > 8192: raise ValueError('xattrs_oversize')
+    names = []
+    if length:
+        data = ctypes.create_string_buffer(length)
+        if libc.flistxattr(fd, data, length, 0x20) != length: raise ValueError('xattrs_changed')
+        raw = data.raw
+        if not raw.endswith(b'\0'): raise ValueError('xattrs_invalid')
+        names = raw[:-1].split(b'\0')
+        if len(names) > 64 or len(set(names)) != len(names) or any(not name or len(name) > 127 for name in names):
+            raise ValueError('xattrs_invalid')
+    digest = hashlib.sha256()
+    total = 0
+    for name in sorted(names):
+        size = libc.fgetxattr(fd, name, None, 0, 0, 0x20)
+        if size < 0: raise OSError(ctypes.get_errno(), 'fgetxattr')
+        total += size
+        if size > 65536 or total > 131072: raise ValueError('xattrs_oversize')
+        value = ctypes.create_string_buffer(size) if size else None
+        if libc.fgetxattr(fd, name, value, size, 0, 0x20) != size: raise ValueError('xattrs_changed')
+        digest.update(struct.pack('>HI', len(name), size)); digest.update(name)
+        if size: digest.update(value.raw)
+    return len(names), digest.hexdigest(), b'com.apple.decmpfs' in names
+
+
+def snapshot_fd(fd):
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_size > 1024 * 1024: raise ValueError('file_invalid')
+    raw = os.pread(fd, st.st_size, 0)
+    count, fingerprint, compressed = xattr_fingerprint(fd)
+    after = os.fstat(fd)
+    if (len(raw) != st.st_size or after.st_size != st.st_size or after.st_mtime_ns != st.st_mtime_ns or
+            after.st_ctime_ns != st.st_ctime_ns or after.st_dev != st.st_dev or after.st_ino != st.st_ino):
+        raise ValueError('file_changed')
+    return {'raw': raw, 'dev': st.st_dev, 'ino': st.st_ino, 'uid': st.st_uid, 'gid': st.st_gid,
+            'mode': stat.S_IMODE(st.st_mode), 'nlink': st.st_nlink, 'flags': getattr(st, 'st_flags', 0),
+            'atime_ns': st.st_atime_ns, 'mtime_ns': st.st_mtime_ns, 'ctime_ns': st.st_ctime_ns,
+            'xattr_count': count, 'xattr_sha256': fingerprint, 'compressed_xattr': compressed}
+
+
 def snapshot(path):
     directory = parent_fd(path)
     try:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        with os.fdopen(fd, 'rb') as stream:
-            st = os.fstat(stream.fileno())
-            if not stat.S_ISREG(st.st_mode) or st.st_size > 1024 * 1024: raise ValueError('file_invalid')
-            raw = stream.read(st.st_size)
-            after = os.fstat(stream.fileno())
-            if (len(raw) != st.st_size or after.st_size != st.st_size or after.st_mtime_ns != st.st_mtime_ns or
-                    after.st_ctime_ns != st.st_ctime_ns): raise ValueError('file_changed')
-            return {'raw': raw, 'dev': st.st_dev, 'ino': st.st_ino, 'uid': st.st_uid, 'gid': st.st_gid,
-                    'mode': stat.S_IMODE(st.st_mode), 'nlink': st.st_nlink, 'flags': getattr(st, 'st_flags', 0),
-                    'atime_ns': st.st_atime_ns, 'mtime_ns': st.st_mtime_ns, 'ctime_ns': st.st_ctime_ns}
+        try: return snapshot_fd(fd)
+        finally: os.close(fd)
     finally: os.close(directory)
 
 
@@ -104,57 +144,90 @@ def select_preboot(paths):
 
 
 def same(a, b):
-    return all(a[key] == b[key] for key in ('raw', 'dev', 'ino', 'uid', 'gid', 'mode', 'nlink', 'flags', 'mtime_ns', 'ctime_ns'))
+    return all(a[key] == b[key] for key in ('raw', 'dev', 'ino', 'uid', 'gid', 'mode', 'nlink', 'flags', 'mtime_ns', 'ctime_ns', 'xattr_count', 'xattr_sha256', 'compressed_xattr'))
 
 
-def replace_if_expected(path, expected, content):
-    if not same(snapshot(path), expected): raise ValueError('foreign_file')
+def write_if_expected(path, expected, content, *, writer=os.pwrite):
+    if not isinstance(content, bytes) or len(content) > 1024 * 1024: raise ValueError('content_oversize')
     directory = parent_fd(path)
-    name = '.vz-preflight-' + secrets.token_hex(16)
-    rename_attempted = False
+    fd = None
+    writing = False
     try:
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-        with os.fdopen(fd, 'wb') as stream:
-            stream.write(content); stream.flush()
-            os.fchown(stream.fileno(), expected['uid'], expected['gid'])
-            os.fchmod(stream.fileno(), expected['mode'])
-            os.utime(stream.fileno(), ns=(expected['atime_ns'], expected['mtime_ns']))
-            os.fsync(stream.fileno())
-        temp_path = path.parent / name
-        temp_state = snapshot(temp_path)
-        if any(temp_state[k] != expected[k] for k in ('uid', 'gid', 'mode', 'nlink', 'flags')) or not clean_metadata(temp_path, temp_state):
-            raise ValueError('temporary_metadata_invalid')
-        if not restore_times(temp_path, temp_state, expected['atime_ns'], expected['mtime_ns']):
-            raise ValueError('temporary_times_invalid')
-        if not same(snapshot(path), expected): raise ValueError('foreign_file')
-        rename_attempted = True
-        os.replace(name, path.name, src_dir_fd=directory, dst_dir_fd=directory)
-        os.fsync(directory)
-        return snapshot(path)
+        fd = os.open(path.name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        if not same(snapshot_fd(fd), expected) or not same(snapshot(path), expected): raise ValueError('foreign_file')
+        if not acl_empty(path): raise ValueError('metadata_unsupported')
+        if not same(snapshot_fd(fd), expected) or not same(snapshot(path), expected): raise ValueError('foreign_file')
+        writing = True
+        offset = 0
+        while offset < len(content):
+            count = writer(fd, content[offset:], offset)
+            if not isinstance(count, int) or count <= 0: raise OSError('short_write')
+            offset += count
+        os.ftruncate(fd, len(content))
+        os.fsync(fd)
+        actual = snapshot_fd(fd)
+        if (actual['raw'] != content or any(actual[k] != expected[k] for k in
+                ('dev', 'ino', 'uid', 'gid', 'mode', 'nlink', 'flags', 'xattr_count', 'xattr_sha256', 'compressed_xattr'))):
+            raise ValueError('write_mismatch')
+        if not acl_empty(path) or not same(snapshot(path), actual) or not same(snapshot_fd(fd), actual):
+            raise ValueError('write_mismatch')
+        return actual
     except BaseException as error:
-        if rename_attempted: raise ReplacementUncertain() from error
+        if writing: raise WriteUncertain() from error
         raise
     finally:
-        try: os.unlink(name, dir_fd=directory)
-        except OSError: pass
-        os.close(directory)
+        close_failed = False
+        for opened in (fd, directory):
+            if opened is not None:
+                try: os.close(opened)
+                except OSError: close_failed = True
+        if close_failed:
+            if writing: raise WriteUncertain()
+            raise OSError('close_failed')
+
+
+def metadata_preserved(original, current):
+    return all(current[k] == original[k] for k in
+               ('dev', 'ino', 'uid', 'gid', 'mode', 'nlink', 'flags', 'xattr_count', 'xattr_sha256', 'compressed_xattr'))
 
 
 def restore_times(path, expected, atime_ns, mtime_ns):
     if not same(snapshot(path), expected): raise ValueError('foreign_file')
     directory = parent_fd(path)
+    fd = None
+    setting = False
     try:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        try:
-            st = os.fstat(fd)
-            if (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size) != (expected['dev'], expected['ino'], expected['mtime_ns'], expected['ctime_ns'], len(expected['raw'])):
-                raise ValueError('foreign_file')
-            os.utime(fd, ns=(atime_ns, mtime_ns))
-            os.fsync(fd)
-            st = os.fstat(fd)
-            return st.st_atime_ns == atime_ns and st.st_mtime_ns == mtime_ns
-        finally: os.close(fd)
-    finally: os.close(directory)
+        if not same(snapshot_fd(fd), expected) or not acl_empty(path) or not same(snapshot(path), expected):
+            raise ValueError('foreign_file')
+        setting = True
+        os.utime(fd, ns=(atime_ns, mtime_ns))
+        os.fsync(fd)
+        st = os.fstat(fd)
+        count, digest, compressed = xattr_fingerprint(fd)
+        named = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        if ((st.st_dev, st.st_ino, st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_nlink,
+             getattr(st, 'st_flags', 0), count, digest, compressed) !=
+            (expected['dev'], expected['ino'], expected['uid'], expected['gid'], expected['mode'],
+             expected['nlink'], expected['flags'], expected['xattr_count'], expected['xattr_sha256'], expected['compressed_xattr']) or
+            (named.st_dev, named.st_ino) != (st.st_dev, st.st_ino) or
+            st.st_atime_ns != atime_ns or st.st_mtime_ns != mtime_ns or not acl_empty(path)):
+            raise ValueError('times_or_metadata_mismatch')
+        after = os.fstat(fd)
+        if after.st_ctime_ns != st.st_ctime_ns: raise ValueError('file_changed')
+        return True
+    except BaseException as error:
+        if setting: raise WriteUncertain() from error
+        raise
+    finally:
+        close_failed = False
+        for opened in (fd, directory):
+            if opened is not None:
+                try: os.close(opened)
+                except OSError: close_failed = True
+        if close_failed:
+            if setting: raise WriteUncertain()
+            raise OSError('close_failed')
 
 
 def guarded():
@@ -176,31 +249,30 @@ def read_plist(args):
     return plistlib.loads(boot.capture(args, 4 * 1024 * 1024, 15))
 
 
-def metadata_facts(path, original):
-    result = {'uid_root': original['uid'] == 0, 'gid_root': original['gid'] == 0,
-              'mode_0644': original['mode'] == 0o644, 'nlink_one': original['nlink'] == 1,
-              'flags_zero': original['flags'] == 0, 'xattrs_empty': None, 'acl_empty': None,
-              'identity_stable': False}
-    try:
-        attrs = boot.capture(['/usr/bin/xattr', str(path)], 4096, 5)
-        result['xattrs_empty'] = not bool(attrs.strip())
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
+def acl_empty(path):
     try:
         acl = boot.capture(['/bin/ls', '-lde', str(path)], 8192, 5)
-        result['acl_empty'] = len(acl.splitlines()) == 1
+        return len(acl.splitlines()) == 1
     except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    try:
-        result['identity_stable'] = same(snapshot(path), original)
-    except (OSError, ValueError):
-        pass
-    return result
+        return False
 
 
-def clean_metadata(path, original):
-    facts = metadata_facts(path, original)
-    return facts['xattrs_empty'] is True and facts['acl_empty'] is True and facts['identity_stable'] is True
+def metadata_facts(path, original):
+    denied = stat.UF_IMMUTABLE | stat.UF_APPEND | stat.SF_IMMUTABLE | stat.SF_APPEND
+    checks = {'uid_root': original['uid'] == 0, 'mode_0644': original['mode'] == 0o644,
+              'nlink_one': original['nlink'] == 1, 'write_blocking_flags_absent': original['flags'] & denied == 0,
+              'compression_absent': not (original['flags'] & stat.UF_COMPRESSED or original['compressed_xattr']),
+              'xattrs_bounded': True, 'acl_empty': acl_empty(path), 'identity_stable': False}
+    try: checks['identity_stable'] = same(snapshot(path), original)
+    except (OSError, ValueError): pass
+    return {'checks': checks, 'observed': {'gid': original['gid'], 'flags': original['flags'],
+            'xattr_count': original['xattr_count'], 'xattr_sha256': original['xattr_sha256']}}
+
+
+def metadata_allowed(facts):
+    checks = facts.get('checks', {})
+    return all(checks.get(key) is True for key in ('uid_root', 'mode_0644', 'nlink_one',
+               'write_blocking_flags_absent', 'compression_absent', 'xattrs_bounded', 'acl_empty', 'identity_stable'))
 
 
 def wait_for_update(child, record, timeout=30):
@@ -236,7 +308,7 @@ def update_preboot(record):
 REASONS = frozenset(('group_invalid', 'groups_invalid', 'group_ambiguous', 'system_ambiguous',
                      'plist_invalid', 'flags_invalid', 'existing_debug_configuration', 'flags_mismatch',
                      'metadata_unsupported', 'path_invalid', 'file_invalid', 'file_changed', 'preboot_ambiguous',
-                     'foreign_file', 'temporary_metadata_invalid', 'temporary_times_invalid', 'artifact_unavailable',
+                     'foreign_file', 'content_oversize', 'xattrs_oversize', 'xattrs_changed', 'xattrs_invalid', 'artifact_unavailable',
                      'update_failed'))
 
 
@@ -266,7 +338,8 @@ def main():
     result = {'phase': 'initial', 'status': 'incomplete', 'restoration': 'not_started',
               'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
               'head_sha': os.environ['GITHUB_SHA'], 'kernel_uuid': UUID,
-              'source_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+              'source_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              'bootargs_source_sha256': hashlib.sha256(Path(boot.__file__).read_bytes()).hexdigest()}
     def report(phase):
         result['phase'] = phase
         temp = output.with_suffix('.tmp')
@@ -297,7 +370,7 @@ def main():
         data_flags, pre_flags = flags(original['raw']), flags(pre_original['raw'])
         if data_flags != pre_flags: raise ValueError('flags_mismatch')
         result['metadata'] = metadata_facts(DATA, original)
-        if not all(value is True for value in result['metadata'].values()): raise ValueError('metadata_unsupported')
+        if not metadata_allowed(result['metadata']): raise ValueError('metadata_unsupported')
         staged_raw = stage_content(original['raw'])
         for name, content in (('original.plist', original['raw']), ('original-metadata.json', json.dumps({k:v for k,v in original.items() if k != 'raw'}).encode())):
             fd = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -308,14 +381,16 @@ def main():
         finally: os.close(dfd)
         result['data_original_sha256'] = hashlib.sha256(original['raw']).hexdigest()
         result['preboot_original_sha256'] = hashlib.sha256(pre_original['raw']).hexdigest()
-        if not report('before_data_replace'): raise ValueError('artifact_unavailable')
-        staged = replace_if_expected(DATA, original, staged_raw)
+        if not report('before_data_write'): raise ValueError('artifact_unavailable')
+        staged = write_if_expected(DATA, original, staged_raw)
         changed = True
         result['data_staged_sha256'] = hashlib.sha256(staged_raw).hexdigest()
+        if not same(snapshot(DATA), staged): raise ValueError('foreign_file')
         if not report('before_update'): raise ValueError('artifact_unavailable')
         result['first_update'] = update_preboot(report)
         report('after_update')
         if result['first_update'] not in ('returned_zero', 'returned_zero_late'): raise ValueError('update_failed')
+        if not same(snapshot(DATA), staged): raise ValueError('foreign_file')
         selected_path, updated = select_preboot(paths)
         result['preboot_staged_match'] = selected_path == pre_path and flags(updated['raw'], allow_debug=True) == flags(staged_raw, allow_debug=True)
         result['status'] = 'observed'
@@ -324,8 +399,8 @@ def main():
         result['update_error'] = update_error_fact(error)
         result['restoration'] = 'uncertain'
         changed = False
-    except ReplacementUncertain:
-        result['status'] = 'replacement_uncertain'
+    except WriteUncertain:
+        result['status'] = 'write_uncertain'
         result['restoration'] = 'uncertain'
         changed = False
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
@@ -335,21 +410,22 @@ def main():
         if changed:
             try:
                 report('before_restore')
-                restored = replace_if_expected(DATA, staged, original['raw'])
-                result['restoration'] = 'data_replaced'
+                restored = write_if_expected(DATA, staged, original['raw'])
+                result['restoration'] = 'data_written'
+                if not same(snapshot(DATA), restored): raise ValueError('foreign_file')
                 report('before_restore_update')
                 result['restore_update'] = update_preboot(report)
                 checked = snapshot(DATA)
                 result['data_original_bytes_match'] = checked['raw'] == original['raw'] and same(checked, restored)
                 selected_path, updated = select_preboot(paths)
                 result['preboot_original_flags_match'] = selected_path == pre_path and flags(updated['raw']) == pre_flags
-                result['data_metadata_match'] = all(checked[k] == original[k] for k in ('uid', 'gid', 'mode', 'nlink', 'flags', 'mtime_ns'))
+                result['data_metadata_match'] = metadata_preserved(original, checked)
                 result['data_timestamps_match'] = restore_times(DATA, checked, original['atime_ns'], original['mtime_ns'])
                 result['restoration'] = 'verified' if (result['restore_update'] in ('returned_zero', 'returned_zero_late') and result['data_original_bytes_match'] and result['preboot_original_flags_match'] and result['data_metadata_match'] and result['data_timestamps_match']) else 'failed'
             except UpdateUncertain as error:
                 result['restoration'] = 'uncertain'
                 result['restore_update_error'] = update_error_fact(error)
-            except ReplacementUncertain:
+            except WriteUncertain:
                 result['restoration'] = 'uncertain'
             except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
                 result['restoration'] = 'failed_or_foreign'
