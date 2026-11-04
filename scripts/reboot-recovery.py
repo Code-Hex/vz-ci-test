@@ -4,6 +4,7 @@ import base64
 import hashlib
 import recovery_reports
 import recovery_bootargs
+import recovery_bootplist
 import recovery_arrival
 import json
 import os
@@ -34,6 +35,8 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[1-9][0-9]{0,19}", str(ctx.get("run_id", "")))) and
               bool(re.fullmatch(r"[1-9][0-9]{0,4}", str(ctx.get("attempt", "")))) and
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
+              ctx.get("debug_source") in ("nvram", "bootplist") and
+              (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
     return bool(common and machine == "x86_64" and
@@ -108,7 +111,8 @@ def reboot_observed(before, after):
 
 
 def mode_matches(data, pending, ctx):
-    return (data.get("trigger", "reboot") == ctx.get("trigger", "reboot") and
+    return (data.get("debug_source") in ("nvram", "bootplist") and data.get("debug_source") == ctx.get("debug_source") and
+            data.get("trigger", "reboot") == ctx.get("trigger", "reboot") and
             type(data.get("debug_boot", False)) is bool and
             data.get("debug_boot", False) == ctx.get("debug_boot", False) and
             data.get("cert_fingerprint", "") == pending.get("cert_fingerprint", ""))
@@ -133,14 +137,25 @@ def boot_proof_matches(data, pending, ctx):
             data.get("baseline_boot_uuid") == pending["baseline_boot_uuid"] and
             reboot_observed(pending["baseline_boot_uuid"], data.get("current_boot_uuid")) and
             (not ctx.get("debug_boot", False) or
-             debug_boot_proven(data.get("debug_boot_facts")) and
+             debug_boot_proven(data.get("debug_boot_facts"), ctx["debug_source"]) and
              data["debug_boot_facts"].get("current_boot_uuid") == data.get("current_boot_uuid")))
 
 
-def debug_boot_proven(facts):
+def debug_restored(facts, source):
+    if source == "nvram":
+        return facts.get("nvram_restored") is True
+    expected = {name: {"bytes": True, "metadata": True, "timestamps": True} for name in ("data", "preboot")}
+    return (source == "bootplist" and facts.get("bootplist_restored") is True and
+            facts.get("bootplist_restore") == expected and
+            isinstance(facts.get("bootplist_file_states"), dict) and
+            set(facts["bootplist_file_states"]) == {"data", "preboot"} and
+            all(value in ("original", "staged") for value in facts["bootplist_file_states"].values()))
+
+
+def debug_boot_proven(facts, source):
     return (isinstance(facts, dict) and type(facts.get("active_debug_mask")) is int and
             facts["active_debug_mask"] == 0x2000 and facts.get("active_bootargs_status") == "observed_debug" and
-            facts.get("nvram_restored") is True)
+            debug_restored(facts, source))
 
 
 def panic_envelope_matches(data, ciphertext, pending, ctx):
@@ -198,7 +213,8 @@ def context_from_env():
             "ref": os.getenv("GITHUB_REF", ""), "event": os.getenv("GITHUB_EVENT_NAME", ""),
             "runner_environment": os.getenv("RUNNER_ENVIRONMENT", ""), "run_id": os.getenv("GITHUB_RUN_ID", ""),
             "attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""), "sha": os.getenv("GITHUB_SHA", ""),
-            "trigger": trigger, "debug_boot": recovery_bootargs.requested(os.getenv("RECOVERY_DEBUG_BOOT", ""), trigger)}
+            "trigger": trigger, "debug_source": os.getenv("RECOVERY_DEBUG_SOURCE", "nvram"),
+            "debug_boot": recovery_bootargs.requested(os.getenv("RECOVERY_DEBUG_BOOT", ""), trigger)}
 
 
 def require_context(ctx, expected_system):
@@ -341,7 +357,7 @@ def prepare_root(payload):
         helper_sha = ""
     nvram_helper_sha = ""
     nvram_source_sha = ""
-    if ctx.get("debug_boot") and ctx.get("trigger") == "reboot-quick":
+    if ctx.get("debug_boot") and ctx.get("trigger") == "reboot-quick" and ctx["debug_source"] == "nvram":
         helper_path = payload.get("nvram_helper", "")
         nvram_source_sha = payload.get("nvram_source_sha256", "")
         if (not isinstance(helper_path, str) or not os.path.isabs(helper_path) or
@@ -371,7 +387,7 @@ def prepare_root(payload):
         raise ValueError("empty boot session")
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "public_key", "binding": binding(ctx),
                           "nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public,
-                          "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "cert_fingerprint": fingerprint})
+                          "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "debug_source": ctx["debug_source"], "cert_fingerprint": fingerprint})
     check = api("POST", CHECKS, token, {"name": "Runner recovery " + ctx["run_id"], "head_sha": ctx["sha"],
                 "external_id": binding(ctx), "status": "in_progress",
                 "output": {"title": "Awaiting controller", "summary": summary}})
@@ -386,6 +402,7 @@ def prepare_root(payload):
     private_write(directory / "recovery.py", Path(__file__).read_bytes())
     private_write(directory / "recovery_reports.py", Path(recovery_reports.__file__).read_bytes())
     private_write(directory / "recovery_bootargs.py", Path(recovery_bootargs.__file__).read_bytes())
+    private_write(directory / "recovery_bootplist.py", Path(recovery_bootplist.__file__).read_bytes())
     private_write(directory / "recovery_arrival.py", Path(recovery_arrival.__file__).read_bytes())
     private_write(directory / "arrival.sh", recovery_arrival.render(config, directory))
     sync_directory(directory)
@@ -474,10 +491,10 @@ def debug_boot_marker(config):
 
 
 def debug_source_identity():
-    return hashlib.sha256(Path(__file__).read_bytes() + b"\0" + Path(recovery_bootargs.__file__).read_bytes()).hexdigest()
+    return hashlib.sha256(Path(__file__).read_bytes() + b"\0" + Path(recovery_bootargs.__file__).read_bytes() + b"\0" + Path(recovery_bootplist.__file__).read_bytes()).hexdigest()
 
 
-DEBUG_EVENTS = ("request", "staged", "native_inflight", "native_synced", "native_failed", "rollback_inflight", "rollback_cleanup", "intent", "returned", "uncertain", "aborted")
+DEBUG_EVENTS = ("request", "staged", "bootplist_inflight", "bootplist_staged", "native_inflight", "native_synced", "native_failed", "rollback_inflight", "rollback_cleanup", "intent", "returned", "uncertain", "aborted")
 DEBUG_REASONS = ("stage_failure", "orphan_stage", "timeout", "interrupted", "exec_error", "rollback_failed", "intent_storage_error", "intent_ack_failure")
 
 
@@ -498,6 +515,11 @@ def read_debug_event(directory, config, event):
         result["reason"] = record["reason"]
     if record.get("nvram_before_rollback") in ("staged", "original", "partial", "unstaged"):
         result["nvram_before_rollback"] = record["nvram_before_rollback"]
+    if event == "bootplist_staged":
+        fact = record.get("bootplist_stage")
+        if config["context"]["debug_source"] != "bootplist" or fact != {"data": "staged", "preboot": "staged", "metadata_preserved": True}:
+            raise ValueError("boot plist stage evidence invalid")
+        result["bootplist_stage"] = fact
     if event == "native_synced":
         fact = record.get("native_sync")
         if not valid_native_sync(fact, config):
@@ -808,6 +830,10 @@ def debug_owner(directory, config, current):
                 return
         except (OSError, ValueError, KeyError):
             return
+    source = config["context"]["debug_source"]
+    if source == "bootplist" and (directory / "debug-reboot-bootplist_inflight.json").exists():
+        read_debug_event(directory, config, "bootplist_inflight")
+        return
     platform = recovery_bootargs.MacPlatform()
     marker = debug_boot_marker(config)
     reason = "orphan_stage" if (directory / "debug-boot-stage.json").exists() else "stage_failure"
@@ -816,9 +842,14 @@ def debug_owner(directory, config, current):
             raise ValueError("prior preintent stage interrupted")
         if not recovery_bootargs.csr_allowed():
             raise ValueError("kernel debugging not permitted")
-        recovery_bootargs.stage(directory, marker, platform, private_write, sync_directory)
+        if source == "bootplist":
+            debug_event(directory, config, "bootplist_inflight", current)
+            fact = recovery_bootplist.stage(directory, marker, private_write, sync_directory)
+            debug_event(directory, config, "bootplist_staged", current, bootplist_stage=fact)
+        else:
+            recovery_bootargs.stage(directory, marker, platform, private_write, sync_directory)
         debug_event(directory, config, "staged", current)
-        if config["context"].get("trigger") == "reboot-quick":
+        if source == "nvram" and config["context"].get("trigger") == "reboot-quick":
             debug_event(directory, config, "native_inflight", current)
             try:
                 fact = native_force_sync(directory, config, platform)
@@ -835,11 +866,18 @@ def debug_owner(directory, config, current):
             debug_event(directory, config, "native_synced", current, native_sync=fact)
         prepared = quick_prepare(directory, config) if config["context"].get("trigger") == "reboot-quick" else None
         debug_event(directory, config, "intent", current)
+    except recovery_bootplist.WriteUncertain:
+        return
     except BaseException:
         if (directory / "debug-reboot-intent.json").exists():
             debug_event(directory, config, "uncertain", current, reason="intent_storage_error")
             return
         try:
+            if source == "bootplist":
+                if (directory / "bootplist-manifest.json").exists():
+                    recovery_bootplist.rollback(directory, marker, private_write, sync_directory, current_boot_uuid=boot_uuid())
+                debug_event(directory, config, "aborted", current, reason=reason)
+                return
             state = recovery_bootargs.rollback(directory, marker, platform, private_write, sync_directory)
             if config["context"].get("trigger") == "reboot-quick" and (directory / "debug-boot-original.plist").exists():
                 debug_event(directory, config, "rollback_inflight", current)
@@ -847,7 +885,7 @@ def debug_owner(directory, config, current):
                 debug_event(directory, config, "rollback_cleanup", current, sync_result=cleanup)
                 print(json.dumps({"event": "rollback_cleanup", **cleanup}), flush=True)
             debug_event(directory, config, "aborted", current, reason=reason, nvram_before_rollback=state)
-        except NativeSyncUncertain:
+        except (NativeSyncUncertain, recovery_bootplist.WriteUncertain):
             return
         except BaseException:
             debug_event(directory, config, "aborted", current, reason="rollback_failed")
@@ -1066,11 +1104,13 @@ def quick_prepare(directory, config):
 
 def quick_intent_ack(directory, config, prepared):
     if (config.get("debug_boot") is not True or config["context"].get("trigger") != "reboot-quick" or
-            prepared.get("phase") != "quick_prepared"):
+            prepared.get("phase") != "quick_prepared" or not mode_matches(prepared, {}, config["context"])):
         raise ValueError("quick intent context mismatch")
+    source = config["context"]["debug_source"]
+    evidence = "bootplist_staged" if source == "bootplist" else "native_synced"
     intent = {**prepared, "phase": "quick_intent",
-              "owner_events": [read_debug_event(directory, config, event) for event in ("staged", "native_synced", "intent")]}
-    if not valid_native_sync(intent["owner_events"][1].get("native_sync"), config):
+              "owner_events": [read_debug_event(directory, config, event) for event in ("staged", evidence, "intent")]}
+    if source == "nvram" and not valid_native_sync(intent["owner_events"][1].get("native_sync"), config):
         raise ValueError("native sync evidence mismatch")
     output = {"title": "Quick reboot intent durable", "summary": json.dumps(intent), "text": ""}
     url = CHECKS + "/" + str(config["check_id"])
@@ -1168,7 +1208,7 @@ def publish_debug_core(directory, config, current, facts, token):
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "boot_core", "binding": binding(ctx),
                           "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
                           "trigger": ctx.get("trigger", "reboot"), "cert_fingerprint": config.get("cert_fingerprint", ""),
-                          "debug_boot": True, "debug_boot_facts": facts})
+                          "debug_boot": True, "debug_source": ctx["debug_source"], "debug_boot_facts": facts})
     output = {"title": "Boot core recovered", "summary": summary, "text": ""}
     url = CHECKS + "/" + str(config["check_id"])
     api("PATCH", url, token, {"status": "in_progress", "output": output})
@@ -1189,14 +1229,23 @@ def collect(directory):
     debug_facts = {}
     if reboot_observed(config["baseline"], current) and config.get("debug_boot", False):
         try:
-            debug_facts = recovery_bootargs.finish(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory,
-                                                   current_boot_uuid=current, inventory=False)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            debug_facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "nvram_restored": False, "current_boot_uuid": current,
-                           "nvram_before_restore": "unavailable", "nvram_key_states": {"boot_args": "unavailable", "canary": "unavailable"},
-                           "debugger_count": None, "debugger_inventory_status": "unavailable",
-                           "network_inventory_status": "unavailable", "virtio_network_classes": [],
-                           "nic_inventory_status": "unsupported", "kernel_debug_state": {}}
+            if config["context"]["debug_source"] == "bootplist":
+                debug_facts = recovery_bootplist.finish(directory, debug_boot_marker(config), private_write, sync_directory,
+                                                        current_boot_uuid=current)
+            else:
+                debug_facts = recovery_bootargs.finish(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory,
+                                                       current_boot_uuid=current, inventory=False)
+        except (OSError, ValueError, subprocess.SubprocessError, recovery_bootplist.WriteUncertain):
+            debug_facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "current_boot_uuid": current}
+            if config["context"]["debug_source"] == "bootplist":
+                debug_facts.update({"bootplist_restored": False, "bootplist_restore": {},
+                                    "bootplist_file_states": {"data": "unavailable", "preboot": "unavailable"}})
+            else:
+                debug_facts.update({"nvram_restored": False, "nvram_before_restore": "unavailable",
+                                    "nvram_key_states": {"boot_args": "unavailable", "canary": "unavailable"},
+                                    "debugger_count": None, "debugger_inventory_status": "unavailable",
+                                    "network_inventory_status": "unavailable", "virtio_network_classes": [],
+                                    "nic_inventory_status": "unsupported", "kernel_debug_state": {}})
         debug_facts["owner_events"] = []
         for event in DEBUG_EVENTS:
             if (directory / ("debug-reboot-" + event + ".json")).exists():
@@ -1213,7 +1262,7 @@ def collect(directory):
             summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "armed", "binding": binding(config["context"]),
                                   "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"],
                                   "trigger": config["context"].get("trigger", "reboot"),
-                                  "debug_boot": config.get("debug_boot", False),
+                                  "debug_boot": config.get("debug_boot", False), "debug_source": config["context"]["debug_source"],
                                   "cert_fingerprint": config.get("cert_fingerprint", "")})
             api("PATCH", CHECKS + "/" + str(config["check_id"]), token,
                 {"output": {"title": "Recovery daemon ready", "summary": summary}})
@@ -1230,7 +1279,7 @@ def collect(directory):
             debug_facts = dict(publish_debug_core(directory, config, current, debug_facts, token))
         except (OSError, ValueError, urllib.error.URLError):
             return
-        if debug_facts.get("nvram_restored") is True:
+        if debug_restored(debug_facts, config["context"]["debug_source"]):
             try:
                 optional = recovery_bootargs.observe_once(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(),
                                                           private_write, sync_directory, current_boot_uuid=current)
@@ -1252,13 +1301,13 @@ def collect(directory):
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": binding(config["context"]),
                           "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
                           "trigger": config["context"].get("trigger", "reboot"), "cert_fingerprint": config.get("cert_fingerprint", ""),
-                          "debug_boot": config.get("debug_boot", False), "debug_boot_facts": debug_facts,
+                          "debug_boot": config.get("debug_boot", False), "debug_source": config["context"]["debug_source"], "debug_boot_facts": debug_facts,
                           "capture_state": capture_state,
                           "cipher_sha256": envelope["cipher_sha256"] if envelope else "",
                           "note": "Boot UUID changed; no stopped-CPU GPR proof."})
     successful = config["context"].get("trigger", "reboot") in ("reboot", "reboot-quick") or capture_state == "captured"
     if config.get("debug_boot", False):
-        successful = successful and debug_boot_proven(debug_facts)
+        successful = successful and debug_boot_proven(debug_facts, config["context"]["debug_source"])
     output = {"title": "Recovery observed" if successful else "Panic report unavailable", "summary": summary}
     if envelope:
         output["text"] = envelope["ciphertext"]
@@ -1268,6 +1317,7 @@ def collect(directory):
                   "phase": "boot_observed", "binding": binding(config["context"]), "nonce": config["nonce"],
                   "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
                   "trigger": config["context"].get("trigger", "reboot"), "cert_fingerprint": config.get("cert_fingerprint", ""),
+                  "debug_boot": config.get("debug_boot", False), "debug_source": config["context"]["debug_source"],
                   "capture_state": "oversized"})}
     payload = {"status": "completed", "conclusion": "success" if successful else "failure", "output": output}
     while time.monotonic() < deadline:
@@ -1398,7 +1448,7 @@ def controller(ctx, token):
                             proof = True
                             return
                         raise ValueError("check completed without boot proof")
-                    if data.get("phase") == "public_key" and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx) and data.get("trigger", "reboot") == ctx.get("trigger", "reboot") and type(data.get("debug_boot", False)) is bool and data.get("debug_boot", False) == ctx.get("debug_boot", False):
+                    if data.get("phase") == "public_key" and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx) and data.get("trigger", "reboot") == ctx.get("trigger", "reboot") and type(data.get("debug_boot", False)) is bool and data.get("debug_boot", False) == ctx.get("debug_boot", False) and data.get("debug_source") == ctx["debug_source"]:
                         nonce, baseline, public = data.get("nonce", ""), data.get("baseline_boot_uuid", ""), data.get("public_key", "")
                         if not re.fullmatch(r"[0-9a-f]{64}", nonce) or not re.fullmatch(r"[0-9A-Fa-f-]{36}", baseline):
                             raise ValueError("nonce or baseline invalid")
@@ -1415,7 +1465,7 @@ def controller(ctx, token):
                             raise ValueError("public key metadata changed")
                         sealed_summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "sealed_token", "binding": binding(ctx),
                                                      "nonce": nonce, "baseline_boot_uuid": baseline, "ciphertext": pending["ciphertext"],
-                                                     "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False),
+                                                     "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "debug_source": ctx["debug_source"],
                                                      "cert_fingerprint": fingerprint})
                         api("PATCH", CHECKS + "/" + str(check_id), token,
                             {"output": {"title": "Controller credential sealed", "summary": sealed_summary}})
@@ -1471,7 +1521,7 @@ def main():
                             "quick_helper": os.environ.pop("RECOVERY_QUICK_HELPER", ""),
                             "nvram_helper": os.environ.pop("RECOVERY_NVRAM_HELPER", ""),
                             "nvram_source_sha256": hashlib.sha256(Path("probes/nvram_backend.c").read_bytes()).hexdigest()
-                            if ctx.get("debug_boot") and ctx.get("trigger") == "reboot-quick" else ""}, timeout=120), end="", flush=True)
+                            if ctx.get("debug_boot") and ctx.get("trigger") == "reboot-quick" and ctx["debug_source"] == "nvram" else ""}, timeout=120), end="", flush=True)
         elif op == "arm":
             print(sudo_call("arm-root", {"context": ctx, "token": token}, timeout=510), end="", flush=True)
             deadline = time.monotonic() + 20

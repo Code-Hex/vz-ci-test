@@ -14,6 +14,22 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def test_debug_source_context_is_explicit_and_bound(self):
+        base = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
+                'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,
+                'trigger': 'reboot-quick', 'debug_boot': True, 'debug_source': 'nvram'}
+        self.assertTrue(r.valid_context(base, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        self.assertTrue(r.valid_context({**base, 'debug_source': 'bootplist'}, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        missing = {key: value for key, value in base.items() if key != 'debug_source'}
+        for invalid in (missing, {**base, 'debug_source': 'unknown'},
+                        {**base, 'debug_source': 'bootplist', 'debug_boot': False},
+                        {**base, 'debug_source': 'bootplist', 'trigger': 'reboot'}):
+            self.assertFalse(r.valid_context(invalid, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        data = {'trigger': 'reboot-quick', 'debug_boot': True, 'debug_source': 'nvram'}
+        self.assertTrue(r.mode_matches(data, {}, base))
+        self.assertFalse(r.mode_matches({key: value for key, value in data.items() if key != 'debug_source'}, {}, base))
+        self.assertFalse(r.mode_matches({**data, 'debug_source': 'bootplist'}, {}, base))
+
     def cleanup_cli(self, *, check_id="126520221299", token="test-job-token", status="in_progress", system="Linux", repo="Code-Hex/vz-ci-test"):
         old_sha = "a" * 40
         check = {"id": 126520221299, "name": "Runner recovery 41814026408", "head_sha": old_sha,
@@ -63,7 +79,7 @@ class Recovery(unittest.TestCase):
                 self.cleanup_cli(**options)
 
     def test_guard(self):
-        ctx = {"actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "2",
+        ctx = {"debug_source": "nvram", "actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "2",
                "sha": "a" * 40, "ref": "refs/heads/main", "event": "workflow_dispatch",
                "runner_environment": "github-hosted"}
         self.assertTrue(r.valid_context(ctx, "Darwin", "x86_64", r.KERNEL_UUID))
@@ -86,7 +102,7 @@ class Recovery(unittest.TestCase):
         self.assertIsNone(r.safe_force_return('secret'))
 
     def test_quick_trigger_and_return_facts_are_bound_and_redacted(self):
-        ctx = {"actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "1", "sha": "a" * 40,
+        ctx = {"debug_source": "nvram", "actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "1", "sha": "a" * 40,
                "ref": "refs/heads/main", "event": "workflow_dispatch", "runner_environment": "github-hosted",
                "trigger": "reboot-quick", "debug_boot": False}
         self.assertTrue(r.valid_context(ctx, "Darwin", "x86_64", r.KERNEL_UUID))
@@ -95,9 +111,9 @@ class Recovery(unittest.TestCase):
         fact = r.safe_quick_return('raw-secret\n{"event":"quick_reboot_unexpected_return","result":-1,"errno":1,"token":"raw-secret"}')
         self.assertEqual(fact, {"event": "quick_reboot_unexpected_return", "result": -1, "errno": 1})
         self.assertIsNone(r.safe_quick_return('{"event":"quick_reboot_unexpected_return","result":true,"errno":1}'))
-        self.assertFalse(r.mode_matches({"trigger": "reboot"}, {}, ctx))
+        self.assertFalse(r.mode_matches({"debug_source": "nvram", "trigger": "reboot"}, {}, ctx))
         pending = {"nonce": "n", "baseline_boot_uuid": "old"}
-        data = {"protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": r.binding(ctx),
+        data = {"debug_source": "nvram", "protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": r.binding(ctx),
                 "nonce": "n", "baseline_boot_uuid": "old", "current_boot_uuid": "new", "trigger": "reboot-quick"}
         self.assertTrue(r.boot_proof_matches(data, pending, ctx))
         self.assertFalse(r.boot_proof_matches(dict(data, phase="quick_prepared"), pending, ctx))
@@ -111,7 +127,7 @@ class Recovery(unittest.TestCase):
         def forbidden(*_args, **_kwargs):
             self.fail("quick trigger used the normal reboot path")
         with patch.object(r.sys, "argv", ["reboot-recovery.py", "trigger"]), \
-                patch.object(r, "context_from_env", lambda: {"trigger": "reboot-quick", "debug_boot": False}), \
+                patch.object(r, "context_from_env", lambda: {"debug_source": "nvram", "trigger": "reboot-quick", "debug_boot": False}), \
                 patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
                 patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), contextlib.redirect_stdout(io.StringIO()):
             r.main()
@@ -125,7 +141,7 @@ class Recovery(unittest.TestCase):
         def forbidden(*_args, **_kwargs):
             self.fail("debug quick parent directly executed reset")
         with patch.object(r.sys, "argv", ["reboot-recovery.py", "trigger"]), \
-                patch.object(r, "context_from_env", lambda: {"trigger": "reboot-quick", "debug_boot": True}), \
+                patch.object(r, "context_from_env", lambda: {"debug_source": "nvram", "trigger": "reboot-quick", "debug_boot": True}), \
                 patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
                 patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), \
                 patch.object(r.time, "sleep", lambda seconds: calls.append(("wait", seconds))), contextlib.redirect_stdout(io.StringIO()):
@@ -136,7 +152,7 @@ class Recovery(unittest.TestCase):
         for acknowledged in (True, False):
             with self.subTest(acknowledged=acknowledged), tempfile.TemporaryDirectory() as tmp:
                 directory, events, output = Path(tmp), [], io.StringIO()
-                ctx = {"actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "1", "sha": "a" * 40,
+                ctx = {"debug_source": "nvram", "actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "1", "sha": "a" * 40,
                        "ref": "refs/heads/main", "event": "workflow_dispatch", "runner_environment": "github-hosted",
                        "trigger": "reboot-quick", "debug_boot": False}
                 helper = directory / "reboot-quick"
@@ -144,7 +160,7 @@ class Recovery(unittest.TestCase):
                 config = {"context": ctx, "baseline": "old", "nonce": "n", "check_id": 9, "cert_fingerprint": "",
                           "helper_sha256": r.hashlib.sha256(helper.read_bytes()).hexdigest()}
                 r.private_write(directory / "token", b"private-token")
-                initial = {"protocol": "vz-recovery-v1", "phase": "armed", "binding": r.binding(ctx), "nonce": "n",
+                initial = {"debug_source": "nvram", "protocol": "vz-recovery-v1", "phase": "armed", "binding": r.binding(ctx), "nonce": "n",
                            "baseline_boot_uuid": "old", "trigger": "reboot-quick", "debug_boot": False, "cert_fingerprint": ""}
                 check = {"id": 9, "name": "Runner recovery 123", "external_id": r.binding(ctx), "head_sha": ctx["sha"],
                          "app": {"id": 15368, "slug": "github-actions"}, "details_url": "https://github.com/Code-Hex/vz-ci-test/runs/9",
@@ -200,7 +216,7 @@ class Recovery(unittest.TestCase):
         self.assertEqual(r.root_error_kind('unstructured SECRET'), "unknown")
 
     def test_force_reset_marker_and_guard(self):
-        ctx = {"actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "1",
+        ctx = {"debug_source": "nvram", "actions": "true", "repo": "Code-Hex/vz-ci-test", "run_id": "123", "attempt": "1",
                "sha": "a" * 40, "ref": "refs/heads/main", "event": "workflow_dispatch",
                "runner_environment": "github-hosted", "trigger": "panic-force-reset"}
         self.assertTrue(r.valid_context(ctx, "Darwin", "x86_64", r.KERNEL_UUID))
@@ -225,9 +241,9 @@ class Recovery(unittest.TestCase):
                 r.recovery_bootargs.requested(value, trigger)
 
     def test_debug_boot_proof_requires_mask_restore_and_mode_binding(self):
-        ctx = {"run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True}
+        ctx = {"debug_source": "nvram", "run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True}
         pending = {"nonce": "n", "baseline_boot_uuid": "old"}
-        data = {"protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": r.binding(ctx),
+        data = {"debug_source": "nvram", "protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": r.binding(ctx),
                 "nonce": "n", "baseline_boot_uuid": "old", "current_boot_uuid": "new", "debug_boot": True,
                 "debug_boot_facts": {"active_debug_mask": 0x2000, "active_bootargs_status": "observed_debug", "nvram_restored": True,
                                      "current_boot_uuid": "new",
@@ -259,7 +275,7 @@ class Recovery(unittest.TestCase):
         def forbidden(*_args, **_kwargs):
             self.fail("runner parent performed debug mutation or reboot")
         with patch.object(r.sys, "argv", ["reboot-recovery.py", "reboot"]), \
-                patch.object(r, "context_from_env", lambda: {"trigger": "reboot", "debug_boot": True}), \
+                patch.object(r, "context_from_env", lambda: {"debug_source": "nvram", "trigger": "reboot", "debug_boot": True}), \
                 patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
                 patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -275,15 +291,109 @@ class Recovery(unittest.TestCase):
         def forbidden(*_args, **_kwargs):
             self.fail("runner parent mutated debug state")
         with patch.object(r.sys, "argv", ["reboot-recovery.py", "reboot"]), \
-                patch.object(r, "context_from_env", lambda: {"trigger": "reboot", "debug_boot": True}), \
+                patch.object(r, "context_from_env", lambda: {"debug_source": "nvram", "trigger": "reboot", "debug_boot": True}), \
                 patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
                 patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), \
                 patch.object(r.time, "sleep", lambda seconds: calls.append(("wait", seconds))), contextlib.redirect_stdout(io.StringIO()):
             r.main()
         self.assertEqual(calls, ["verify-root", "debug-request-root", ("wait", 90)])
 
+    def test_bootplist_proof_requires_file_restoration(self):
+        facts = {"active_debug_mask": 0x2000, "active_bootargs_status": "observed_debug",
+                 "nvram_restored": True}
+        self.assertTrue(r.debug_boot_proven(facts, "nvram"))
+        self.assertFalse(r.debug_boot_proven(facts, "bootplist"))
+        facts.pop("nvram_restored")
+        facts.update({"bootplist_restored": True, "bootplist_file_states": {"data": "staged", "preboot": "original"},
+                      "bootplist_restore": {name: {"bytes": True, "metadata": True, "timestamps": True} for name in ("data", "preboot")}})
+        self.assertTrue(r.debug_boot_proven(facts, "bootplist"))
+        self.assertFalse(r.debug_boot_proven(facts, "nvram"))
+        for invalid in ({"active_debug_mask": None}, {"bootplist_restored": False},
+                        {"bootplist_file_states": {"data": "staged", "preboot": "other"}},
+                        {"bootplist_restore": {}}):
+            self.assertFalse(r.debug_boot_proven({**facts, **invalid}, "bootplist"))
+
+    def test_bootplist_owner_ack_precedes_single_reboot_without_nvram(self):
+        for uncertain in (False, True):
+            with self.subTest(uncertain=uncertain), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config, _platform, _original = self.owner_fixture(directory)
+                config["context"].update(debug_source="bootplist", trigger="reboot-quick")
+                events = []
+                def stage(*_args):
+                    events.append("stage")
+                    if uncertain:
+                        raise r.recovery_bootplist.WriteUncertain()
+                    return {"data": "staged", "preboot": "staged", "metadata_preserved": True}
+                def prepared(*_args):
+                    events.append("prepared")
+                    return {"phase": "quick_prepared"}
+                def acknowledged(_directory, _config, value):
+                    self.assertTrue((directory / "debug-reboot-intent.json").exists())
+                    evidence = r.read_debug_event(directory, config, "bootplist_staged")
+                    self.assertTrue(evidence["bootplist_stage"]["metadata_preserved"])
+                    events.append("ack")
+                    return value
+                def reboot(*_args, **_kwargs):
+                    events.append("reboot")
+                    return {"returncode": 1}
+                def forbidden(*_args, **_kwargs):
+                    self.fail("unexpected NVRAM operation or uncertain rollback")
+                with patch.object(r.recovery_bootargs, "csr_allowed", lambda: True), \
+                        patch.object(r.recovery_bootargs, "stage", forbidden), \
+                        patch.object(r.recovery_bootargs, "rollback", forbidden), \
+                        patch.object(r.recovery_bootplist, "stage", stage), \
+                        patch.object(r.recovery_bootplist, "rollback", forbidden), \
+                        patch.object(r, "native_force_sync", forbidden), \
+                        patch.object(r, "quick_prepare", prepared), \
+                        patch.object(r, "quick_intent_ack", acknowledged), \
+                        patch.object(r, "quick_reboot_child", reboot):
+                    r.debug_owner(directory, config, "old")
+                    r.debug_owner(directory, config, "old")
+                self.assertEqual(events, ["stage"] if uncertain else ["stage", "prepared", "ack", "reboot"])
+                self.assertEqual((directory / "debug-reboot-intent.json").exists(), not uncertain)
+
+    def test_bootplist_collection_restores_before_ack_and_inventory(self):
+        for restored in (True, False):
+            with self.subTest(restored=restored), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config, _platform, _original = self.owner_fixture(directory)
+                config["context"].update(debug_source="bootplist", trigger="reboot-quick")
+                config["check_id"] = 9
+                r.private_write(directory / "token", b"synthetic-token")
+                r.private_write(directory / "ready.json", r.json.dumps({"baseline": "old", "nonce": config["nonce"], "preboot_patch": True}).encode())
+                events = []
+                def finish(*_args, **_kwargs):
+                    events.append("restore")
+                    if not restored:
+                        raise r.recovery_bootplist.WriteUncertain()
+                    return {"current_boot_uuid": "new", "active_debug_mask": 0x2000, "active_bootargs_status": "observed_debug",
+                            "bootplist_restored": True, "bootplist_file_states": {"data": "staged", "preboot": "staged"},
+                            "bootplist_restore": {name: {"bytes": True, "metadata": True, "timestamps": True} for name in ("data", "preboot")}}
+                def core(_directory, _config, _current, facts, _token):
+                    self.assertNotIn("nvram_restored", facts)
+                    self.assertEqual(facts["bootplist_restored"], restored)
+                    events.append("ack")
+                    return facts
+                def inventory(*_args, **_kwargs):
+                    events.append("inventory")
+                    return {}
+                def api(_method, _url, _token, payload, **_kwargs):
+                    events.append(payload["conclusion"])
+                    error = r.urllib.error.HTTPError("https://api.github.com", 401, "test refusal", {}, None)
+                    self.addCleanup(error.close)
+                    raise error
+                def forbidden(*_args, **_kwargs):
+                    self.fail("file collection used NVRAM restoration")
+                with patch.object(r, "load_config", lambda _: config), patch.object(r, "boot_uuid", lambda: "new"), \
+                        patch.object(r.recovery_bootplist, "finish", finish), patch.object(r.recovery_bootargs, "finish", forbidden), \
+                        patch.object(r, "publish_debug_core", core), patch.object(r.recovery_bootargs, "observe_once", inventory), \
+                        patch.object(r, "api", api):
+                    r.collect(directory)
+                self.assertEqual(events, ["restore", "ack", "inventory", "success"] if restored else ["restore", "ack", "failure"])
+
     def owner_fixture(self, directory):
-        config = {"context": {"run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True, "trigger": "reboot"},
+        config = {"debug_source": "nvram", "context": {"debug_source": "nvram", "run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True, "trigger": "reboot"},
                   "debug_boot": True, "baseline": "old", "nonce": "b" * 64, "debug_source_identity": r.debug_source_identity()}
         original = {"boot-args": b"preempt=10"}
         class Platform:
@@ -425,7 +535,7 @@ class Recovery(unittest.TestCase):
             helper.write_bytes(b'synthetic helper')
             config = {'baseline': 'old', 'nonce': 'b' * 64,
                       'nvram_helper_sha256': r.hashlib.sha256(helper.read_bytes()).hexdigest(),
-                      'context': {'actions': 'true', 'event': 'workflow_dispatch', 'repo': 'Code-Hex/vz-ci-test',
+                      'context': {"debug_source": "nvram", 'actions': 'true', 'event': 'workflow_dispatch', 'repo': 'Code-Hex/vz-ci-test',
                                   'ref': 'refs/heads/main', 'runner_environment': 'github-hosted',
                                   'run_id': '123', 'attempt': '1', 'sha': 'a' * 40, 'trigger': 'reboot-quick'}}
             with patch.object(r, 'boot_uuid', lambda: 'old'), patch.object(r.subprocess, 'Popen', side_effect=KeyboardInterrupt()):
@@ -594,15 +704,15 @@ class Recovery(unittest.TestCase):
             self.assertFalse((directory / "debug-reboot-intent.json").exists())
 
     def test_quick_intent_canonical_ack_preserves_prepared_and_filters_owner_fields(self):
-        for acknowledged in (True, False):
+        for source, acknowledged in (("nvram", True), ("nvram", False), ("bootplist", True), ("bootplist", False)):
             with self.subTest(acknowledged=acknowledged), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 config, _platform, _original = self.owner_fixture(directory)
-                config["context"]["trigger"] = "reboot-quick"
+                config["context"].update(trigger="reboot-quick", debug_source=source)
                 config["check_id"] = 9
                 config.update({"nvram_helper_sha256": "a" * 64, "nvram_source_sha256": "b" * 64})
                 ctx = config["context"]
-                prepared = {"protocol": "vz-recovery-v1", "phase": "quick_prepared", "binding": r.binding(ctx),
+                prepared = {"debug_source": source, "protocol": "vz-recovery-v1", "phase": "quick_prepared", "binding": r.binding(ctx),
                             "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "trigger": "reboot-quick",
                             "debug_boot": True, "cert_fingerprint": "", "quick_flags": 1024, "helper_sha256": "c" * 64,
                             "permission_verified": False}
@@ -611,7 +721,11 @@ class Recovery(unittest.TestCase):
                     r.debug_event(directory, config, event, "old")
                 native_fact = r.native_sync_fact(b'{"event":"sync","status":"returned","ioreturn":0}', 0,
                     {"boot_args": "staged", "canary": "staged"}, {"boot_args": "staged", "canary": "staged"}, "a" * 64, "b" * 64)
-                r.debug_event(directory, config, "native_synced", "old", native_sync=native_fact)
+                evidence = "native_synced" if source == "nvram" else "bootplist_staged"
+                if source == "nvram":
+                    r.debug_event(directory, config, evidence, "old", native_sync=native_fact)
+                else:
+                    r.debug_event(directory, config, evidence, "old", bootplist_stage={"data": "staged", "preboot": "staged", "metadata_preserved": True})
                 path = directory / "debug-reboot-staged.json"
                 raw = r.json.loads(path.read_text())
                 path.write_text(r.json.dumps({**raw, "raw": "private-not-published"}))
@@ -637,7 +751,7 @@ class Recovery(unittest.TestCase):
                 summary = r.json.loads(sent["output"]["summary"])
                 self.assertEqual({key: summary[key] for key in prepared if key != "phase"},
                                  {key: value for key, value in prepared.items() if key != "phase"})
-                self.assertEqual([event["event"] for event in summary["owner_events"]], ["staged", "native_synced", "intent"])
+                self.assertEqual([event["event"] for event in summary["owner_events"]], ["staged", evidence, "intent"])
                 self.assertNotIn("private-not-published", sent["output"]["summary"])
 
     def test_quick_timeout_retains_same_child_until_exit_without_kill(self):
@@ -645,7 +759,7 @@ class Recovery(unittest.TestCase):
             with self.subTest(interruption=type(interruption).__name__), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 config, _platform, _original = self.owner_fixture(directory)
-                config["context"].update({"actions": "true", "event": "workflow_dispatch", "repo": "Code-Hex/vz-ci-test",
+                config["context"].update({"debug_source": "nvram", "actions": "true", "event": "workflow_dispatch", "repo": "Code-Hex/vz-ci-test",
                                           "ref": "refs/heads/main", "runner_environment": "github-hosted", "trigger": "reboot-quick"})
                 helper = directory / "reboot-quick"
                 helper.write_bytes(b"synthetic helper")
@@ -738,7 +852,7 @@ class Recovery(unittest.TestCase):
         def run(command, **kwargs):
             calls.append((command, kwargs))
         with patch.object(r.sys, "argv", ["reboot-recovery.py", "reboot"]), \
-                patch.object(r, "context_from_env", lambda: {"trigger": "reboot", "debug_boot": False}), \
+                patch.object(r, "context_from_env", lambda: {"debug_source": "nvram", "trigger": "reboot", "debug_boot": False}), \
                 patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
                 patch.object(r.os, "sync", lambda: calls.append("sync")), patch.object(r.subprocess, "run", run), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -746,7 +860,7 @@ class Recovery(unittest.TestCase):
         self.assertEqual(calls, ["verify-root", "sync", (["/usr/bin/sudo", "-n", "/sbin/reboot"], {"check": True, "timeout": 15})])
 
     def test_debug_controller_stop_does_not_overwrite_new_core_after_stale_get(self):
-        ctx = {"run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True}
+        ctx = {"debug_source": "nvram", "run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True}
         armed = {"id": 9, "name": "Runner recovery 123", "external_id": r.binding(ctx), "head_sha": ctx["sha"],
                  "app": {"id": 15368, "slug": "github-actions"}, "details_url": "https://github.com/Code-Hex/vz-ci-test/runs/9",
                  "status": "in_progress", "output": {"summary": '{"phase":"armed"}'}}
@@ -784,14 +898,14 @@ class Recovery(unittest.TestCase):
                 r.encrypt_token(invalid, "test-job-token")
 
     def test_sealed_retry_and_boot_proof_match_nonce_and_baseline(self):
-        ctx = {"run_id": "123", "attempt": "2", "sha": "a" * 40}
+        ctx = {"debug_source": "nvram", "run_id": "123", "attempt": "2", "sha": "a" * 40}
         pending = {"nonce": "b" * 64, "baseline_boot_uuid": "first", "ciphertext": "cipher"}
-        data = {"protocol": "vz-recovery-v1", "binding": r.binding(ctx), "phase": "sealed_token", **pending}
+        data = {"debug_source": "nvram", "protocol": "vz-recovery-v1", "binding": r.binding(ctx), "phase": "sealed_token", **pending}
         self.assertTrue(r.sealed_matches(data, pending, ctx))
         self.assertFalse(r.sealed_matches(dict(data, ciphertext="other"), pending, ctx))
-        proof = {"protocol": "vz-recovery-v1", "binding": r.binding(ctx), "phase": "boot_observed",
+        proof = {"debug_source": "nvram", "protocol": "vz-recovery-v1", "binding": r.binding(ctx), "phase": "boot_observed",
                  "nonce": pending["nonce"], "baseline_boot_uuid": "first", "current_boot_uuid": "second"}
-        armed = {"protocol": "vz-recovery-v1", "binding": r.binding(ctx), "phase": "armed", "nonce": pending["nonce"], "baseline_boot_uuid": "first"}
+        armed = {"debug_source": "nvram", "protocol": "vz-recovery-v1", "binding": r.binding(ctx), "phase": "armed", "nonce": pending["nonce"], "baseline_boot_uuid": "first"}
         self.assertTrue(r.armed_matches(armed, pending, ctx))
         self.assertFalse(r.armed_matches(dict(armed, baseline_boot_uuid="other"), pending, ctx))
         self.assertTrue(r.boot_proof_matches(proof, pending, ctx))
@@ -802,9 +916,9 @@ class Recovery(unittest.TestCase):
     def test_panic_proof_requires_matching_ciphertext(self):
         import base64
         import hashlib
-        ctx = {"run_id": "123", "attempt": "1", "sha": "a" * 40, "trigger": "panic-control"}
+        ctx = {"debug_source": "nvram", "run_id": "123", "attempt": "1", "sha": "a" * 40, "trigger": "panic-control"}
         pending = {"nonce": "b" * 64, "baseline_boot_uuid": "old", "cert_fingerprint": "c" * 64}
-        data = {"protocol": "vz-recovery-v1", "binding": r.binding(ctx), "phase": "boot_observed", "nonce": pending["nonce"],
+        data = {"debug_source": "nvram", "protocol": "vz-recovery-v1", "binding": r.binding(ctx), "phase": "boot_observed", "nonce": pending["nonce"],
                 "baseline_boot_uuid": "old", "current_boot_uuid": "new", "trigger": "panic-control",
                 "cert_fingerprint": pending["cert_fingerprint"], "capture_state": "captured", "cipher_sha256": hashlib.sha256(b"cipher").hexdigest()}
         encoded = base64.b64encode(b"cipher").decode()
@@ -835,7 +949,7 @@ class Recovery(unittest.TestCase):
         self.assertFalse(r.cleanup_eligible(dict(old, details_url="https://evil.example"), "126478800449", current))
 
     def test_binding_exact_and_no_duplicate(self):
-        ctx = {"run_id": "123", "attempt": "2", "sha": "a" * 40}
+        ctx = {"debug_source": "nvram", "run_id": "123", "attempt": "2", "sha": "a" * 40}
         check = {"id": 9, "name": "Runner recovery 123", "external_id": r.binding(ctx),
                  "head_sha": ctx["sha"], "app": {"slug": "github-actions", "id": 15368},
                  "details_url": "https://github.com/Code-Hex/vz-ci-test/runs/9", "status": "in_progress"}

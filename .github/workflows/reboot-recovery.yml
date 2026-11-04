@@ -23,6 +23,14 @@ on:
         required: false
         type: boolean
         default: false
+      debug_source:
+        description: Boot argument source for the debug quick reboot
+        required: false
+        type: choice
+        options:
+          - nvram
+          - bootplist
+        default: nvram
       report_cert:
         description: Public recipient certificate for encrypted panic reports
         required: false
@@ -40,6 +48,7 @@ jobs:
     env:
       RECOVERY_TRIGGER: ${{ inputs.trigger || 'reboot' }}
       RECOVERY_DEBUG_BOOT: ${{ inputs.debug_boot && '1' || '0' }}
+      RECOVERY_DEBUG_SOURCE: ${{ inputs.debug_source }}
     permissions:
       contents: read
       checks: write
@@ -61,6 +70,7 @@ jobs:
     env:
       RECOVERY_TRIGGER: ${{ inputs.trigger || 'reboot' }}
       RECOVERY_DEBUG_BOOT: ${{ inputs.debug_boot && '1' || '0' }}
+      RECOVERY_DEBUG_SOURCE: ${{ inputs.debug_source }}
     permissions:
       contents: read
       checks: write
@@ -77,7 +87,7 @@ jobs:
         if: ${{ inputs.trigger == 'reboot-quick' }}
         run: xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -std=c11 -Wall -Wextra -Werror -O1 probes/reboot_quick.c -o "$RUNNER_TEMP/recovery-quick-reboot"
       - name: Build the guarded NVRAM synchronization helper
-        if: ${{ inputs.debug_boot && inputs.trigger == 'reboot-quick' }}
+        if: ${{ inputs.debug_boot && inputs.trigger == 'reboot-quick' && inputs.debug_source == 'nvram' }}
         run: xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -std=c11 -Wall -Wextra -Werror -O1 probes/nvram_backend.c -framework IOKit -framework CoreFoundation -o "$RUNNER_TEMP/recovery-nvram-backend"
       - name: Publish the runner recovery public key
         env:
