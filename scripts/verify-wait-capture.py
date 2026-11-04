@@ -235,6 +235,18 @@ def ready_snapshot():
                 x.get("error_seen") == 0 and sequence_valid(x, 2) for i, x in enumerate(waits)))
 
 
+def report_gate(stage):
+    snapshot = last_snapshot
+    for cpu, wait in zip(snapshot["cpus"], snapshot["waits"]):
+        report({"event": "control_cpu", "stage": stage, "snapshot": snapshot["snapshot"],
+                "mach_before_write_ns": snapshot["mach_before_write_ns"],
+                "mach_after_write_ns": snapshot["mach_after_write_ns"],
+                "export_timestamp_ns": snapshot["export_timestamp_ns"], "record": cpu,
+                "wait_validation": {key: wait.get(key) for key in (
+                    "coherent", "trustworthy", "counter_transport_valid", "invalid_count", "error_seen")},
+                "dropped": dropped})
+
+
 def timer_fact(phase, attempt, value):
     if value.get("api") in {"probe_start", "owner_thread_id", "hv_vcpu_run_until", "guest_observation",
                             "timer_guest_state", "sentinel_spin_verified", "sentinel_hlt_timer_verified",
@@ -333,12 +345,15 @@ def main():
                               str(header["pid"]), str(header["address"]), str(header["fd"])], "sampler-dtrace.jsonl")
         until(lambda: trace.root_pid and trace.proc.poll() is None and helper.proc.poll() is None and ready_snapshot() and fresh_advanced and wait_positive, 30, "fresh four-CPU / natural wait control missing")
         report({"event": "sampler_control_pass", "dropped": dropped})
-        if run_timer("timer-spin", 20, (helper, trace)) != "success":
+        report_gate("before_linux" if linux else "before_spin")
+        if not linux and run_timer("timer-spin", 20, (helper, trace)) != "success":
             raise RuntimeError("spin control failed")
         if not ready_snapshot() or helper.proc.poll() is not None or trace.proc.poll() is not None:
-            raise RuntimeError("sampler no longer ready after spin")
+            raise RuntimeError("sampler no longer ready before workload")
         if linux and time.monotonic() - helper_started > 35:
             raise RuntimeError("sampler duration insufficient for Linux timeout")
+        if not linux:
+            report_gate("before_hlt")
         result = run_linux(binary, 200, (helper, trace)) if linux else run_timer("timer-hlt", 45, (helper, trace))
         if result == "success" and (not ready_snapshot() or helper.proc.poll() is not None or trace.proc.poll() is not None):
             raise RuntimeError("observer invalid at workload completion")
