@@ -14,6 +14,123 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def test_runtime_watch_identity_and_check_are_strict(self):
+        config, saved, _b3 = self.followup_fixture()
+        identity = r.runtime_watch_identity(config, saved['scope'], 'f' * 64)
+        check = {'id': 17, 'name': 'Runtime heartbeat 123', 'head_sha': 'a' * 40,
+                 'external_id': r.runtime_watch_external(identity),
+                 'app': {'id': 15368, 'slug': 'github-actions'},
+                 'details_url': 'https://github.com/Code-Hex/vz-ci-test/runs/17'}
+        self.assertTrue(r.runtime_watch_check(check, identity, 17))
+        for change in ({'id': 18}, {'head_sha': 'b' * 40}, {'external_id': 'other'},
+                       {'name': 'Runner recovery 123'}, {'app': {'id': 1, 'slug': 'github-actions'}}):
+            self.assertFalse(r.runtime_watch_check({**check, **change}, identity, 17))
+        with self.assertRaises(ValueError):
+            r.runtime_watch_identity(config, {**saved['scope'], 'debug_boot_uuid': config['baseline']}, 'f' * 64)
+
+    def test_runtime_watch_release_requires_exact_trigger(self):
+        config, saved, _b3 = self.followup_fixture()
+        identity = r.runtime_watch_identity(config, saved['scope'], 'f' * 64)
+        release = {'scope': saved['scope'], 'helper_sha256': 'f' * 64,
+                   'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
+        raw = r.json.dumps(release).encode()
+        self.assertEqual(r.runtime_watch_release(raw, raw, identity), r.hashlib.sha256(raw).hexdigest())
+        for change in ({'ready': False}, {'helper_pid': True}, {'tracer_pid': 123},
+                       {'helper_sha256': '0' * 64}, {'extra': 'private'},
+                       {'scope': {**saved['scope'], 'nonce': '0' * 64}}):
+            with self.assertRaises(ValueError):
+                r.runtime_watch_release(r.json.dumps({**release, **change}).encode(), raw, identity)
+        with self.assertRaises(ValueError):
+            r.runtime_watch_release(raw, b'{}', identity)
+
+    def test_runtime_watch_stage_needs_local_release_evidence(self):
+        config, saved, _b3 = self.followup_fixture()
+        identity = r.runtime_watch_identity(config, saved['scope'], 'f' * 64)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'panic-control').mkdir()
+            before = ('before_release', None)
+            self.assertEqual(r.runtime_watch_stage(directory, identity, before), before)
+            record = {'scope': saved['scope'], 'helper_sha256': 'f' * 64,
+                      'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
+            raw = r.json.dumps(record).encode()
+            r.private_write(directory / 'panic-control' / 'release-attempt.json', raw)
+            r.private_write(directory / 'panic-followup-trigger.json', raw)
+            observed = r.runtime_watch_stage(directory, identity, before)
+            self.assertEqual(observed, ('release_observed', r.hashlib.sha256(raw).hexdigest()))
+            (directory / 'panic-control' / 'release-attempt.json').unlink()
+            self.assertEqual(r.runtime_watch_stage(directory, identity, observed), observed)
+            r.private_write(directory / 'panic-control' / 'release-attempt.json', b'{}')
+            self.assertEqual(r.runtime_watch_stage(directory, identity, before), ('invalid', None))
+
+    def test_runtime_watch_ready_requires_same_live_child_and_budget(self):
+        config, saved, _b3 = self.followup_fixture()
+        identity = r.runtime_watch_identity(config, saved['scope'], 'f' * 64)
+        receipt = {'identity': identity, 'check_id': 17, 'pid': 123, 'started_monotonic': 10.0,
+                   'deadline_monotonic': 130.0, 'acknowledged': True}
+        self.assertEqual(r.runtime_watch_ready(receipt, identity, 123, 9.0, 20.0), 130.0)
+        for change in ({'pid': 456}, {'acknowledged': False}, {'deadline_monotonic': float('inf')},
+                       {'check_id': True}, {'identity': {**identity, 'helper_sha256': '0' * 64}}):
+            with self.assertRaises(ValueError):
+                r.runtime_watch_ready({**receipt, **change}, identity, 123, 9.0, 20.0)
+        with self.assertRaises(ValueError):
+            r.runtime_watch_ready(receipt, identity, 123, 9.0, 71.0)
+
+    def test_runtime_watch_reaper_waits_for_a_real_child(self):
+        child = subprocess.Popen([r.sys.executable, '-c', 'pass'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        waiter = r.reap_runtime_watch(child)
+        waiter.join(3)
+        self.assertTrue(waiter.daemon)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(child.returncode, 0)
+
+    def test_runtime_watch_failure_prevents_fire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, _b3 = self.followup_fixture()
+            events = []
+            def prepare(*_args):
+                (directory / 'panic-control').mkdir()
+                return {'helper_sha256': 'f' * 64}
+            def unavailable(*_args):
+                events.append('watch_failed')
+                raise TimeoutError('not ready')
+            with patch.object(r.recovery_panic_control, 'prepare', prepare), \
+                    patch.object(r, 'publish_followup', lambda *_a: events.append('prepared_ack')), \
+                    patch.object(r, 'start_runtime_watch', unavailable), \
+                    patch.object(r.recovery_panic_control, 'fire', lambda *_a: self.fail('watch failure reached fire')), \
+                    patch.object(r, 'complete_recovery', lambda *_a: events.append('reported')):
+                r.followup_start(directory, config, saved['scope']['debug_boot_uuid'], saved['facts'], 'token')
+            self.assertEqual(events, ['prepared_ack', 'watch_failed', 'reported'])
+            self.assertFalse((directory / 'panic-followup-trigger.json').exists())
+
+    def test_runtime_watch_budget_is_checked_after_intent_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, _b3 = self.followup_fixture()
+            events = []
+            def prepare(*_args):
+                (directory / 'panic-control').mkdir()
+                return {'helper_sha256': 'f' * 64}
+            def publish(_d, _c, _t, summary, _title):
+                events.append(summary['phase'])
+            def alive(_watch, minimum=60):
+                self.assertIn(minimum, (60, 30))
+                return 'panic_intent' not in events
+            def fire(_d, scope, prepared, _save, _sync, on_ready, _boot):
+                trigger = {'scope': scope, 'helper_sha256': prepared['helper_sha256'],
+                           'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
+                self.assertFalse(on_ready(trigger))
+                self.assertFalse((directory / 'panic-control' / 'release-attempt.json').exists())
+                events.append('not_released')
+                return {'phase': 'not_released'}
+            with patch.object(r.recovery_panic_control, 'prepare', prepare), patch.object(r.recovery_panic_control, 'fire', fire), \
+                    patch.object(r, 'publish_followup', publish), patch.object(r, 'start_runtime_watch', lambda *_a: object()), \
+                    patch.object(r, 'runtime_watch_alive', alive), patch.object(r, 'boot_uuid', lambda: saved['scope']['debug_boot_uuid']), \
+                    patch.object(r, 'complete_recovery', lambda *_a: events.append('reported')):
+                r.followup_start(directory, config, saved['scope']['debug_boot_uuid'], saved['facts'], 'token')
+            self.assertEqual(events, ['panic_prepared', 'panic_intent', 'not_released', 'reported'])
+
     def test_boot_argument_profiles_keep_first_scoped_observation(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -530,6 +647,9 @@ class Recovery(unittest.TestCase):
                 self.assertTrue(ready(trigger))
                 events.append("release")
                 return {"phase": "returned"}
+            def watch(*_args):
+                events.append('watch_ready')
+                return object()
             def encrypt(_certificate, metadata, report):
                 self.assertEqual(metadata["kind"], "panic_control_failure")
                 fragments = r.json.loads(report)
@@ -544,10 +664,11 @@ class Recovery(unittest.TestCase):
             with patch.object(r.recovery_panic_control, "prepare", prepare), patch.object(r.recovery_panic_control, "fire", fire), \
                     patch.object(r.recovery_nvram_panic, "read_panic_info", lambda: self.fail("boot 2 loaded IOKit before spawning tools")), \
                     patch.object(r, "publish_followup", publish), patch.object(r, "complete_recovery", complete), \
+                    patch.object(r, "start_runtime_watch", watch), patch.object(r, "runtime_watch_alive", lambda *_a, **_k: True), \
                     patch.object(r.recovery_reports, "encrypt_bundle", encrypt), \
                     patch.object(r, "boot_uuid", lambda: saved["scope"]["debug_boot_uuid"]):
                 r.followup_start(directory, config, saved["scope"]["debug_boot_uuid"], saved["facts"], "token")
-            self.assertEqual(events, ["prepare", "panic_prepared", "panic_intent", "release", "returned"])
+            self.assertEqual(events, ["prepare", "panic_prepared", "watch_ready", "panic_intent", "release", "returned"])
 
     def test_followup_third_boot_bypasses_second_boot_restoration(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -9,6 +9,7 @@ import recovery_nvram_panic
 import recovery_panic_control
 import recovery_arrival
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -20,6 +21,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1362,6 +1364,192 @@ def read_followup_debug(directory, config):
     return saved
 
 
+def runtime_watch_identity(config, scope, helper_sha256):
+    recovery_panic_control.validate_scope(scope)
+    if (not panic_followup(config['context']) or
+            scope != {**debug_boot_marker(config), 'debug_boot_uuid': scope['debug_boot_uuid']} or
+            config['debug_source_identity'] != debug_source_identity() or
+            not isinstance(helper_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', helper_sha256)):
+        raise ValueError('runtime watch identity invalid')
+    return {'protocol': 'vz-runtime-watch-v1', 'role': 'runtime-watch',
+            'scope': scope, 'helper_sha256': helper_sha256}
+
+
+def runtime_watch_external(identity):
+    scope = identity['scope']
+    return '/'.join(('runtime-watch', scope['binding'], scope['nonce'],
+                     scope['debug_boot_uuid'], scope['source_identity']))
+
+
+def runtime_watch_check(check, identity, check_id=None):
+    scope = identity['scope']
+    run, _attempt, sha = scope['binding'].split('/')
+    return (isinstance(check, dict) and type(check.get('id')) is int and check['id'] > 0 and
+            (check_id is None or check['id'] == check_id) and check.get('name') == 'Runtime heartbeat ' + run and
+            check.get('head_sha') == sha and check.get('external_id') == runtime_watch_external(identity) and
+            isinstance(check.get('app'), dict) and check['app'].get('id') == 15368 and
+            check['app'].get('slug') == 'github-actions' and
+            check.get('details_url') == 'https://github.com/Code-Hex/vz-ci-test/runs/' + str(check['id']))
+
+
+def runtime_watch_release(raw, trigger_raw, identity):
+    if len(raw) > 4096 or len(trigger_raw) > 4096:
+        raise ValueError('runtime watch release oversized')
+    record, trigger = json.loads(raw), json.loads(trigger_raw)
+    if (not isinstance(record, dict) or set(record) != {'scope', 'helper_sha256', 'helper_pid', 'tracer_pid', 'ready'} or
+            record != trigger or record['scope'] != identity['scope'] or
+            record['helper_sha256'] != identity['helper_sha256'] or record['ready'] is not True or
+            any(type(record[k]) is not int or not 0 < record[k] < 2**31 for k in ('helper_pid', 'tracer_pid')) or
+            record['helper_pid'] == record['tracer_pid']):
+        raise ValueError('runtime watch release invalid')
+    return hashlib.sha256(raw).hexdigest()
+
+
+def runtime_watch_stage(directory, identity, previous):
+    if previous[0] != 'before_release':
+        return previous
+    try:
+        raw = recovery_panic_control.read_private(directory / 'panic-control' / 'release-attempt.json', 0o600, 4096)
+    except FileNotFoundError:
+        return previous
+    except (OSError, ValueError):
+        return ('invalid', None)
+    try:
+        trigger = recovery_panic_control.read_private(directory / 'panic-followup-trigger.json', 0o600, 4096)
+        return ('release_observed', runtime_watch_release(raw, trigger, identity))
+    except (OSError, ValueError):
+        return ('invalid', None)
+
+
+def runtime_watch_ready(receipt, identity, pid, launched, now):
+    if (not isinstance(receipt, dict) or set(receipt) != {'identity', 'check_id', 'pid', 'started_monotonic',
+            'deadline_monotonic', 'acknowledged'} or receipt['identity'] != identity or
+            type(receipt['check_id']) is not int or receipt['check_id'] <= 0 or
+            type(receipt['pid']) is not int or not 0 < receipt['pid'] < 2**31 or receipt['pid'] != pid or receipt['acknowledged'] is not True or
+            any(type(receipt[k]) not in (int, float) or not math.isfinite(receipt[k])
+                for k in ('started_monotonic', 'deadline_monotonic')) or
+            not launched <= receipt['started_monotonic'] <= now or
+            receipt['deadline_monotonic'] - receipt['started_monotonic'] != 120 or
+            receipt['deadline_monotonic'] - now < 60):
+        raise ValueError('runtime watch readiness invalid')
+    return receipt['deadline_monotonic']
+
+
+def reap_runtime_watch(child):
+    waiter = threading.Thread(target=child.wait, daemon=True)
+    waiter.start()
+    return waiter
+
+
+def runtime_watch_alive(watch, minimum=60):
+    return watch['child'].poll() is None and watch['deadline_monotonic'] - time.monotonic() >= minimum
+
+
+def start_runtime_watch(directory, config, scope, prepared):
+    identity = runtime_watch_identity(config, scope, prepared['helper_sha256'])
+    copied = directory / 'recovery.py'
+    if Path(__file__).resolve() != copied or str(Path(sys.executable).resolve()) != config['python']:
+        raise ValueError('runtime watch executable changed')
+    private_write(directory / 'runtime-watch-launch.json', json.dumps(identity).encode())
+    sync_directory(directory)
+    launched = time.monotonic()
+    child = subprocess.Popen([config['python'], str(copied), 'runtime-watch', str(directory)],
+                             env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LC_ALL': 'C', 'PYTHONDONTWRITEBYTECODE': '1'},
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+    reap_runtime_watch(child)
+    while time.monotonic() - launched < 25:
+        if child.poll() is not None:
+            raise RuntimeError('runtime watch exited before fire')
+        try:
+            raw = recovery_panic_control.read_private(directory / 'runtime-watch-ready.json', 0o600, 4096)
+        except FileNotFoundError:
+            time.sleep(0.1)
+            continue
+        deadline = runtime_watch_ready(json.loads(raw), identity, child.pid, launched, time.monotonic())
+        watch = {'child': child, 'deadline_monotonic': deadline}
+        if not runtime_watch_alive(watch):
+            raise RuntimeError('runtime watch budget exhausted')
+        return watch
+    raise TimeoutError('runtime watch readiness timed out')
+
+
+def runtime_watch(directory):
+    started = time.monotonic()
+    deadline = started + 120
+    def expired(_signum, _frame):
+        raise TimeoutError('runtime watch deadline')
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, 120)
+    check_id = None
+    identity = token = None
+    sequence = 0
+    observation = ('before_release', None)
+    def fact(phase):
+        return {**identity, 'phase': phase, 'sequence': sequence, 'pid': os.getpid(),
+                'elapsed_ms': min(120000, max(0, int((time.monotonic() - started) * 1000))),
+                'stage': observation[0], 'release_record_sha256': observation[1]}
+    def send(phase):
+        remaining = deadline - time.monotonic() - (5 if phase == 'heartbeat' else 0)
+        if remaining <= 0:
+            raise TimeoutError('runtime watch deadline')
+        output = {'title': 'Runtime userspace observation', 'summary': json.dumps(fact(phase)), 'text': ''}
+        check = api('PATCH', CHECKS + '/' + str(check_id), token,
+                    {'status': 'completed', 'conclusion': 'neutral', 'output': output}, timeout=min(5, remaining))
+        if not runtime_watch_check(check, identity, check_id):
+            raise ValueError('runtime watch check changed')
+    try:
+        config = load_config(directory)
+        if Path(__file__).resolve() != directory / 'recovery.py' or str(Path(sys.executable).resolve()) != config['python']:
+            raise ValueError('runtime watch executable changed')
+        saved = read_followup_debug(directory, config)
+        if boot_uuid() != saved['scope']['debug_boot_uuid']:
+            raise ValueError('runtime watch boot changed')
+        prepared = json.loads(recovery_panic_control.read_private(directory / 'panic-control' / 'prepared.json', 0o600, 8192))
+        recovery_panic_control.validate_prepared(directory, config['nonce'], prepared)
+        identity = runtime_watch_identity(config, saved['scope'], prepared['helper_sha256'])
+        launch = json.loads(recovery_panic_control.read_private(directory / 'runtime-watch-launch.json', 0o600, 4096))
+        if launch != identity or runtime_watch_stage(directory, identity, observation) != observation:
+            raise ValueError('runtime watch launch invalid')
+        token = (directory / 'token').read_text()
+        if not token or len(token.encode()) > 446:
+            raise ValueError('runtime watch token invalid')
+        output = {'title': 'Runtime userspace observation', 'summary': json.dumps(fact('heartbeat')), 'text': ''}
+        check = api('POST', CHECKS, token, {'name': 'Runtime heartbeat ' + config['context']['run_id'],
+                    'head_sha': config['context']['sha'], 'external_id': runtime_watch_external(identity),
+                    'status': 'completed', 'conclusion': 'neutral', 'output': output}, timeout=min(5, max(0.01, deadline - time.monotonic())))
+        if not runtime_watch_check(check, identity):
+            raise ValueError('runtime watch created check invalid')
+        created_id = check['id']
+        check = api('GET', CHECKS + '/' + str(created_id), token, timeout=min(5, max(0.01, deadline - time.monotonic())))
+        if (not runtime_watch_check(check, identity, created_id) or check.get('status') != 'completed' or
+                check.get('conclusion') != 'neutral' or check.get('output', {}).get('summary') != output['summary'] or
+                check['output'].get('title') != output['title'] or check['output'].get('text') not in (None, '')):
+            raise ValueError('runtime watch acknowledgement invalid')
+        check_id = created_id
+        private_write(directory / 'runtime-watch-ready.json', json.dumps({'identity': identity, 'check_id': check_id,
+            'pid': os.getpid(), 'started_monotonic': started, 'deadline_monotonic': deadline, 'acknowledged': True}).encode())
+        sync_directory(directory)
+        while deadline - time.monotonic() > 5:
+            time.sleep(min(5, max(0, deadline - time.monotonic() - 5)))
+            observation = runtime_watch_stage(directory, identity, observation)
+            sequence += 1
+            try:
+                send('heartbeat')
+            except (OSError, ValueError, urllib.error.URLError):
+                pass
+    finally:
+        if check_id is not None:
+            observation = runtime_watch_stage(directory, identity, observation)
+            sequence += 1
+            try:
+                send('finished')
+            except (OSError, ValueError, urllib.error.URLError):
+                pass
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def followup_start(directory, config, current, facts, token):
     if config["debug_source_identity"] != debug_source_identity():
         raise ValueError("followup source identity mismatch")
@@ -1376,15 +1564,20 @@ def followup_start(directory, config, current, facts, token):
         prepared = recovery_panic_control.prepare(directory, config["nonce"], private_write, sync_directory)
         publish_followup(directory, config, token, followup_summary(config, "panic_prepared", current, saved, prepared=prepared),
                          "Nonce panic control prepared")
+        watch = start_runtime_watch(directory, config, scope, prepared)
+        if not runtime_watch_alive(watch):
+            raise ValueError('runtime watch not ready for fire')
         def on_ready(trigger):
             if trigger.get("scope") != scope or trigger.get("helper_sha256") != prepared["helper_sha256"] or trigger.get("ready") is not True:
                 raise ValueError("panic trigger identity mismatch")
+            if not runtime_watch_alive(watch, minimum=30):
+                return False
             private_write(directory / "panic-followup-trigger.json", json.dumps(trigger).encode())
             sync_directory(directory)
             publish_followup(directory, config, token,
                              followup_summary(config, "panic_intent", current, saved, panic_trigger=trigger, prepared=prepared),
                              "Nonce panic intent durable")
-            return boot_uuid() == current
+            return boot_uuid() == current and runtime_watch_alive(watch, minimum=30)
         returned = recovery_panic_control.fire(directory, scope, prepared, private_write, sync_directory, on_ready, boot_uuid)
         failure = {"status": "returned", "result": returned}
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, urllib.error.URLError) as error:
@@ -1832,6 +2025,8 @@ def main():
         {"prepare-root": prepare_root, "arm-root": arm_root, "verify-root": verify_root, "panic-preflight-root": panic_preflight_root, "panic-execute-root": panic_execute_root,
          "force-preflight-root": force_preflight_root, "force-execute-root": force_execute_root,
          "debug-request-root": debug_request_root, "quick-execute-root": quick_execute_root}[op](json.load(sys.stdin))
+    elif op == 'runtime-watch' and len(sys.argv) == 3:
+        runtime_watch(Path(sys.argv[2]))
     elif op == "collect" and len(sys.argv) == 3:
         collect(Path(sys.argv[2]))
     else:
