@@ -43,6 +43,17 @@ class Preflight(unittest.TestCase):
                 p.command([sys.executable, '-c', 'import sys; sys.stderr.write("x" * 100000)'], root, 'large')
             self.assertLessEqual((root / 'large.stderr').stat().st_size, p.LIMIT)
 
+    def test_timeout_callback_runs_before_child_cleanup_and_preserves_timeout(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as tmp:
+            def capture(child):
+                seen.append(child.poll() is None)
+                raise RuntimeError('private error')
+            with self.assertRaises(TimeoutError):
+                p.command([sys.executable, '-c', 'import time; time.sleep(2)'], Path(tmp), 'timeout',
+                          timeout=0.05, on_timeout=capture)
+        self.assertEqual(seen, [True])
+
     def test_private_logs_ignore_umask_and_reject_symlinks(self):
         import os
         with tempfile.TemporaryDirectory() as tmp:

@@ -93,7 +93,13 @@ def open_private(path, *, append=False):
         raise
 
 
-def command(argv, directory, label, timeout=15, *, env=None):
+def notify_timeout(on_timeout, child):
+    if on_timeout is not None:
+        try: on_timeout(child)
+        except BaseException: pass
+
+
+def command(argv, directory, label, timeout=15, *, env=None, on_timeout=None):
     with open_private(directory / (label + '.stdout')) as sink, open_private(directory / (label + '.stderr')) as errors:
         child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         selector = selectors.DefaultSelector()
@@ -116,6 +122,9 @@ def command(argv, directory, label, timeout=15, *, env=None):
                     if key.fileobj is child.stdout: data.extend(chunk)
             result = child.wait(timeout=max(0.1, deadline - time.monotonic()))
             return result, bytes(data)
+        except (TimeoutError, subprocess.TimeoutExpired):
+            notify_timeout(on_timeout, child)
+            raise
         finally:
             selector.close(); child.stdout.close(); child.stderr.close()
             if child.poll() is None:
@@ -142,12 +151,12 @@ def guard(directory):
     return True
 
 
-def observe(binary, nonce, directory, facts, *, env=None):
+def observe(binary, nonce, directory, facts, *, env=None, on_timeout=None):
     name = 'vz_nonce_' + nonce
     helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     tracer = None
     try:
-        code, listing = command(['/usr/sbin/dtrace', '-p', str(helper.pid), '-l', '-n', 'pid$target::' + name + ':entry'], directory, 'listing', env=env)
+        code, listing = command(['/usr/sbin/dtrace', '-p', str(helper.pid), '-l', '-n', 'pid$target::' + name + ':entry'], directory, 'listing', env=env, on_timeout=on_timeout)
         facts['list_exit'] = code
         facts['list_status'] = parse_probe_list(listing.decode('utf-8', 'replace'), helper.pid, name)
         facts['list_stderr'] = stderr_kind((directory / 'listing.stderr').read_bytes())
@@ -179,6 +188,9 @@ def observe(binary, nonce, directory, facts, *, env=None):
                 helper_code = helper.wait(timeout=2) if released else helper.poll()
                 if not released or tracer_code != 0 or helper_code != 0 or not events_valid(bytes(data), helper.pid, name):
                     raise ValueError('probe_not_observed')
+            except (TimeoutError, subprocess.TimeoutExpired):
+                notify_timeout(on_timeout, tracer)
+                raise
             finally:
                 facts.update(event_facts(bytes(data), helper.pid, name))
                 facts.update(released=released, tracer_exit=tracer.poll(), helper_exit=helper.poll(), trace_stderr=stderr_kind(bytes(err_data)))
@@ -192,10 +204,10 @@ def observe(binary, nonce, directory, facts, *, env=None):
                 except subprocess.TimeoutExpired: pass
 
 
-def compile_panic(binary, nonce, directory, *, env=None):
+def compile_panic(binary, nonce, directory, *, env=None, on_timeout=None):
     helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     try:
-        code, _ = command(['/usr/sbin/dtrace', '-w', '-e', '-p', str(helper.pid), '-n', probe_script(nonce, True)], directory, 'panic-compile', env=env)
+        code, _ = command(['/usr/sbin/dtrace', '-w', '-e', '-p', str(helper.pid), '-n', probe_script(nonce, True)], directory, 'panic-compile', env=env, on_timeout=on_timeout)
         return code == 0
     finally:
         helper.stdin.close()

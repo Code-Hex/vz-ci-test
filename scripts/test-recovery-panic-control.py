@@ -59,10 +59,10 @@ class PanicControl(unittest.TestCase):
             copied = importlib.util.module_from_spec(spec); spec.loader.exec_module(copied)
             self.assertEqual(copied.validate_built(root, 'a' * 64), built)
             calls = []
-            def observe(binary, nonce, directory, facts, *, env):
+            def observe(binary, nonce, directory, facts, *, env, on_timeout):
                 self.assertEqual(env, control.CHILD_ENV)
                 calls.append('observe')
-            def compile_only(binary, nonce, directory, *, env):
+            def compile_only(binary, nonce, directory, *, env, on_timeout):
                 calls.append('compile_only'); return True
             prepared = control.prepare(root, 'a' * 64, save, sync, observe=observe, compile_only=compile_only)
             self.assertEqual(calls, ['observe', 'compile_only'])
@@ -100,6 +100,26 @@ class PanicControl(unittest.TestCase):
                         if not path.exists() or path.read_bytes() != originals[path]: path.write_bytes(originals[path])
                         path.chmod(0o700 if path.name == 'helper' else 0o600)
                     (private / 'prepare-failure.json').unlink()
+
+    def test_timeout_capture_is_bounded_private_and_preserves_timeout(self):
+        preflight = control.load_preflight()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            callback_pids = []
+            def capture(child):
+                callback_pids.append(child.pid)
+                control.capture_timeout(child, root)
+            with self.assertRaises(TimeoutError):
+                preflight.command([sys.executable, '-c', 'import time; time.sleep(10)'], root, 'target',
+                                  timeout=0.05, env=control.CHILD_ENV, on_timeout=capture)
+            self.assertEqual(len(callback_pids), 1)
+            diagnostic = __import__('json').loads((root / 'timeout-diagnostic.json').read_text())
+            self.assertIn(diagnostic['ps_status'], ('ok', 'failed', 'timeout', 'limit', 'unavailable'))
+            self.assertIn(diagnostic['sample_status'], ('ok', 'failed', 'timeout', 'limit', 'unavailable'))
+            paths = [root / ('timeout-' + kind + '.' + channel) for kind in ('ps', 'sample') for channel in ('stdout', 'stderr')]
+            self.assertLessEqual(sum(path.stat().st_size for path in paths if path.exists()), 65536)
+            for path in paths:
+                if path.exists(): self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_scope_requires_distinct_valid_boots_and_exact_fields(self):
         scope = {'binding': '12/1/' + 'a' * 40, 'nonce': 'b' * 64,

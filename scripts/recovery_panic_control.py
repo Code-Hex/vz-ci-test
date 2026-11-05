@@ -158,6 +158,73 @@ def validate_built(directory, nonce):
     return built
 
 
+def _timeout_command(argv, directory, label, budget, timeout):
+    output = open_private(Path(directory) / ('timeout-' + label + '.stdout'))
+    try:
+        errors = open_private(Path(directory) / ('timeout-' + label + '.stderr'))
+    except BaseException:
+        output.close()
+        raise
+    child = None
+    selector = selectors.DefaultSelector()
+    try:
+        if budget == 0: return 'limit', budget
+        try:
+            child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=CHILD_ENV)
+        except OSError:
+            return 'unavailable', budget
+        selector.register(child.stdout, selectors.EVENT_READ, output)
+        selector.register(child.stderr, selectors.EVENT_READ, errors)
+        deadline = time.monotonic() + timeout
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: return 'timeout', budget
+            events = selector.select(remaining)
+            if not events: return 'timeout', budget
+            for key, _ in events:
+                data = os.read(key.fd, 4096)
+                if not data:
+                    selector.unregister(key.fileobj); continue
+                if len(data) > budget:
+                    if budget: key.data.write(data[:budget])
+                    return 'limit', 0
+                key.data.write(data); budget -= len(data)
+        try:
+            code = child.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return 'timeout', budget
+        return ('ok' if code == 0 else 'failed'), budget
+    finally:
+        selector.close(); output.close(); errors.close()
+        if child is not None:
+            if child.poll() is None:
+                child.kill()
+                try: child.wait(timeout=0.2)
+                except subprocess.TimeoutExpired: pass
+            if child.stdout is not None: child.stdout.close()
+            if child.stderr is not None: child.stderr.close()
+
+
+def _sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
+def capture_timeout(target, directory, *, sync=_sync_directory):
+    directory = Path(directory)
+    budget = 65536
+    ps_status = sample_status = 'unavailable'
+    if target.poll() is None:
+        ps_status, budget = _timeout_command(['/bin/ps', '-p', str(target.pid), '-o', 'pid=,state=,wchan=,comm='],
+                                             directory, 'ps', budget, 2)
+    if target.poll() is None:
+        sample_status, budget = _timeout_command(['/usr/bin/sample', str(target.pid), '1', '-file', '/dev/stdout'],
+                                                 directory, 'sample', budget, 3)
+    once_record(directory, 'timeout-diagnostic.json', {'ps_status': ps_status, 'sample_status': sample_status,
+                                                       'bytes_captured': 65536 - budget}, sync)
+
+
 def prepare(directory, nonce, save, sync, *, observe=None, compile_only=None):
     private = Path(directory) / 'panic-control'
     facts = {'list_status': 'unavailable', 'list_exit': None, 'list_stderr': 'unavailable',
@@ -172,9 +239,10 @@ def prepare(directory, nonce, save, sync, *, observe=None, compile_only=None):
         compile_only = p.compile_panic if compile_only is None else compile_only
         binary = private / 'helper'
         progress.stage = 'observe'
-        observe(binary, nonce, private, facts, env=CHILD_ENV)
+        on_timeout = lambda child: capture_timeout(child, private, sync=sync)
+        observe(binary, nonce, private, facts, env=CHILD_ENV, on_timeout=on_timeout)
         progress.stage = 'compile_panic'
-        if not compile_only(binary, nonce, private, env=CHILD_ENV): raise ValueError('panic_compile_failed')
+        if not compile_only(binary, nonce, private, env=CHILD_ENV, on_timeout=on_timeout): raise ValueError('panic_compile_failed')
         progress.stage = 'receipt'
         prepared = {key: built[key] for key in ('control_sha256', 'preflight_sha256', 'getter_sha256',
                                                  'helper_source_sha256', 'helper_sha256', 'nonce_sha256')}
