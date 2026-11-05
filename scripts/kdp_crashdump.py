@@ -46,6 +46,13 @@ def encode_data(block, payload):
     return struct.pack('!HI', 3, _uint32(block)) + payload
 
 
+def encode_paniclog_data(block, payload, filename, trailer):
+    if (not isinstance(payload, bytes) or not 1 <= len(payload) <= 512 or
+            not isinstance(trailer, bytes) or len(trailer) != len(_filename(filename)) + 1):
+        raise ValueError('paniclog_payload_invalid')
+    return encode_data(block, payload) + trailer
+
+
 def encode_eof(block):
     return struct.pack('!HI', 7, _uint32(block))
 
@@ -57,11 +64,12 @@ def decode_ack(packet):
 
 
 class Receiver:
-    def __init__(self, filename, required_prefix, max_bytes=12288):
+    def __init__(self, filename, required_prefix, max_bytes=12288, *, paniclog=False):
         self._request_prefix = b'\x00\x02' + _filename(filename) + b'\x00octet\x00features\x00'
         if (not isinstance(required_prefix, bytes) or not 1 <= len(required_prefix) <= 512
-                or type(max_bytes) is not int or not len(required_prefix) <= max_bytes <= 12288):
+                or type(max_bytes) is not int or not len(required_prefix) <= max_bytes <= 12288 or type(paniclog) is not bool):
             raise ValueError('receiver_bounds_invalid')
+        self._tail_bytes = len(_filename(filename)) + 1 if paniclog else 0
         self._prefix, self._limit = required_prefix, max_bytes
         self._data = bytearray()
         self._blocks = {}
@@ -104,7 +112,8 @@ class Receiver:
             return self._fail(Error.OPCODE_UNSUPPORTED)
         if self.state != State.RECEIVING:
             return self._fail(Error.WRQ_REQUIRED)
-        if len(packet) < 6 or (opcode == 7 and len(packet) != 6) or (opcode == 3 and not 1 <= len(packet) - 6 <= 512):
+        if (len(packet) < 6 or (opcode == 7 and len(packet) != 6) or
+                (opcode == 3 and not 1 <= len(packet) - 6 - self._tail_bytes <= 512)):
             return self._fail(Error.PACKET_INVALID)
         block = struct.unpack('!I', packet[2:6])[0]
         next_block = len(self._blocks) + 1
@@ -117,7 +126,8 @@ class Receiver:
                 return self._fail(Error.EMPTY_TRANSFER)
             self._eof, self.state = block, State.COMPLETE
         else:
-            payload = packet[6:]
+            # Paniclog DATA includes a corename-sized tail outside its copied body.
+            payload = packet[6:len(packet) - self._tail_bytes] if self._tail_bytes else packet[6:]
             if block < next_block:
                 previous = self._blocks.get(block)
                 if previous is None or self._data[previous[0]:previous[1]] != payload:

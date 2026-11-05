@@ -13,6 +13,45 @@ ACK2 = b'\x00\x04\x00\x00\x00\x02'
 
 
 class Crashdump(unittest.TestCase):
+    def test_paniclog_layout_uses_filename_length_to_discard_only_the_wire_tail(self):
+        name = 'f' * 255
+        data = PREFIX + b'actual-data-ending-in-YYY'
+        trailer = (b'panic(cpu 9): stale\nKernel UUID: stale\n' + b'X' * 256)[:256]
+        packet = k.encode_paniclog_data(1, data, name, trailer)
+        self.assertEqual(len(packet), 6 + len(data) + len(name) + 1)
+        r = k.Receiver(name, PREFIX, paniclog=True)
+        self.assertEqual(r.receive(k.encode_wrq(name)), ACK0)
+        self.assertEqual(r.receive(packet), ACK1)
+        self.assertEqual(r.data, data)
+        self.assertNotIn(b'stale', r.data)
+        changed_tail = k.encode_paniclog_data(1, data, name, b'Y' * 256)
+        self.assertEqual(r.receive(changed_tail), ACK1)
+        self.assertEqual(r.receive(k.encode_eof(2)), ACK2)
+        self.assertEqual(r.data, data)
+
+    def test_paniclog_full_chunk_and_short_chunk_preserve_exact_body(self):
+        r = k.Receiver(NAME, PREFIX, paniclog=True)
+        self.assertEqual(r.receive(WRQ), ACK0)
+        data = PREFIX + b'x' * (512 - len(PREFIX))
+        for block, body, tail in ((1, data, b'X'), (2, b'endYY', b'Y')):
+            packet = k.encode_paniclog_data(block, body, NAME, tail * (len(NAME) + 1))
+            self.assertEqual(k.decode_ack(r.receive(packet)), block)
+        self.assertEqual(r.receive(k.encode_eof(3)), b'\x00\x04\x00\x00\x00\x03')
+        self.assertEqual(r.data, data + b'endYY')
+
+    def test_paniclog_layout_rejects_missing_or_oversized_body_and_wrong_tail_length(self):
+        for body in (b'', b'x' * 513):
+            with self.assertRaises(ValueError):
+                k.encode_paniclog_data(1, body, NAME, b'Y' * (len(NAME) + 1))
+        for trailer in (b'', b'Y' * len(NAME), b'Y' * (len(NAME) + 2), None):
+            with self.assertRaises(ValueError): k.encode_paniclog_data(1, PREFIX, NAME, trailer)
+        for packet in (k.encode_data(1, b'x'), k.encode_data(1, b'x' * 512) + b'Y' * (len(NAME) + 2)):
+            r = k.Receiver(NAME, PREFIX, paniclog=True)
+            self.assertEqual(r.receive(WRQ), ACK0)
+            self.assertIsNone(r.receive(packet))
+            self.assertEqual(r.state, 'failed')
+        with self.assertRaises(ValueError): k.Receiver(NAME, PREFIX, paniclog=1)
+
     def receiver(self, **kwargs):
         return k.Receiver(NAME, PREFIX, **kwargs)
 

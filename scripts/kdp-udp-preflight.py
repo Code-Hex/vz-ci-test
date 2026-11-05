@@ -315,7 +315,7 @@ def wire_fixture(ctx, own_nonce, peer_nonce):
     intel, receiver = (own_nonce, peer_nonce) if ctx['role'] == 'intel' else (peer_nonce, own_nonce)
     body = json.dumps({'binding': '/'.join((ctx['run'], ctx['attempt'], ctx['sha'])),
                        'intel_nonce': intel.hex(), 'receiver_nonce': receiver.hex()}, separators=(',', ':')).encode()
-    return 'vz-synthetic-' + hashlib.sha256(body).hexdigest(), SYNTHETIC_PREFIX + body + b'\n' + b'0123456789abcdef' * 70
+    return 'vz' + hashlib.sha256(body).hexdigest()[:14], SYNTHETIC_PREFIX + body + b'\n' + b'0123456789abcdef' * 70
 
 
 def _wire_packet(sock, peer, packet, block, deadline):
@@ -343,11 +343,13 @@ def wire_exchange(sock, peer, role, filename, data, commit, *, seconds=60):
             _wire_packet(sock, peer, wire.encode_wrq(filename), 0, deadline)
             block = 1
             for offset in range(0, len(data), 512):
-                _wire_packet(sock, peer, wire.encode_data(block, data[offset:offset + 512]), block, deadline)
+                packet = wire.encode_paniclog_data(block, data[offset:offset + 512], filename,
+                                                   b'Y' * (len(filename.encode('ascii')) + 1))
+                _wire_packet(sock, peer, packet, block, deadline)
                 block += 1
             _wire_packet(sock, peer, wire.encode_eof(block), block, deadline)
         elif role == 'receiver' and callable(commit):
-            receiver = wire.Receiver(filename, SYNTHETIC_PREFIX)
+            receiver = wire.Receiver(filename, SYNTHETIC_PREFIX, paniclog=True)
             committed = False
             for _ in range(256):
                 remaining = deadline - time.monotonic()

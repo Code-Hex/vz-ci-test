@@ -68,6 +68,7 @@ class Udp(unittest.TestCase):
         sender = r.wire_fixture(self.context(mode='crashdump-wire'), a, b)
         receiver = r.wire_fixture(self.context('receiver', 'crashdump-wire'), b, a)
         self.assertEqual(sender, receiver)
+        self.assertEqual(len(sender[0]), 16)
         self.assertTrue(sender[1].startswith(b'VZ_SYNTHETIC_NON_KERNEL\n'))
         self.assertGreater(len(sender[1]), 1024)
         self.assertLessEqual(len(sender[1]), 12288)
