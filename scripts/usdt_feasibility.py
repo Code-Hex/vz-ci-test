@@ -1,4 +1,5 @@
 """Actions-only non-faulting USDT gate."""
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -15,10 +16,10 @@ import time
 ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LC_ALL': 'C'}
 KERNEL_UUID = '87453B1D-A163-31FA-B33B-0FB4BE78E6E8'
 STAGES = ('context', 'sources', 'kernel', 'header', 'compile', 'sign', 'verify', 'helper_ready', 'listing',
-          'tracer_ready', 'once', 'hit', 'returned', 'quit', 'exits', 'completed')
+          'compile_panic', 'tracer_ready', 'once', 'hit', 'returned', 'quit', 'exits', 'completed')
 REASONS = ('invalid', 'command_exit', 'deadline', 'output_limit', 'child_eof', 'os_error', 'requires_root', 'cleanup_unverified', 'interrupted')
-COMMANDS = ('kernel_uuid', 'kernel_file', 'header', 'compile', 'sign', 'verify', 'listing', 'helper', 'tracer')
-HASHES = ('script', 'workflow', 'nonce', 'provider', 'argument', 'provider_source', 'header', 'helper_source', 'helper_binary', 'tracer_program')
+COMMANDS = ('kernel_uuid', 'kernel_file', 'header', 'compile', 'sign', 'verify', 'listing', 'panic_compile', 'helper', 'tracer')
+HASHES = ('script', 'workflow', 'nonce', 'provider', 'argument', 'provider_source', 'header', 'helper_source', 'helper_binary', 'tracer_program', 'panic_program')
 
 
 class GateFailure(ValueError):
@@ -34,9 +35,41 @@ def require(condition):
 def digest(raw): return hashlib.sha256(raw).hexdigest()
 
 
-def identity(nonce):
-    require(type(nonce) is str and re.fullmatch('[0-9a-f]{64}', nonce))
-    return 'vzobs' + nonce[:16] + 'p', nonce[16:32]
+@dataclass(frozen=True)
+class ProbeSpec:
+    nonce: str
+
+    def __post_init__(self):
+        require(type(self.nonce) is str and re.fullmatch('[0-9a-f]{64}', self.nonce))
+
+    @property
+    def provider(self): return 'vzobs' + self.nonce[:16] + 'p'
+
+    @property
+    def argument(self): return self.nonce[16:32]
+
+    @property
+    def function(self): return 'vz_nonce_' + self.nonce
+
+    def bind(self, pid): return ProbeIdentity(self, pid)
+
+
+@dataclass(frozen=True)
+class ProbeIdentity:
+    spec: ProbeSpec
+    pid: int
+
+    def __post_init__(self):
+        require(type(self.spec) is ProbeSpec and type(self.pid) is int and 0 < self.pid < 2**31)
+
+    @property
+    def fields(self): return (self.spec.provider + str(self.pid), 'helper', self.spec.function, 'observe')
+
+    @property
+    def selector(self): return ':'.join(self.fields)
+
+    @property
+    def predicate(self): return ' /pid == ' + str(self.pid) + ' && arg0 == 0x' + self.spec.argument + '/ '
 
 
 def validate_header(raw, provider):
@@ -51,8 +84,8 @@ def parse_ready(raw, pid):
     require(type(pid) is int and pid > 0 and raw == ('HELPER_READY ' + str(pid) + '\n').encode())
 
 
-def parse_listing(raw, provider, pid):
-    require(type(raw) is bytes and len(raw) <= 65536 and type(pid) is int and pid > 0)
+def parse_listing(raw, probe):
+    require(type(raw) is bytes and len(raw) <= 65536 and type(probe) is ProbeIdentity)
     try: lines = raw.decode('ascii').splitlines()
     except UnicodeError: raise GateFailure() from None
     require(lines and lines[0].split() == ['ID', 'PROVIDER', 'MODULE', 'FUNCTION', 'NAME'])
@@ -60,21 +93,27 @@ def parse_listing(raw, provider, pid):
     require(1 <= len(rows) <= 32)
     for row in rows:
         require(len(row) == 5 and re.fullmatch('[1-9][0-9]*', row[0]) and row[0] not in identifiers and
-                row[1:] == [provider + str(pid), 'helper', 'main', 'observe'])
+                tuple(row[1:]) == probe.fields)
         identifiers.add(row[0])
     return len(rows)
 
 
-def parse_hit(raw, provider, argument, pid):
-    expected = 'HIT ' + str(pid) + ' ' + provider + str(pid) + ' helper main observe ' + argument + '\n'
-    require(type(pid) is int and pid > 0 and raw == expected.encode())
+def parse_hit(raw, probe):
+    require(type(probe) is ProbeIdentity and type(raw) is bytes)
+    expected = 'HIT ' + str(probe.pid) + ' ' + ' '.join(probe.fields) + ' ' + probe.spec.argument + '\n'
+    require(raw == expected.encode())
 
 
-def tracer_command(provider, argument, pid):
-    require(re.fullmatch(r'vzobs[0-9a-f]{16}p', provider) and re.fullmatch('[0-9a-f]{16}', argument) and type(pid) is int and pid > 0)
-    program = ('dtrace:::BEGIN { printf("TRACER_READY\\n"); } ' + provider + '*:::observe /pid == ' + str(pid) +
-               ' && arg0 == 0x' + argument + '/ { printf("HIT %d %s %s %s %s %016llx\\n", pid, probeprov, probemod, probefunc, probename, arg0); exit(0); }')
+def tracer_command(probe):
+    require(type(probe) is ProbeIdentity)
+    program = ('dtrace:::BEGIN { printf("TRACER_READY\\n"); } ' + probe.selector + probe.predicate +
+               '{ printf("HIT %d %s %s %s %s %016llx\\n", pid, probeprov, probemod, probefunc, probename, arg0); exit(0); }')
     return ['/usr/sbin/dtrace', '-q', '-x', 'switchrate=10hz', '-n', program]
+
+
+def panic_compile_command(probe):
+    require(type(probe) is ProbeIdentity)
+    return ['/usr/sbin/dtrace', '-w', '-e', '-n', probe.selector + probe.predicate + '{ panic(); }']
 
 
 def initial_report():
@@ -224,11 +263,9 @@ def write_private(path, raw):
     with os.fdopen(fd, 'wb') as stream: stream.write(raw)
 
 
-def build(directory, provider, argument, architecture, state):
-    require(architecture in ('arm64', 'x86_64'))
-    require(re.fullmatch(r'vzobs[0-9a-f]{16}p', provider) and re.fullmatch('[0-9a-f]{16}', argument))
-    provider_source = ('provider ' + provider + ' { probe observe(unsigned long long); };\n').encode()
-    helper_source = ('''#include "provider.h"
+def helper_source(spec):
+    require(type(spec) is ProbeSpec)
+    return ('''#include "provider.h"
 #include <errno.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -237,25 +274,34 @@ static int command(char *value) {
     do { count = read(STDIN_FILENO, value, 1); } while (count < 0 && errno == EINTR);
     return count == 1;
 }
+__attribute__((noinline,used,visibility("default"))) void ''' + spec.function + '''(void) {
+    ''' + spec.provider.upper() + '_OBSERVE(0x' + spec.argument + '''ULL);
+}
 int main(void) {
     char value;
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("HELPER_READY %ld\\n", (long)getpid());
     if (!command(&value) || value != 'O') return 2;
-    ''' + provider.upper() + '_OBSERVE(0x' + argument + '''ULL);
+    ''' + spec.function + '''();
     puts("HELPER_RETURNED");
     if (!command(&value) || value != 'Q') return 3;
     return 0;
 }
 ''').encode()
+
+
+def build(directory, spec, architecture, state):
+    require(type(spec) is ProbeSpec and architecture in ('arm64', 'x86_64'))
+    provider_source = ('provider ' + spec.provider + ' { probe observe(unsigned long long); };\n').encode()
+    source = helper_source(spec)
     write_private(directory / 'provider.d', provider_source)
-    write_private(directory / 'helper.c', helper_source)
-    state.report['hashes'].update(provider_source=digest(provider_source), helper_source=digest(helper_source))
+    write_private(directory / 'helper.c', source)
+    state.report['hashes'].update(provider_source=digest(provider_source), helper_source=digest(source))
     state.stage('header')
     command(['/usr/sbin/dtrace', '-h', '-s', str(directory / 'provider.d'), '-o', str(directory / 'provider.h')], 'header', state)
     require((directory / 'provider.h').stat().st_size <= 65536)
     header = (directory / 'provider.h').read_bytes()
-    validate_header(header, provider)
+    validate_header(header, spec.provider)
     state.report['hashes']['header'] = digest(header)
     state.stage('compile')
     command(['/usr/bin/xcrun', 'clang', '-arch', architecture, '-O0', '-g', '-Wall', '-Wextra', '-Werror', '-I', str(directory),
@@ -273,7 +319,7 @@ def validate_final_output(tracer, helper, ready, hit):
     require(tracer == b'TRACER_READY\n' + hit + b'\n' and helper == ready + b'HELPER_RETURNED\n')
 
 
-def execute(directory, provider, argument, state):
+def execute(directory, spec, state, *, run_command=command):
     helper = tracer = None
     try:
         state.stage('helper_ready')
@@ -281,11 +327,17 @@ def execute(directory, provider, argument, state):
         state.report['helper_pid'] = helper.process.pid
         ready = helper.line(10)
         parse_ready(ready, helper.process.pid)
+        probe = spec.bind(helper.process.pid)
         state.stage('listing')
-        listing = command(['/usr/sbin/dtrace', '-l', '-n', provider + '*:::observe'], 'listing', state, 20)
-        state.report['listing_rows'] = parse_listing(listing, provider, helper.process.pid)
+        listing = run_command(['/usr/sbin/dtrace', '-l', '-n', spec.provider + '*:::observe'], 'listing', state, 20)
+        state.report['listing_rows'] = parse_listing(listing, probe)
+        state.stage('compile_panic')
+        compile_argv = panic_compile_command(probe)
+        state.report['hashes']['panic_program'] = digest(compile_argv[-1].encode())
+        run_command(compile_argv, 'panic_compile', state, 20)
+        require(state.cleanup_ok and helper.process.poll() is None)
         state.stage('tracer_ready')
-        argv = tracer_command(provider, argument, helper.process.pid)
+        argv = tracer_command(probe)
         state.report['hashes']['tracer_program'] = digest(argv[-1].encode())
         tracer = Child(argv, state)
         state.report['tracer_pid'] = tracer.process.pid
@@ -297,7 +349,7 @@ def execute(directory, provider, argument, state):
         state.report['o_written'] = True
         state.stage('hit')
         hit = tracer.line(10)
-        parse_hit(hit, provider, argument, helper.process.pid)
+        parse_hit(hit, probe)
         state.report['hit_count'] = 1
         state.stage('returned')
         require(helper.line(5) == b'HELPER_RETURNED\n')
@@ -362,13 +414,13 @@ def main():
         require(live == KERNEL_UUID and re.findall(r'UUID:\s*([0-9A-Fa-f-]+)\s*\(x86_64\)', file) == [KERNEL_UUID])
         state.report['kernel_matched'] = True
         nonce = secrets.token_hex(32)
-        provider, argument = identity(nonce)
-        state.report['hashes'].update(nonce=digest(nonce.encode()), provider=digest(provider.encode()), argument=digest(argument.encode()))
+        spec = ProbeSpec(nonce)
+        state.report['hashes'].update(nonce=digest(nonce.encode()), provider=digest(spec.provider.encode()), argument=digest(spec.argument.encode()))
         with tempfile.TemporaryDirectory(prefix='usdt-feasibility-', dir=runner_temp) as work:
             directory = Path(work)
             require(directory.stat().st_mode & 0o777 == 0o700 and directory.stat().st_uid == os.geteuid())
-            build(directory, provider, argument, machine, state)
-            execute(directory, provider, argument, state)
+            build(directory, spec, machine, state)
+            execute(directory, spec, state)
         state.stage('completed')
         state.report['status'] = 'passed'
     except GateFailure as error: state.report.update(status='failed', reason=error.reason)
