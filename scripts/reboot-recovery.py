@@ -336,6 +336,54 @@ def diagnostic_sysctls():
     return result
 
 
+def checked_boot_argument_profile(value):
+    if not isinstance(value, dict):
+        raise ValueError("boot argument profile invalid")
+    if value in ({"status": "unavailable"}, {"status": "invalid"}):
+        return dict(value)
+    if (set(value) != {"status", "debug_mask", "nondebug_token_count", "nondebug_sha256"} or
+            value["status"] != "observed" or
+            not (value["debug_mask"] is None or type(value["debug_mask"]) is int and 0 <= value["debug_mask"] <= 0xffffffff) or
+            type(value["nondebug_token_count"]) is not int or not 0 <= value["nondebug_token_count"] <= 512 or
+            not isinstance(value["nondebug_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["nondebug_sha256"])):
+        raise ValueError("boot argument profile invalid")
+    return dict(value)
+
+
+def observe_boot_argument_profile():
+    try:
+        return recovery_bootargs.boot_argument_profile(recovery_bootargs.MacPlatform().active())
+    except (OSError, subprocess.SubprocessError):
+        return {"status": "unavailable"}
+    except ValueError:
+        return {"status": "invalid"}
+
+
+def postboot_argument_profiles(directory, config, current):
+    try:
+        initial = checked_boot_argument_profile(config.get("initial_boot_argument_profile", {"status": "unavailable"}))
+    except ValueError:
+        initial = {"status": "invalid"}
+    scope = {"marker": debug_boot_marker(config), "current_boot_uuid": current}
+    path = directory / "boot-argument-observation.json"
+    try:
+        if path.exists():
+            saved = json.loads(path.read_text())
+            if not isinstance(saved, dict) or set(saved) != {"scope", "profile"} or saved["scope"] != scope:
+                raise ValueError("boot argument observation identity mismatch")
+            profile = checked_boot_argument_profile(saved["profile"])
+        else:
+            profile = checked_boot_argument_profile(observe_boot_argument_profile())
+            private_write(path, json.dumps({"scope": scope, "profile": profile}).encode())
+            sync_directory(directory)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        profile = {"status": "invalid"}
+    equal = None
+    if initial["status"] == profile["status"] == "observed":
+        equal = all(initial[key] == profile[key] for key in ("nondebug_token_count", "nondebug_sha256"))
+    return {"initial": initial, "postboot": profile, "nondebug_equal": equal}
+
+
 def root_dir(ctx):
     return Path("/var/root") / ("vz-ci-recovery-" + ctx["run_id"] + "-" + ctx["attempt"])
 
@@ -429,6 +477,7 @@ def prepare_root(payload):
     baseline = boot_uuid()
     if not baseline:
         raise ValueError("empty boot session")
+    initial_boot_argument_profile = observe_boot_argument_profile() if panic_followup(ctx) else {"status": "unavailable"}
     if panic_followup(ctx):
         recovery_panic_control.build(directory, nonce, private_write, sync_directory)
         baseline_status, baseline_raw = recovery_nvram_panic.read_panic_info()
@@ -449,6 +498,7 @@ def prepare_root(payload):
               "nvram_helper_sha256": nvram_helper_sha, "nvram_source_sha256": nvram_source_sha,
               "debug_source_identity": debug_source_identity() if ctx.get("debug_boot", False) else "",
               "arrival_api_ipv4": recovery_arrival.resolve_api()}
+    config["initial_boot_argument_profile"] = initial_boot_argument_profile
     private_write(directory / "config.json", json.dumps(config).encode())
     private_write(directory / "recovery.py", Path(__file__).read_bytes())
     private_write(directory / "recovery_reports.py", Path(recovery_reports.__file__).read_bytes())
@@ -1463,6 +1513,9 @@ def collect(directory):
         followup_finish(directory, config, current, saved, (directory / "token").read_text())
         return
     debug_facts = {}
+    argument_profiles = None
+    if reboot_observed(config["baseline"], current) and panic_followup(config["context"]):
+        argument_profiles = postboot_argument_profiles(directory, config, current)
     if reboot_observed(config["baseline"], current) and config.get("debug_boot", False):
         try:
             if config["context"]["debug_source"] == "bootplist":
@@ -1482,6 +1535,8 @@ def collect(directory):
                                     "debugger_count": None, "debugger_inventory_status": "unavailable",
                                     "network_inventory_status": "unavailable", "virtio_network_classes": [],
                                     "nic_inventory_status": "unsupported", "kernel_debug_state": {}})
+        if argument_profiles is not None:
+            debug_facts["boot_argument_profiles"] = argument_profiles
         debug_facts["owner_events"] = []
         for event in DEBUG_EVENTS:
             if (directory / ("debug-reboot-" + event + ".json")).exists():

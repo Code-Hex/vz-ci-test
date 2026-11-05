@@ -40,6 +40,36 @@ class Platform:
         return {"debugger_count": None, "virtio_network_classes": [], "nic_inventory_status": "unsupported"}
 
 
+class BootArgumentProfile(unittest.TestCase):
+    def test_canonical_spacing_and_exact_token_sequence(self):
+        expected = {'status': 'observed', 'debug_mask': 8192, 'nondebug_token_count': 3,
+                    'nondebug_sha256': '11a6f7c443706e6d2af0396c32aa8d5350a93892d43185cdacfe1430b82d9505'}
+        self.assertEqual(b.boot_argument_profile(' alpha=1  beta\talpha=1  --debug=0x2000 '), expected)
+        self.assertEqual(b.boot_argument_profile(b'alpha=1\tbeta alpha=1 -debug=8192'), expected)
+        self.assertNotEqual(b.boot_argument_profile('beta alpha=1 alpha=1')['nondebug_sha256'], expected['nondebug_sha256'])
+        self.assertNotEqual(b.boot_argument_profile('alpha=1 beta')['nondebug_sha256'], expected['nondebug_sha256'])
+
+    def test_only_exact_debug_key_is_excluded(self):
+        result = b.boot_argument_profile('debugger=1 xdebug=3 -debugger=2 debug=0')
+        self.assertEqual(result['debug_mask'], 0)
+        self.assertEqual(result['nondebug_token_count'], 3)
+        self.assertEqual(result['nondebug_sha256'], b.boot_argument_profile('debugger=1 xdebug=3 -debugger=2')['nondebug_sha256'])
+        self.assertNotIn('debugger', json.dumps(result))
+
+    def test_empty_and_debug_only_have_same_nondebug_hash(self):
+        empty = b.boot_argument_profile('')
+        debug = b.boot_argument_profile('--debug=0x2000')
+        self.assertEqual(empty['nondebug_sha256'], '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945')
+        self.assertEqual((empty['nondebug_token_count'], debug['nondebug_token_count']), (0, 0))
+        self.assertEqual(empty['nondebug_sha256'], debug['nondebug_sha256'])
+        self.assertIsNone(empty['debug_mask'])
+
+    def test_invalid_values_propagate(self):
+        for value in ('debug=1 debug=2', 'debug=wat', 'debug', '_router_ip=1', b'x\n', 'x' * 1024, None, 'é'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                b.boot_argument_profile(value)
+
+
 class Bootargs(unittest.TestCase):
     def save(self, path, data):
         with path.open("xb") as stream:

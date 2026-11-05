@@ -14,6 +14,68 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def test_boot_argument_profiles_keep_first_scoped_observation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, _b3 = self.followup_fixture()
+            config['initial_boot_argument_profile'] = r.recovery_bootargs.boot_argument_profile('alpha=1 beta=2')
+            current = saved['scope']['debug_boot_uuid']
+            with patch.object(r, 'observe_boot_argument_profile', lambda: r.recovery_bootargs.boot_argument_profile('alpha=1 debug=0x102000 beta=2')):
+                first = r.postboot_argument_profiles(directory, config, current)
+            self.assertIs(first['nondebug_equal'], True)
+            with patch.object(r, 'observe_boot_argument_profile', lambda: self.fail('observation was repeated')):
+                self.assertEqual(r.postboot_argument_profiles(directory, config, current), first)
+            self.assertEqual(r.postboot_argument_profiles(directory, config, 'C' * 8 + '-CCCC-CCCC-CCCC-' + 'C' * 12)['postboot'], {'status': 'invalid'})
+            self.assertNotIn('alpha', (directory / 'boot-argument-observation.json').read_text())
+
+    def test_boot_argument_observation_failure_does_not_claim_equality(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, _b3 = self.followup_fixture()
+            config['initial_boot_argument_profile'] = r.recovery_bootargs.boot_argument_profile('alpha=1')
+            with patch.object(r, 'observe_boot_argument_profile', lambda: {'status': 'unavailable'}):
+                result = r.postboot_argument_profiles(directory, config, saved['scope']['debug_boot_uuid'])
+            self.assertIsNone(result['nondebug_equal'])
+            self.assertEqual(result['postboot'], {'status': 'unavailable'})
+            (directory / 'boot-argument-observation.json').write_text('{broken')
+            self.assertEqual(r.postboot_argument_profiles(directory, config, saved['scope']['debug_boot_uuid'])['postboot'], {'status': 'invalid'})
+
+    def test_boot_argument_storage_failure_still_restores_and_acknowledges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, _b3 = self.followup_fixture()
+            current = saved['scope']['debug_boot_uuid']
+            config['debug_boot'] = True
+            r.private_write(directory / 'token', b'synthetic-token')
+            r.private_write(directory / 'ready.json', r.json.dumps({'baseline': config['baseline'], 'nonce': config['nonce'], 'preboot_patch': True}).encode())
+            original_write = r.private_write
+            events = []
+            def write(path, data):
+                if path.name == 'boot-argument-observation.json':
+                    raise OSError('synthetic storage failure')
+                original_write(path, data)
+            def finish(*_args, **_kwargs):
+                events.append('restore')
+                return dict(saved['facts'])
+            def core(_directory, _config, _current, facts, _token):
+                self.assertEqual(facts['boot_argument_profiles']['postboot'], {'status': 'invalid'})
+                self.assertIsNone(facts['boot_argument_profiles']['nondebug_equal'])
+                events.append('ack')
+                return facts
+            with patch.object(r, 'load_config', lambda _: config), patch.object(r, 'boot_uuid', lambda: current), \
+                    patch.object(r, 'observe_boot_argument_profile', lambda: {'status': 'unavailable'}), \
+                    patch.object(r, 'private_write', write), patch.object(r.recovery_bootplist, 'finish', finish), \
+                    patch.object(r, 'publish_debug_core', core), patch.object(r, 'followup_start', lambda *_: events.append('followup')):
+                r.collect(directory)
+            self.assertEqual(events, ['restore', 'ack', 'followup'])
+
+    def test_boot_argument_profile_boundary_rejects_raw_and_invalid_scalars(self):
+        valid = r.recovery_bootargs.boot_argument_profile('alpha=1')
+        for extra in ({'raw': 'private argument'}, {'debug_mask': True}, {'nondebug_token_count': True},
+                      {'nondebug_token_count': -1}, {'nondebug_sha256': 'private argument'}):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                r.checked_boot_argument_profile({**valid, **extra})
+
     def test_debug_source_context_is_explicit_and_bound(self):
         base = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
                 'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,

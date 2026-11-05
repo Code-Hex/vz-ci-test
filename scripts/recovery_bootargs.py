@@ -1,5 +1,6 @@
 """A reversible debug boot-argument transaction for normal and quick reboot."""
 import ctypes
+import hashlib
 import json
 import os
 import plistlib
@@ -107,6 +108,15 @@ def debug_mask(value):
     if len(masks) > 1 or (masks and masks[0] > 0xffffffff):
         raise ValueError("ambiguous debug mask")
     return masks[0] if masks else None
+
+
+def boot_argument_profile(value):
+    value = text(value)
+    mask = debug_mask(value)
+    tokens = [token for token in value.split() if token.partition('=')[0].lstrip('-') != 'debug']
+    canonical = json.dumps(tokens, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+    return {'status': 'observed', 'debug_mask': mask, 'nondebug_token_count': len(tokens),
+            'nondebug_sha256': hashlib.sha256(canonical).hexdigest()}
 
 
 def capture(argv, limit=4_000_000, timeout=8):
