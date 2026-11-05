@@ -857,9 +857,10 @@ class Recovery(unittest.TestCase):
                 config["check_id"] = 9
                 config.update({"nvram_helper_sha256": "a" * 64, "nvram_source_sha256": "b" * 64})
                 ctx = config["context"]
+                config["cert_fingerprint"] = "e" * 64 if source == "bootplist" else ""
                 prepared = {"debug_source": source, "protocol": "vz-recovery-v1", "phase": "quick_prepared", "binding": r.binding(ctx),
                             "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "trigger": "reboot-quick",
-                            "debug_boot": True, "cert_fingerprint": "", "quick_flags": 1024, "helper_sha256": "c" * 64,
+                            "debug_boot": True, "cert_fingerprint": config["cert_fingerprint"], "quick_flags": 1024, "helper_sha256": "c" * 64,
                             "permission_verified": False}
                 r.private_write(directory / "token", b"synthetic-token")
                 for event in ("staged", "intent"):
@@ -889,6 +890,8 @@ class Recovery(unittest.TestCase):
                     if acknowledged:
                         result = r.quick_intent_ack(directory, config, prepared)
                         self.assertEqual(result["phase"], "quick_intent")
+                        with self.assertRaises(ValueError):
+                            r.quick_intent_ack(directory, config, {**prepared, "cert_fingerprint": "0" * 64})
                     else:
                         with self.assertRaises(ValueError):
                             r.quick_intent_ack(directory, config, prepared)

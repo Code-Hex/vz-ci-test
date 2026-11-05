@@ -1151,7 +1151,7 @@ def quick_prepare(directory, config):
 
 def quick_intent_ack(directory, config, prepared):
     if (config.get("debug_boot") is not True or config["context"].get("trigger") != "reboot-quick" or
-            prepared.get("phase") != "quick_prepared" or not mode_matches(prepared, {}, config["context"])):
+            prepared.get("phase") != "quick_prepared" or not mode_matches(prepared, config, config["context"])):
         raise ValueError("quick intent context mismatch")
     source = config["context"]["debug_source"]
     evidence = "bootplist_staged" if source == "bootplist" else "native_synced"
