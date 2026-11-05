@@ -44,6 +44,7 @@ on:
           - none
           - panic-nonce
           - panic-nonce-nvram-off
+          - netdump-prime
         default: none
       report_cert:
         description: Public recipient certificate for encrypted panic reports
@@ -143,6 +144,14 @@ jobs:
       KDP_STUN_HOST: stun.cloudflare.com
       KDP_STUN_PORT: '3478'
     steps:
+      - name: Reject conflicting discovery and after-boot controls
+        env:
+          AFTER_DEBUG_BOOT: ${{ inputs.after_debug_boot || 'none' }}
+        run: |
+          if [ "$AFTER_DEBUG_BOOT" != none ]; then
+            echo 'Choose either discovery-only or an after-boot control.' >&2
+            exit 1
+          fi
       - name: Check out trusted diagnostic scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -158,5 +167,35 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: netdump-discovery-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/debug/netdump-discovery.json
+          if-no-files-found: warn
+  netdump_receiver:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only && inputs.after_debug_boot == 'netdump-prime' && inputs.debug_boot && inputs.debug_source == 'bootplist' && inputs.trigger == 'reboot-quick' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      checks: write
+    env:
+      KDP_ROLE: receiver
+      KDP_PORT_MODE: kernel-source
+      KDP_STUN_HOST: stun.cloudflare.com
+      KDP_STUN_PORT: '3478'
+    steps:
+      - name: Check out trusted diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Keep the receiver through the non-panic reboot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KDP_REPORT_CERT: ${{ inputs.report_cert }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/recovery_netdump.py prime-receiver
+      - name: Preserve the filtered network control
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: netdump-prime-receiver-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/debug/netdump-discovery.json
           if-no-files-found: warn

@@ -10,7 +10,7 @@ import struct
 import subprocess
 
 import recovery_bootargs as boot
-from recovery_netdump_settings import DEBUG_MASK, NetdumpSettings
+from recovery_netdump_settings import DEBUG_MASK, NetdumpSettings, active_control
 
 UUID = '87453B1D-A163-31FA-B33B-0FB4BE78E6E8'
 DATA = Path('/Library/Preferences/SystemConfiguration/com.apple.Boot.plist')
@@ -529,16 +529,93 @@ def rollback(directory, marker, save, sync, *, current_boot_uuid):
     return rollback_files(directory, marker, data, preboot, save, sync, current_boot_uuid=current_boot_uuid)
 
 
-def finish(directory, marker, save, sync, *, current_boot_uuid):
+def _control_profile(value, mask, maximum):
+    if (type(value) is not dict or set(value) != {'status', 'debug_mask', 'nondebug_token_count', 'nondebug_sha256'} or
+            value['status'] != 'observed' or type(value['debug_mask']) is not type(mask) or value['debug_mask'] != mask or
+            type(value['nondebug_token_count']) is not int or not 0 <= value['nondebug_token_count'] <= maximum or
+            type(value['nondebug_sha256']) is not str or not re.fullmatch(r'[0-9a-f]{64}', value['nondebug_sha256'])):
+        raise ValueError('active_control_invalid')
+    return dict(value)
+
+
+def _checked_capture(value, scope, settings, baseline):
+    if type(value) is not dict or set(value) != {'scope', 'active_mask', 'active_status', 'control'} or value['scope'] != scope:
+        raise ValueError('active_capture_invalid')
+    mask, status, control = value['active_mask'], value['active_status'], value['control']
+    if (status not in ('observed', 'invalid', 'unavailable') or
+            (mask is not None and (type(mask) is not int or not 0 <= mask <= 0xffffffff)) or
+            (status != 'observed' and mask is not None) or type(control) is not dict):
+        raise ValueError('active_capture_invalid')
+    if control.get('status') in ('invalid', 'unavailable'):
+        if (set(control) != {'status'} or (status != 'observed' and control != {'status': status}) or
+                (control['status'] == 'unavailable' and status != 'unavailable')):
+            raise ValueError('active_capture_invalid')
+    else:
+        if (set(control) != {'status', 'settings_sha256', 'full_profile', 'remaining_profile'} or
+                control['status'] != 'observed' or control['settings_sha256'] != settings.digest() or
+                status != 'observed' or mask != DEBUG_MASK or baseline is None):
+            raise ValueError('active_capture_invalid')
+        full = _control_profile(control['full_profile'], DEBUG_MASK, 516)
+        remaining = _control_profile(control['remaining_profile'], DEBUG_MASK, 512)
+        if (full['nondebug_token_count'] != remaining['nondebug_token_count'] + 4 or
+                any(remaining[key] != baseline[key] for key in ('nondebug_token_count', 'nondebug_sha256'))):
+            raise ValueError('active_capture_invalid')
+    return value
+
+
+def _netdump_capture(directory, marker, current, settings, baseline, save, sync):
+    invalid = {'active_mask': None, 'active_status': 'invalid', 'control': {'status': 'invalid'}}
+    try:
+        try: baseline = _control_profile(baseline, None, 512)
+        except ValueError: baseline = None
+        scope = {'marker': marker, 'current_boot_uuid': current.upper(), 'settings_sha256': settings.digest(),
+                 'baseline_profile_sha256': hashlib.sha256(json.dumps(baseline, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+        started, captured = directory / 'bootplist-active-started.json', directory / 'bootplist-active-capture.json'
+        if any(path.exists() for path in (started, captured, directory / 'bootplist-observation.json', directory / 'bootplist-restored.json')):
+            if json.loads(started.read_text()) != scope: return invalid
+            raw = captured.read_bytes()
+            if len(raw) > 8192: return invalid
+            return _checked_capture(json.loads(raw), scope, settings, baseline)
+        _record(directory, started.name, scope, save, sync)
+        mask, status, control = None, 'unavailable', {'status': 'unavailable'}
+        try:
+            raw = boot.MacPlatform().active()
+            mask = boot.debug_mask(settings.strip_owned(raw))
+            status = 'observed'
+            try: control = active_control(raw, settings, baseline)
+            except ValueError: control = {'status': 'invalid'}
+        except ValueError:
+            status, control = 'invalid', {'status': 'invalid'}
+        except (OSError, subprocess.SubprocessError):
+            pass
+        value = _checked_capture({'scope': scope, 'active_mask': mask, 'active_status': status, 'control': control}, scope, settings, baseline)
+        _record(directory, captured.name, value, save, sync)
+        return value
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+        return invalid
+
+
+def finish(directory, marker, save, sync, *, current_boot_uuid, baseline_boot_argument_profile=None):
     data, preboot = _production_paths(directory, marker)
     _, _, settings = _load(directory, marker, data, preboot)
+    if settings is not None:
+        if (not isinstance(current_boot_uuid, str) or not UUID_RE.fullmatch(current_boot_uuid) or
+                current_boot_uuid.upper() == marker['baseline'].upper()): raise ValueError('boot_invalid')
+        capture = _netdump_capture(Path(directory), marker, current_boot_uuid, settings, baseline_boot_argument_profile, save, sync)
+        result = finish_files(directory, marker, data, preboot, current_boot_uuid, capture['active_mask'], save, sync,
+                              active_status=capture['active_status'])
+        status = capture['active_status']
+        if status == 'observed': status = 'observed_debug' if capture['active_mask'] == DEBUG_MASK else 'observed_no_debug'
+        result['netdump_active_control'] = (capture['control'] if result['active_debug_mask'] == capture['active_mask'] and
+                                            result['active_bootargs_status'] == status else {'status': 'invalid'})
+        return result
     try:
         active = boot.MacPlatform().active()
-        active_mask = boot.debug_mask(settings.strip_owned(active) if settings is not None else active)
+        active_mask = boot.debug_mask(active)
         active_status = 'observed'
     except ValueError:
         active_mask = None
-        active_status = 'invalid' if settings is not None else 'unavailable'
+        active_status = 'unavailable'
     except (OSError, subprocess.SubprocessError):
         active_mask = None
         active_status = 'unavailable'

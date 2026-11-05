@@ -164,6 +164,212 @@ class Transaction(unittest.TestCase):
                 self.assertEqual((data.read_bytes(), preboot.read_bytes()), (original, original))
                 if status == 'invalid': self.assertIsNone(result['active_debug_mask'])
 
+    def test_netdump_active_control_uses_one_capture_and_replays_without_reading(self):
+        settings = self.netdump_settings()
+        baseline = core.boot.boot_argument_profile('-v')
+        active = '-v debug=0x22040 ' + ' '.join(settings.tokens())
+        with tempfile.TemporaryDirectory() as tmp:
+            data, preboot, directory, original, marker = self.fixture(Path(tmp).resolve())
+            core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(),
+                             debug_mask=0x22040, netdump_settings=settings)
+            captures = []
+            def read_active(_platform):
+                captures.append(True)
+                if len(captures) != 1: raise AssertionError('active_recaptured')
+                return active.encode()
+            with patch.object(core, '_production_paths', return_value=(data, preboot)), \
+                 patch.object(core.boot.MacPlatform, 'active', read_active):
+                result = core.finish(directory, marker, save, sync,
+                                     current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                     baseline_boot_argument_profile=baseline)
+                again = core.finish(directory, marker, save, sync,
+                                    current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                    baseline_boot_argument_profile=baseline)
+            self.assertEqual(captures, [True])
+            self.assertEqual(again, result)
+            self.assertTrue(result['bootplist_restored'])
+            self.assertEqual((data.read_bytes(), preboot.read_bytes()), (original, original))
+            control = result['netdump_active_control']
+            self.assertEqual(control['status'], 'observed')
+            self.assertEqual(control['settings_sha256'], settings.digest())
+            self.assertEqual(control['remaining_profile'], {**baseline, 'debug_mask': 0x22040})
+            self.assertEqual(control['full_profile']['nondebug_token_count'], baseline['nondebug_token_count'] + 4)
+            self.assertEqual(control['full_profile']['debug_mask'], result['active_debug_mask'])
+
+    def test_netdump_bad_baseline_or_capture_still_restores_both_files(self):
+        settings = self.netdump_settings()
+        valid = '-v debug=0x22040 ' + ' '.join(settings.tokens())
+        baseline = core.boot.boot_argument_profile('-v')
+        for profile, active, status in ((None, valid, 'invalid'), ({}, valid, 'invalid'),
+                                        ({**baseline, 'debug_mask': 0x2000}, valid, 'invalid'),
+                                        (baseline, valid + ' other=1', 'invalid'),
+                                        (baseline, OSError('read_unavailable'), 'unavailable')):
+            with self.subTest(profile=profile, status=status), tempfile.TemporaryDirectory() as tmp:
+                data, preboot, directory, original, marker = self.fixture(Path(tmp).resolve())
+                core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(),
+                                 debug_mask=0x22040, netdump_settings=settings)
+                def read_active(_platform):
+                    if isinstance(active, Exception): raise active
+                    return active.encode()
+                with patch.object(core, '_production_paths', return_value=(data, preboot)), \
+                     patch.object(core.boot.MacPlatform, 'active', read_active):
+                    result = core.finish(directory, marker, save, sync,
+                                         current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                         baseline_boot_argument_profile=profile)
+                self.assertTrue(result['bootplist_restored'])
+                self.assertEqual(result['netdump_active_control'], {'status': status})
+                self.assertEqual((data.read_bytes(), preboot.read_bytes()), (original, original))
+                def forbidden(_platform): raise AssertionError('active_recaptured')
+                with patch.object(core, '_production_paths', return_value=(data, preboot)), \
+                     patch.object(core.boot.MacPlatform, 'active', forbidden):
+                    again = core.finish(directory, marker, save, sync,
+                                        current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                        baseline_boot_argument_profile=profile)
+                self.assertEqual(again, result)
+
+    def test_netdump_corrupt_or_partial_capture_does_not_block_restore_or_recapture(self):
+        settings = self.netdump_settings()
+        for filename, content in (('bootplist-active-started.json', '{'),
+                                  ('bootplist-active-capture.json', '{'),
+                                  ('bootplist-active-capture.json', '{"scope":{}}')):
+            with self.subTest(filename=filename, content=content), tempfile.TemporaryDirectory() as tmp:
+                data, preboot, directory, original, marker = self.fixture(Path(tmp).resolve())
+                core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(),
+                                 debug_mask=0x22040, netdump_settings=settings)
+                (directory / filename).write_text(content)
+                def forbidden(_platform): raise AssertionError('active_recaptured')
+                with patch.object(core, '_production_paths', return_value=(data, preboot)), \
+                     patch.object(core.boot.MacPlatform, 'active', forbidden):
+                    result = core.finish(directory, marker, save, sync,
+                                         current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                         baseline_boot_argument_profile=core.boot.boot_argument_profile('-v'))
+                self.assertTrue(result['bootplist_restored'])
+                self.assertEqual(result['netdump_active_control'], {'status': 'invalid'})
+                self.assertEqual((data.read_bytes(), preboot.read_bytes()), (original, original))
+
+    def test_netdump_capture_storage_failure_restores_and_prevents_later_recapture(self):
+        settings = self.netdump_settings()
+        baseline = core.boot.boot_argument_profile('-v')
+        active = ('-v debug=0x22040 ' + ' '.join(settings.tokens())).encode()
+        for filename in ('bootplist-active-started.json', 'bootplist-active-capture.json'):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                data, preboot, directory, original, marker = self.fixture(Path(tmp).resolve())
+                core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(),
+                                 debug_mask=0x22040, netdump_settings=settings)
+                def failing_save(path, value):
+                    if path.name == filename: raise OSError('capture_storage_failed')
+                    save(path, value)
+                calls = []
+                def read_active(_platform):
+                    calls.append(True)
+                    return active
+                with patch.object(core, '_production_paths', return_value=(data, preboot)), \
+                     patch.object(core.boot.MacPlatform, 'active', read_active):
+                    result = core.finish(directory, marker, failing_save, sync,
+                                         current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                         baseline_boot_argument_profile=baseline)
+                    count = len(calls)
+                    again = core.finish(directory, marker, save, sync,
+                                        current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                        baseline_boot_argument_profile=baseline)
+                self.assertTrue(result['bootplist_restored'])
+                self.assertEqual(result['netdump_active_control'], {'status': 'invalid'})
+                self.assertEqual(again, result)
+                self.assertEqual(len(calls), count)
+                self.assertEqual((data.read_bytes(), preboot.read_bytes()), (original, original))
+
+    def test_netdump_capture_replay_rejects_scope_control_and_baseline_tampering(self):
+        settings = self.netdump_settings()
+        baseline = core.boot.boot_argument_profile('-v')
+        for mutation in ('source', 'boot', 'settings', 'baseline', 'mask', 'extra', 'control_settings', 'count_bool', 'remaining_hash', 'caller_baseline'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                data, preboot, directory, _, marker = self.fixture(Path(tmp).resolve())
+                core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(),
+                                 debug_mask=0x22040, netdump_settings=settings)
+                with patch.object(core, '_production_paths', return_value=(data, preboot)), \
+                     patch.object(core.boot.MacPlatform, 'active', return_value=('-v debug=0x22040 ' + ' '.join(settings.tokens())).encode()):
+                    first = core.finish(directory, marker, save, sync,
+                                        current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                        baseline_boot_argument_profile=baseline)
+                self.assertEqual(first['netdump_active_control']['status'], 'observed')
+                path = directory / 'bootplist-active-capture.json'
+                value = json.loads(path.read_text())
+                if mutation == 'source': value['scope']['marker']['source_identity'] = 'd' * 64
+                elif mutation == 'boot': value['scope']['current_boot_uuid'] = marker['baseline']
+                elif mutation == 'settings': value['scope']['settings_sha256'] = '0' * 64
+                elif mutation == 'baseline': value['scope']['baseline_profile_sha256'] = '0' * 64
+                elif mutation == 'mask': value['active_mask'] = 0x2000
+                elif mutation == 'extra': value['raw'] = 'unowned'
+                elif mutation == 'control_settings': value['control']['settings_sha256'] = '0' * 64
+                elif mutation == 'count_bool': value['control']['full_profile']['nondebug_token_count'] = True
+                elif mutation == 'remaining_hash': value['control']['remaining_profile']['nondebug_sha256'] = '0' * 64
+                path.write_text(json.dumps(value))
+                supplied = core.boot.boot_argument_profile('-v other=1') if mutation == 'caller_baseline' else baseline
+                def forbidden(_platform): raise AssertionError('active_recaptured')
+                with patch.object(core, '_production_paths', return_value=(data, preboot)), \
+                     patch.object(core.boot.MacPlatform, 'active', forbidden):
+                    result = core.finish(directory, marker, save, sync,
+                                         current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                         baseline_boot_argument_profile=supplied)
+                self.assertTrue(result['bootplist_restored'])
+                self.assertEqual(result['netdump_active_control'], {'status': 'invalid'})
+
+    def test_netdump_old_mask_receipt_never_gets_a_new_capture(self):
+        settings = self.netdump_settings()
+        with tempfile.TemporaryDirectory() as tmp:
+            data, preboot, directory, _, marker = self.fixture(Path(tmp).resolve())
+            core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(),
+                             debug_mask=0x22040, netdump_settings=settings)
+            core.finish_files(directory, marker, data, preboot,
+                              'BBBBBBBB-2222-2222-2222-222222222222', 0x2000, save, sync)
+            def forbidden(_platform): raise AssertionError('active_recaptured')
+            with patch.object(core, '_production_paths', return_value=(data, preboot)), \
+                 patch.object(core.boot.MacPlatform, 'active', forbidden):
+                result = core.finish(directory, marker, save, sync,
+                                     current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                     baseline_boot_argument_profile=core.boot.boot_argument_profile('-v'))
+            self.assertEqual(result['active_debug_mask'], 0x2000)
+            self.assertTrue(result['bootplist_restored'])
+            self.assertEqual(result['netdump_active_control'], {'status': 'invalid'})
+
+    def test_netdump_capture_and_restored_receipt_mask_mismatch_is_negative(self):
+        settings = self.netdump_settings()
+        baseline = core.boot.boot_argument_profile('-v')
+        with tempfile.TemporaryDirectory() as tmp:
+            data, preboot, directory, _, marker = self.fixture(Path(tmp).resolve())
+            core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(),
+                             debug_mask=0x22040, netdump_settings=settings)
+            with patch.object(core, '_production_paths', return_value=(data, preboot)), \
+                 patch.object(core.boot.MacPlatform, 'active', return_value=('-v debug=0x22040 ' + ' '.join(settings.tokens())).encode()):
+                first = core.finish(directory, marker, save, sync,
+                                    current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                    baseline_boot_argument_profile=baseline)
+            self.assertEqual(first['netdump_active_control']['status'], 'observed')
+            for filename in ('bootplist-observation.json', 'bootplist-restored.json'):
+                path = directory / filename
+                value = json.loads(path.read_text())
+                value.update(active_debug_mask=0x2000, active_bootargs_status='observed_no_debug')
+                path.write_text(json.dumps(value))
+            with patch.object(core, '_production_paths', return_value=(data, preboot)):
+                result = core.finish(directory, marker, save, sync,
+                                     current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                     baseline_boot_argument_profile=baseline)
+            self.assertEqual(result['active_debug_mask'], 0x2000)
+            self.assertEqual(result['netdump_active_control'], {'status': 'invalid'})
+
+    def test_legacy_finish_ignores_new_baseline_and_adds_no_control(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data, preboot, directory, original, marker = self.fixture(Path(tmp).resolve())
+            core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid())
+            with patch.object(core, '_production_paths', return_value=(data, preboot)), \
+                 patch.object(core.boot.MacPlatform, 'active', return_value=b'-v debug=0x2000'):
+                result = core.finish(directory, marker, save, sync,
+                                     current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                     baseline_boot_argument_profile={'invalid': 'ignored'})
+            self.assertNotIn('netdump_active_control', result)
+            self.assertTrue(result['bootplist_restored'])
+            self.assertEqual((data.read_bytes(), preboot.read_bytes()), (original, original))
+
     def test_nvram_off_derivation_adds_only_fixed_token(self):
         original = plistlib.dumps({'Kernel Flags': '-v', 'other': 'preserved'}, fmt=plistlib.FMT_BINARY)
         default = core.stage_content(original, 0x102000)

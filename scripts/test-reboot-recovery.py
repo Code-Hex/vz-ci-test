@@ -14,6 +14,62 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def test_netdump_private_plan_binds_the_boot_mode_and_initial_profile(self):
+        n = r.recovery_netdump
+        ctx = {'run_id': '123', 'attempt': '1', 'sha': 'a' * 40, 'after_debug_boot': 'netdump-prime'}
+        core, network = n.source_identity(r.__file__)
+        profile = r.recovery_bootargs.boot_argument_profile('preempt=1')
+        baseline = n.BootBaseline.from_profile('11111111-1111-1111-1111-111111111111', profile)
+        offer = n.ReceiverOffer(r.binding(ctx), 'c' * 32, n.Endpoint('1.1.1.1', 10248), 43210,
+                                'f' * 64, core, network, 'prime')
+        settings = r.recovery_netdump_settings.NetdumpSettings('1.1.1.1', '192.168.64.1', 10248, 'b' * 16)
+        plan = n.DiscoveryPlan(offer, 'b' * 64, n.Endpoint('8.8.8.8', 40000), '192.168.64.2', 'en0',
+                               settings, n.HelloStats(True, True, 10), baseline)
+        config = {'context': ctx, 'netdump_plan': plan.record(), 'nonce': plan.nonce,
+                  'baseline': baseline.baseline_boot_uuid, 'cert_fingerprint': 'f' * 64,
+                  'initial_boot_argument_profile': profile}
+        self.assertEqual(r.netdump_plan(config), plan)
+        for field, value in (('nonce', 'd' * 64), ('baseline', '22222222-2222-2222-2222-222222222222'),
+                              ('cert_fingerprint', 'e' * 64), ('initial_boot_argument_profile', {'status': 'unavailable'})):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                r.netdump_plan({**config, field: value})
+
+    def test_netdump_prime_does_not_start_when_boot_restore_is_unproven(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            result = r.run_netdump_prime_once(directory, {'context': {'after_debug_boot': 'netdump-prime'}},
+                                               'new', {}, 'token', 100)
+            self.assertEqual(result, {'status': 'invalid'})
+            self.assertEqual(list(directory.iterdir()), [])
+
+    def test_netdump_prime_boot_success_requires_the_receiver_proof(self):
+        ctx = {'run_id': '123', 'attempt': '1', 'sha': 'a' * 40, 'debug_source': 'bootplist',
+               'debug_boot': True, 'trigger': 'reboot-quick', 'after_debug_boot': 'netdump-prime'}
+        current = '22222222-2222-2222-2222-222222222222'
+        facts = {'active_debug_mask': 0x22040, 'active_bootargs_status': 'observed_debug', 'current_boot_uuid': current,
+                 'bootplist_restored': True, 'bootplist_file_states': {'data': 'staged', 'preboot': 'staged'},
+                 'bootplist_restore': {name: {'bytes': True, 'metadata': True, 'timestamps': True} for name in ('data', 'preboot')}}
+        pending = {'nonce': 'b' * 64, 'baseline_boot_uuid': '11111111-1111-1111-1111-111111111111',
+                   'cert_fingerprint': 'c' * 64, 'check_id': 17}
+        data = {'current_boot_uuid': current, 'debug_boot_facts': facts}
+        self.assertTrue(r.debug_boot_proven(facts, 'bootplist', 0x22040))
+        self.assertFalse(r.debug_lineage_matches(data, pending, ctx))
+        facts['netdump_prime'] = {'status': 'verified', 'proof': {}}
+        self.assertFalse(r.debug_lineage_matches(data, pending, ctx))
+
+    def test_netdump_prime_is_a_certificate_bound_boot_control_without_panic(self):
+        ctx = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
+               'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,
+               'trigger': 'reboot-quick', 'debug_boot': True, 'debug_source': 'bootplist', 'after_debug_boot': 'netdump-prime'}
+        self.assertTrue(r.valid_context(ctx, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        self.assertTrue(r.netdump_prime(ctx))
+        self.assertEqual(r.expected_debug_mask(ctx), 0x22040)
+        self.assertTrue(r.certificate_required(ctx))
+        self.assertFalse(r.report_required(ctx))
+        self.assertFalse(r.panic_followup(ctx))
+        for change in ({'trigger': 'reboot'}, {'trigger': 'panic-control'}, {'debug_boot': False}, {'debug_source': 'nvram'}):
+            self.assertFalse(r.valid_context({**ctx, **change}, 'Darwin', 'x86_64', r.KERNEL_UUID))
+
     def test_runtime_watch_identity_and_check_are_strict(self):
         config, saved, _b3 = self.followup_fixture()
         identity = r.runtime_watch_identity(config, saved['scope'], 'f' * 64)

@@ -9,6 +9,8 @@ import recovery_nvram_panic
 import recovery_panic_control
 import recovery_arrival
 import recovery_sources
+import recovery_netdump_settings
+import recovery_netdump
 import json
 import math
 import os
@@ -42,7 +44,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
-              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "netdump-prime") and
               (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
@@ -70,12 +72,80 @@ def nvram_off_control(ctx):
     return ctx.get("after_debug_boot") == "panic-nonce-nvram-off"
 
 
+def netdump_prime(ctx):
+    return ctx.get('after_debug_boot') == 'netdump-prime'
+
+
 def expected_debug_mask(ctx):
+    if netdump_prime(ctx):
+        return recovery_netdump_settings.DEBUG_MASK
     return 0x102000 if panic_followup(ctx) else 0x2000
 
 
 def report_required(ctx):
     return panic_mode(ctx) or panic_followup(ctx)
+
+
+def certificate_required(ctx):
+    return report_required(ctx) or netdump_prime(ctx)
+
+
+def netdump_context(ctx):
+    return {'run': ctx['run_id'], 'attempt': ctx['attempt'], 'sha': ctx['sha'],
+            'role': 'intel', 'port_mode': 'kernel-source'}
+
+
+def netdump_plan(config):
+    plan = recovery_netdump.DiscoveryPlan.from_record(config['netdump_plan'])
+    core, network = recovery_netdump.source_identity(__file__)
+    recovery_netdump.match_offer(plan.offer.record(), netdump_context(config['context']),
+                                config['cert_fingerprint'], core, dict(network), 'prime')
+    if (plan.offer.purpose != 'prime' or plan.nonce != config['nonce'] or plan.stats is None or
+            plan.baseline is None or plan.baseline.baseline_boot_uuid != config['baseline'] or
+            plan.baseline.profile() != config['initial_boot_argument_profile']):
+        raise ValueError('netdump plan scope mismatch')
+    return plan
+
+
+def netdump_scope(config, current):
+    if config['debug_source_identity'] != debug_source_identity():
+        raise ValueError('netdump source mismatch')
+    return recovery_netdump.PrimeScope(binding(config['context']), config['nonce'], config['baseline'], current,
+                                      config['debug_source_identity'], config['cert_fingerprint'], config['check_id'])
+
+
+def run_netdump_prime_once(directory, config, current, facts, token, deadline):
+    if not debug_boot_proven(facts, 'bootplist', recovery_netdump_settings.DEBUG_MASK):
+        return {'status': 'invalid'}
+    try:
+        plan = netdump_plan(config)
+        control = facts.get('netdump_active_control', {})
+        if control.get('status') != 'observed' or control.get('settings_sha256') != plan.settings.digest():
+            return {'status': 'invalid'}
+        expected = netdump_scope(config, current)
+        scope = {'scope': expected.record(), 'plan_sha256': recovery_netdump.digest(plan.record())}
+        result_path = directory / 'netdump-prime-result.json'
+        started_path = directory / 'netdump-prime-started.json'
+        if result_path.exists():
+            saved = json.loads(result_path.read_text())
+            if type(saved) is not dict or set(saved) != {'scope', 'plan_sha256', 'proof'} or any(saved[key] != value for key, value in scope.items()):
+                raise ValueError('netdump result scope mismatch')
+            if not started_path.exists() or json.loads(started_path.read_text()) != scope:
+                raise ValueError('netdump result start mismatch')
+            proof = recovery_netdump.verify_prime_ack(netdump_context(config['context']), token, saved['proof'], expected, control, deadline - 30)
+            return {'status': 'verified', 'proof': proof}
+        if started_path.exists():
+            return {'status': 'uncertain'}
+        private_write(started_path, json.dumps(scope).encode())
+        sync_directory(directory)
+        proof = recovery_netdump.prime(netdump_context(config['context']), token, (directory / 'report-cert.pem').read_bytes(),
+                                       plan, current, config['check_id'], main_path=__file__, hard_deadline=deadline - 30)
+        proof = recovery_netdump.verify_prime_ack(netdump_context(config['context']), token, proof, expected, control, deadline - 30)
+        private_write(result_path, json.dumps({**scope, 'proof': proof}).encode())
+        sync_directory(directory)
+        return {'status': 'verified', 'proof': proof}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
+        return {'status': 'failed'}
 
 
 def binding(ctx):
@@ -161,6 +231,17 @@ def debug_lineage_matches(data, pending, ctx):
         return False
     if nvram_off_control(ctx) and not nvram_off_control_proven(facts):
         return False
+    if netdump_prime(ctx):
+        try:
+            result = facts.get('netdump_prime')
+            if type(result) is not dict or set(result) != {'status', 'proof'} or result['status'] != 'verified':
+                return False
+            expected = recovery_netdump.PrimeScope(binding(ctx), pending['nonce'], pending['baseline_boot_uuid'],
+                data['current_boot_uuid'], debug_source_identity(), pending['cert_fingerprint'], pending['check_id'])
+            recovery_netdump.validate_prime_proof(result['proof'], expected, facts['netdump_active_control'])
+            return facts.get('current_boot_uuid') == data['current_boot_uuid']
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return False
     if not panic_followup(ctx):
         return facts.get("current_boot_uuid") == data.get("current_boot_uuid")
     boots = [pending["baseline_boot_uuid"], data.get("debug_boot_uuid"), data.get("current_boot_uuid")]
@@ -496,7 +577,7 @@ def prepare_root(payload):
         raise ValueError("daemon Python executable unavailable")
     cert = payload.get("report_cert", "").encode()
     fingerprint = ""
-    if report_required(ctx):
+    if certificate_required(ctx):
         fingerprint = recovery_reports.encrypt_bundle(cert, {"preflight": True}, b"synthetic")["cert_fingerprint"]
     directory = root_dir(ctx)
     directory.mkdir(mode=0o700)
@@ -552,7 +633,12 @@ def prepare_root(payload):
     baseline = boot_uuid()
     if not baseline:
         raise ValueError("empty boot session")
-    initial_boot_argument_profile = observe_boot_argument_profile() if panic_followup(ctx) else {"status": "unavailable"}
+    initial_boot_argument_profile = observe_boot_argument_profile() if panic_followup(ctx) or netdump_prime(ctx) else {"status": "unavailable"}
+    plan = None
+    if netdump_prime(ctx):
+        baseline_fact = recovery_netdump.BootBaseline.from_profile(baseline, initial_boot_argument_profile)
+        plan = recovery_netdump.discover(netdump_context(ctx), token, cert, nonce, main_path=__file__,
+                                         purpose='prime', baseline=baseline_fact)
     if panic_followup(ctx):
         recovery_panic_control.build(directory, nonce, private_write, sync_directory)
         baseline_status, baseline_raw = recovery_nvram_panic.read_panic_info()
@@ -574,6 +660,8 @@ def prepare_root(payload):
               "debug_source_identity": debug_source_identity() if ctx.get("debug_boot", False) else "",
               "arrival_api_ipv4": recovery_arrival.resolve_api()}
     config["initial_boot_argument_profile"] = initial_boot_argument_profile
+    if plan is not None:
+        config['netdump_plan'] = plan.record()
     private_write(directory / "config.json", json.dumps(config).encode())
     for target, source in recovery_sources.source_files(__file__):
         private_write(directory / target, source.read_bytes())
@@ -1018,7 +1106,8 @@ def debug_owner(directory, config, current):
         if source == "bootplist":
             debug_event(directory, config, "bootplist_inflight", current)
             fact = recovery_bootplist.stage(directory, marker, private_write, sync_directory, debug_mask=expected_debug_mask(config["context"]),
-                                               nvram_paniclog=0 if nvram_off_control(config["context"]) else None)
+                                               nvram_paniclog=0 if nvram_off_control(config["context"]) else None,
+                                               netdump_settings=netdump_plan(config).settings if netdump_prime(config['context']) else None)
             debug_event(directory, config, "bootplist_staged", current, bootplist_stage=fact)
         else:
             recovery_bootargs.stage(directory, marker, platform, private_write, sync_directory)
@@ -1811,7 +1900,9 @@ def collect(directory):
         try:
             if config["context"]["debug_source"] == "bootplist":
                 debug_facts = recovery_bootplist.finish(directory, debug_boot_marker(config), private_write, sync_directory,
-                                                        current_boot_uuid=current)
+                                                        current_boot_uuid=current,
+                                                        baseline_boot_argument_profile=config.get('initial_boot_argument_profile')
+                                                        if netdump_prime(config['context']) else None)
             else:
                 debug_facts = recovery_bootargs.finish(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory,
                                                        current_boot_uuid=current, inventory=False)
@@ -1866,7 +1957,11 @@ def collect(directory):
         if panic_followup(config["context"]):
             followup_start(directory, config, current, debug_facts, token)
             return
-        if debug_restored(debug_facts, config["context"]["debug_source"]):
+        if netdump_prime(config['context']):
+            debug_facts['netdump_prime'] = run_netdump_prime_once(directory, config, current, debug_facts, token, deadline)
+        if netdump_prime(config['context']):
+            debug_facts['optional_inventory_status'] = 'skipped_netdump_control'
+        elif debug_restored(debug_facts, config["context"]["debug_source"]):
             try:
                 optional = recovery_bootargs.observe_once(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(),
                                                           private_write, sync_directory, current_boot_uuid=current)
@@ -1895,6 +1990,8 @@ def collect(directory):
     successful = config["context"].get("trigger", "reboot") in ("reboot", "reboot-quick") or capture_state == "captured"
     if config.get("debug_boot", False):
         successful = successful and debug_boot_proven(debug_facts, config["context"]["debug_source"], expected_debug_mask(config["context"]))
+    if netdump_prime(config['context']):
+        successful = successful and debug_facts.get('netdump_prime', {}).get('status') == 'verified'
     output = {"title": "Recovery observed" if successful else "Panic report unavailable", "summary": summary}
     if envelope:
         output["text"] = envelope["ciphertext"]
@@ -1985,7 +2082,7 @@ def sudo_call(operation, payload, timeout=40):
 
 
 def controller(ctx, token):
-    deadline = time.monotonic() + (1080 if panic_followup(ctx) else 600)
+    deadline = time.monotonic() + (1080 if panic_followup(ctx) or netdump_prime(ctx) else 600)
     check_id = None
     pending = None
     sealed = False
@@ -2008,6 +2105,12 @@ def controller(ctx, token):
                         matches = pending is not None and boot_proof_matches(data, pending, ctx)
                         if matches and report_required(ctx):
                             matches = panic_envelope_matches(data, check.get("output", {}).get("text", ""), pending, ctx)
+                        if matches and netdump_prime(ctx):
+                            expected = recovery_netdump.PrimeScope(binding(ctx), pending['nonce'], pending['baseline_boot_uuid'],
+                                data['current_boot_uuid'], debug_source_identity(), pending['cert_fingerprint'], check_id)
+                            facts = data['debug_boot_facts']
+                            recovery_netdump.verify_prime_ack(netdump_context(ctx), token, facts['netdump_prime']['proof'], expected,
+                                                              facts['netdump_active_control'], deadline)
                         if matches and check.get("conclusion") == "success":
                             print(json.dumps({"event": "controller_boot_proof", "check_id": check_id}), flush=True)
                             proof = True
@@ -2018,14 +2121,15 @@ def controller(ctx, token):
                         if not re.fullmatch(r"[0-9a-f]{64}", nonce) or not re.fullmatch(r"[0-9A-Fa-f-]{36}", baseline):
                             raise ValueError("nonce or baseline invalid")
                         fingerprint = data.get("cert_fingerprint", "")
-                        if report_required(ctx) and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+                        if certificate_required(ctx) and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
                             raise ValueError("certificate fingerprint invalid")
-                        if not report_required(ctx) and fingerprint:
+                        if not certificate_required(ctx) and fingerprint:
                             raise ValueError("unexpected certificate fingerprint")
                         if pending is None:
                             ciphertext = encrypt_token(public.encode(), token)
                             pending = {"nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public,
-                                       "ciphertext": base64.b64encode(ciphertext).decode(), "cert_fingerprint": fingerprint}
+                                       "ciphertext": base64.b64encode(ciphertext).decode(), "cert_fingerprint": fingerprint,
+                                       "check_id": check_id}
                         if (nonce, baseline, public, fingerprint) != (pending["nonce"], pending["baseline_boot_uuid"], pending["public_key"], pending["cert_fingerprint"]):
                             raise ValueError("public key metadata changed")
                         sealed_summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "sealed_token", "binding": binding(ctx),
@@ -2086,7 +2190,8 @@ def main():
                             "quick_helper": os.environ.pop("RECOVERY_QUICK_HELPER", ""),
                             "nvram_helper": os.environ.pop("RECOVERY_NVRAM_HELPER", ""),
                             "nvram_source_sha256": hashlib.sha256(Path("probes/nvram_backend.c").read_bytes()).hexdigest()
-                            if ctx.get("debug_boot") and ctx.get("trigger") == "reboot-quick" and ctx["debug_source"] == "nvram" else ""}, timeout=120), end="", flush=True)
+                            if ctx.get("debug_boot") and ctx.get("trigger") == "reboot-quick" and ctx["debug_source"] == "nvram" else ""},
+                            timeout=360 if netdump_prime(ctx) else 120), end="", flush=True)
         elif op == "arm":
             print(sudo_call("arm-root", {"context": ctx, "token": token}, timeout=510), end="", flush=True)
             deadline = time.monotonic() + 20
