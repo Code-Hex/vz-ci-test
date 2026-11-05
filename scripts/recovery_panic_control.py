@@ -61,7 +61,7 @@ def once_record(directory, name, data, sync):
 
 
 class PrepareProgress:
-    STAGES = frozenset(('setup', 'build', 'sign', 'observe', 'compile_panic', 'receipt'))
+    STAGES = frozenset(('setup', 'build', 'sign', 'verify_signature', 'verify_build', 'observe', 'compile_panic', 'receipt'))
     ENUMS = {'list_status': frozenset(('unavailable', 'matched', 'ambiguous', 'missing')),
              'list_stderr': frozenset(('unavailable', 'empty', 'permission', 'attach_failed', 'no_probes', 'compile_failed', 'other')),
              'trace_stderr': frozenset(('unavailable', 'empty', 'permission', 'attach_failed', 'no_probes', 'compile_failed', 'other'))}
@@ -69,8 +69,9 @@ class PrepareProgress:
     COUNTS = frozenset(('ready_count', 'hit_count'))
     EXITS = frozenset(('list_exit', 'tracer_exit', 'helper_exit'))
 
-    def __init__(self, directory, save, sync, facts):
+    def __init__(self, directory, save, sync, facts, *, failure_file='prepare-failure.json'):
         self.directory, self.save, self.sync, self.facts = directory, save, sync, facts
+        self.failure_file = failure_file
         self.stage = 'setup'
 
     def __enter__(self):
@@ -93,22 +94,32 @@ class PrepareProgress:
             elif key in self.COUNTS and type(value) is int and 0 <= value <= 65536: observed[key] = value
             elif key in self.EXITS and (value is None or type(value) is int and -255 <= value <= 255): observed[key] = value
         try:
-            record(self.directory, 'prepare-failure.json', {'stage': self.stage if self.stage in self.STAGES else 'setup',
+            record(self.directory, self.failure_file, {'stage': self.stage if self.stage in self.STAGES else 'setup',
                                                            'kind': kind, 'observe': observed}, self.save, self.sync)
         except BaseException:
             pass
         return False
 
 
-def prepare(directory, nonce, save, sync):
+def read_private(path, mode, maximum):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or
+                stat.S_IMODE(info.st_mode) != mode or info.st_size > maximum):
+            raise ValueError('private_file_invalid')
+        data = stream.read(maximum + 1)
+        after = os.fstat(stream.fileno())
+        if len(data) != info.st_size or (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size) != (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns, after.st_size):
+            raise ValueError('private_file_changed')
+        return data
+
+
+def build(directory, nonce, save, sync):
     if not isinstance(nonce, str) or not HEX.fullmatch(nonce): raise ValueError('nonce_invalid')
     directory = Path(directory) / 'panic-control'
     os.mkdir(directory, 0o700)
-    facts = {'list_status': 'unavailable', 'list_exit': None, 'list_stderr': 'unavailable',
-             'ready_count': 0, 'hit_count': 0, 'provider_exact': None, 'function_exact': None,
-             'name_exact': None, 'released': False, 'tracer_exit': None, 'helper_exit': None,
-             'trace_stderr': 'unavailable'}
-    with PrepareProgress(directory, save, sync, facts) as progress:
+    with PrepareProgress(directory, save, sync, {}, failure_file='build-failure.json') as progress:
         sync(directory.parent)
         p = load_preflight()
         source = p.helper_source(nonce).encode()
@@ -120,17 +131,55 @@ def prepare(directory, nonce, save, sync):
         progress.stage = 'sign'
         code, _ = p.command(['/usr/bin/codesign', '-s', '-', '-f', str(binary)], directory, 'sign', env=CHILD_ENV)
         if code: raise ValueError('sign_failed')
+        progress.stage = 'verify_signature'
+        code, _ = p.command(['/usr/bin/codesign', '--verify', '--strict', str(binary)], directory, 'verify-signature', env=CHILD_ENV)
+        if code: raise ValueError('signature_invalid')
         os.chmod(binary, 0o700)
         with binary.open('rb') as stream: os.fsync(stream.fileno())
         sync(directory)
-        progress.stage = 'observe'
-        p.observe(binary, nonce, directory, facts, env=CHILD_ENV)
-        progress.stage = 'compile_panic'
-        if not p.compile_panic(binary, nonce, directory, env=CHILD_ENV): raise ValueError('panic_compile_failed')
         progress.stage = 'receipt'
-        prepared = {**source_hashes(), 'helper_source_sha256': digest(source), 'helper_sha256': digest(binary.read_bytes()),
-                    'nonce_sha256': digest(nonce.encode()), 'observe_status': 'passed', 'compile_status': 'passed'}
-        record(directory, 'prepared.json', prepared, save, sync)
+        built = {**source_hashes(), 'helper_source_sha256': digest(source), 'helper_sha256': digest(read_private(binary, 0o700, 16 * 1024 * 1024)),
+                 'nonce_sha256': digest(nonce.encode()), 'build_status': 'passed', 'sign_status': 'passed', 'signature_status': 'verified'}
+        record(directory, 'built.json', built, save, sync)
+        return built
+
+
+def validate_built(directory, nonce):
+    if not isinstance(nonce, str) or not HEX.fullmatch(nonce): raise ValueError('nonce_invalid')
+    directory = Path(directory) / 'panic-control'
+    p = load_preflight()
+    source = read_private(directory / 'helper.c', 0o600, 1024 * 1024)
+    binary = read_private(directory / 'helper', 0o700, 16 * 1024 * 1024)
+    built = json.loads(read_private(directory / 'built.json', 0o600, 65536))
+    expected = {**source_hashes(), 'helper_source_sha256': digest(p.helper_source(nonce).encode()),
+                'helper_sha256': digest(binary), 'nonce_sha256': digest(nonce.encode()),
+                'build_status': 'passed', 'sign_status': 'passed', 'signature_status': 'verified'}
+    if built != expected or digest(source) != expected['helper_source_sha256']: raise ValueError('built_invalid')
+    return built
+
+
+def prepare(directory, nonce, save, sync, *, observe=None, compile_only=None):
+    private = Path(directory) / 'panic-control'
+    facts = {'list_status': 'unavailable', 'list_exit': None, 'list_stderr': 'unavailable',
+             'ready_count': 0, 'hit_count': 0, 'provider_exact': None, 'function_exact': None,
+             'name_exact': None, 'released': False, 'tracer_exit': None, 'helper_exit': None,
+             'trace_stderr': 'unavailable'}
+    with PrepareProgress(private, save, sync, facts) as progress:
+        progress.stage = 'verify_build'
+        built = validate_built(directory, nonce)
+        p = load_preflight()
+        observe = p.observe if observe is None else observe
+        compile_only = p.compile_panic if compile_only is None else compile_only
+        binary = private / 'helper'
+        progress.stage = 'observe'
+        observe(binary, nonce, private, facts, env=CHILD_ENV)
+        progress.stage = 'compile_panic'
+        if not compile_only(binary, nonce, private, env=CHILD_ENV): raise ValueError('panic_compile_failed')
+        progress.stage = 'receipt'
+        prepared = {key: built[key] for key in ('control_sha256', 'preflight_sha256', 'getter_sha256',
+                                                 'helper_source_sha256', 'helper_sha256', 'nonce_sha256')}
+        prepared.update(observe_status='passed', compile_status='passed')
+        record(private, 'prepared.json', prepared, save, sync)
         return prepared
 
 

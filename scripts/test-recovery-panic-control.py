@@ -40,6 +40,67 @@ class PanicControl(unittest.TestCase):
                     raise original
             self.assertIs(captured.exception, original)
 
+    def test_b1_build_and_b2_prepare_never_builds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            def save(path, data):
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write(data); stream.flush(); os.fsync(stream.fileno())
+            sync = lambda _: None
+            built = control.build(root, 'a' * 64, save, sync)
+            self.assertEqual(built['signature_status'], 'verified')
+            import importlib.util
+            copydir = root / 'copied-sources'; copydir.mkdir()
+            scripts = Path(control.__file__).parent
+            for filename in ('recovery_panic_control.py', 'panic-source-preflight.py', 'recovery_nvram_panic.py'):
+                (copydir / filename).write_bytes((scripts / filename).read_bytes())
+            spec = importlib.util.spec_from_file_location('private_control', copydir / 'recovery_panic_control.py')
+            copied = importlib.util.module_from_spec(spec); spec.loader.exec_module(copied)
+            self.assertEqual(copied.validate_built(root, 'a' * 64), built)
+            calls = []
+            def observe(binary, nonce, directory, facts, *, env):
+                self.assertEqual(env, control.CHILD_ENV)
+                calls.append('observe')
+            def compile_only(binary, nonce, directory, *, env):
+                calls.append('compile_only'); return True
+            prepared = control.prepare(root, 'a' * 64, save, sync, observe=observe, compile_only=compile_only)
+            self.assertEqual(calls, ['observe', 'compile_only'])
+            self.assertEqual(prepared['helper_sha256'], built['helper_sha256'])
+            self.assertEqual(control.validate_prepared(root, 'a' * 64, prepared), root / 'panic-control' / 'helper')
+
+    def test_b2_rejects_tampered_or_missing_build_before_observation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            def save(path, data):
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write(data); stream.flush(); os.fsync(stream.fileno())
+            sync = lambda _: None
+            control.build(root, 'a' * 64, save, sync)
+            private = root / 'panic-control'
+            paths = [private / 'built.json', private / 'helper.c', private / 'helper']
+            originals = {path: path.read_bytes() for path in paths}
+            calls = []
+            def observe(*args, **kwargs): calls.append('observe')
+            def compile_only(*args, **kwargs): calls.append('compile_only'); return True
+            for kind in ('built_missing', 'built_modified', 'source_modified', 'binary_modified', 'wrong_nonce', 'binary_mode'):
+                with self.subTest(kind=kind):
+                    if kind == 'built_missing': paths[0].unlink()
+                    elif kind == 'built_modified': paths[0].write_bytes(b'{}')
+                    elif kind == 'source_modified': paths[1].write_bytes(b'wrong')
+                    elif kind == 'binary_modified': paths[2].write_bytes(b'wrong')
+                    elif kind == 'binary_mode': paths[2].chmod(0o755)
+                    with self.assertRaises((ValueError, OSError)):
+                        control.prepare(root, 'b' * 64 if kind == 'wrong_nonce' else 'a' * 64,
+                                        save, sync, observe=observe, compile_only=compile_only)
+                    self.assertEqual(calls, [])
+                    self.assertEqual(__import__('json').loads((private / 'prepare-failure.json').read_text())['stage'], 'verify_build')
+                    for path in paths:
+                        if not path.exists() or path.read_bytes() != originals[path]: path.write_bytes(originals[path])
+                        path.chmod(0o700 if path.name == 'helper' else 0o600)
+                    (private / 'prepare-failure.json').unlink()
+
     def test_scope_requires_distinct_valid_boots_and_exact_fields(self):
         scope = {'binding': '12/1/' + 'a' * 40, 'nonce': 'b' * 64,
                  'baseline': 'AAAAAAAA-1111-1111-1111-111111111111',

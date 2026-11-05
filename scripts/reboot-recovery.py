@@ -429,6 +429,8 @@ def prepare_root(payload):
     baseline = boot_uuid()
     if not baseline:
         raise ValueError("empty boot session")
+    if panic_followup(ctx):
+        recovery_panic_control.build(directory, nonce, private_write, sync_directory)
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "public_key", "binding": binding(ctx),
                           "nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public,
                           "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "debug_source": ctx["debug_source"], "after_debug_boot": ctx.get("after_debug_boot", "none"), "cert_fingerprint": fingerprint})
