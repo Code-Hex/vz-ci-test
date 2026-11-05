@@ -243,7 +243,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def api(method, path, token, payload=None):
     if not (path == "/check-runs" or re.fullmatch(r"/check-runs/[1-9][0-9]*", path) or
-            re.fullmatch(r"/commits/[0-9a-f]{40}/check-runs\?filter=all&per_page=100", path)):
+            re.fullmatch(r"/commits/[0-9a-f]{40}/check-runs\?filter=all&per_page=100", path) or
+            (method == "GET" and re.fullmatch(
+                r"/actions/runs/[1-9][0-9]{0,19}/attempts/[1-9][0-9]{0,4}/jobs\?per_page=100", path))):
         raise ValueError("API endpoint rejected")
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(API + path, method=method, data=data, headers={"Authorization": "Bearer " + token,

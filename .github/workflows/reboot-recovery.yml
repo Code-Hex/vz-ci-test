@@ -3,6 +3,11 @@ name: Intel reboot and panic recovery
 on:
   workflow_dispatch:
     inputs:
+      netdump_synthetic_capture_only:
+        description: Check independent encrypted capture after the sender exits
+        required: false
+        type: boolean
+        default: false
       netdump_discovery_only:
         description: Check the receiver and host plan without rebooting
         required: false
@@ -57,7 +62,7 @@ permissions:
 
 jobs:
   controller:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only && !inputs.netdump_synthetic_capture_only }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.after_debug_boot != 'none' && 20 || 12 }}
     env:
@@ -80,7 +85,7 @@ jobs:
           RECOVERY_CLEANUP_CHECK_ID: ${{ inputs.cleanup_check }}
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py controller
   verify:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only && !inputs.netdump_synthetic_capture_only }}
     runs-on: macos-26-intel
     timeout-minutes: ${{ inputs.after_debug_boot != 'none' && 20 || 12 }}
     env:
@@ -144,12 +149,13 @@ jobs:
       KDP_STUN_HOST: stun.cloudflare.com
       KDP_STUN_PORT: '3478'
     steps:
-      - name: Reject conflicting discovery and after-boot controls
+      - name: Reject conflicting network and after-boot controls
         env:
           AFTER_DEBUG_BOOT: ${{ inputs.after_debug_boot || 'none' }}
+          SYNTHETIC_CAPTURE: ${{ inputs.netdump_synthetic_capture_only && '1' || '0' }}
         run: |
-          if [ "$AFTER_DEBUG_BOOT" != none ]; then
-            echo 'Choose either discovery-only or an after-boot control.' >&2
+          if [ "$AFTER_DEBUG_BOOT" != none ] || [ "$SYNTHETIC_CAPTURE" != 0 ]; then
+            echo 'Choose one network-only control or one after-boot control.' >&2
             exit 1
           fi
       - name: Check out trusted diagnostic scripts
@@ -170,7 +176,7 @@ jobs:
           path: ${{ runner.temp }}/debug/netdump-discovery.json
           if-no-files-found: warn
   netdump_receiver:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only && inputs.after_debug_boot == 'netdump-prime' && inputs.debug_boot && inputs.debug_source == 'bootplist' && inputs.trigger == 'reboot-quick' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only && !inputs.netdump_synthetic_capture_only && inputs.after_debug_boot == 'netdump-prime' && inputs.debug_boot && inputs.debug_source == 'bootplist' && inputs.trigger == 'reboot-quick' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -197,5 +203,56 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: netdump-prime-receiver-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/debug/netdump-discovery.json
+          if-no-files-found: warn
+  netdump_synthetic_capture:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && inputs.netdump_synthetic_capture_only }}
+    name: Netdump synthetic capture (${{ matrix.role }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: intel
+            command: synthetic-sender
+            os: macos-26-intel
+          - role: receiver
+            command: synthetic-receiver
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 6
+    permissions:
+      contents: read
+      checks: write
+      actions: read
+    env:
+      KDP_ROLE: ${{ matrix.role }}
+      KDP_PORT_MODE: kernel-source
+      KDP_STUN_HOST: stun.cloudflare.com
+      KDP_STUN_PORT: '3478'
+    steps:
+      - name: Reject conflicting network and after-boot controls
+        env:
+          AFTER_DEBUG_BOOT: ${{ inputs.after_debug_boot || 'none' }}
+          DISCOVERY_ONLY: ${{ inputs.netdump_discovery_only && '1' || '0' }}
+        run: |
+          if [ "$AFTER_DEBUG_BOOT" != none ] || [ "$DISCOVERY_ONLY" != 0 ]; then
+            echo 'Choose one network-only control or one after-boot control.' >&2
+            exit 1
+          fi
+      - name: Check out trusted diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Capture the synthetic fragment independently
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KDP_REPORT_CERT: ${{ inputs.report_cert }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/recovery_netdump.py ${{ matrix.command }}
+      - name: Preserve the filtered synthetic result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: netdump-synthetic-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/debug/netdump-discovery.json
           if-no-files-found: warn

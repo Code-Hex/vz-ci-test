@@ -1,4 +1,5 @@
 import json
+import http.server
 import os
 import tempfile
 import socket
@@ -12,6 +13,39 @@ import kdp_udp_preflight as r
 
 
 class Udp(unittest.TestCase):
+    def test_attempt_jobs_get_uses_owned_api_and_rejects_other_job_requests(self):
+        paths = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                paths.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"total_count":0,"jobs":[]}')
+
+            def log_message(self, *_): pass
+
+        server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        original = r.API
+        try:
+            thread.start()
+            r.API = 'http://127.0.0.1:' + str(server.server_port) + '/repos/Code-Hex/vz-ci-test'
+            path = '/actions/runs/41983313767/attempts/1/jobs?per_page=100'
+            self.assertEqual(r.api('GET', path, 'local-test'), {'total_count': 0, 'jobs': []})
+            for method, invalid in [('POST', path), ('PATCH', path), ('GET', path + '&page=2'),
+                                    ('GET', path.replace('/1/', '/0/')),
+                                    ('GET', path.replace('/1/', '/100000/')),
+                                    ('GET', path.replace('41983313767', '0')),
+                                    ('GET', path.replace('per_page=100', 'per_page=1'))]:
+                with self.subTest(method=method, path=invalid), self.assertRaises(ValueError):
+                    r.api(method, invalid, 'local-test')
+            self.assertEqual(paths, ['/repos/Code-Hex/vz-ci-test' + path])
+        finally:
+            r.API = original
+            server.shutdown()
+            thread.join(2)
+            server.server_close()
+
     def wire_state(self, role='receiver'):
         import base64
         import hashlib
