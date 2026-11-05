@@ -642,6 +642,42 @@ class Discovery(unittest.TestCase):
             fact['other_peer_ports'].append(1)
             self.assertEqual(mismatch.exception.fact['other_peer_ports'], [other.getsockname()[1]])
 
+    def test_native_b2_hello_failure_uses_same_seven_filtered_fields(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as host, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as other:
+            for sock in (host, peer, other): sock.bind(('127.0.0.1', 0))
+            address = peer.getsockname()
+            raw = n.udp.exchange(host, address, b'a' * 16, b'b' * 16, .08)
+            for stage in ('b2_intel', 'b2_receiver'):
+                with self.assertRaises(n.HelloFailure) as failure:
+                    n.hello_result(raw, stage, address[1])
+                self.assertEqual(failure.exception.fact, {'stage': stage, 'expected_peer_port': address[1],
+                                 'hello_received': False, 'ack_received': False, 'sent': 1,
+                                 'valid_peer_port_mismatches': 0, 'other_peer_ports': []})
+            other.sendto(n.udp.PACKET.pack(b'KDP1', 1, b'b' * 16, b'a' * 16, 1), host.getsockname())
+            raw = n.udp.exchange(host, address, b'a' * 16, b'b' * 16, .08)
+            with self.assertRaises(n.HelloFailure) as failure:
+                n.hello_result(raw, 'b2_receiver', address[1])
+            self.assertEqual(failure.exception.fact['valid_peer_port_mismatches'], 1)
+            self.assertEqual(failure.exception.fact['other_peer_ports'], [other.getsockname()[1]])
+            self.assertNotIn('127.0.0.1', n.canonical(failure.exception.fact))
+
+    def test_hello_cleanup_stage_matches_owner_role_and_b1_or_prime_namespace(self):
+        raw = {'hello_received': False, 'ack_received': False, 'sent': 1, 'valid_peer_port_mismatches': 0, 'other_peer_ports': []}
+        def failure(stage): return n.HelloFailure({'stage': stage, 'expected_peer_port': 12345, **raw})
+        for role in ('intel', 'receiver'):
+            owner = n.CheckOwner(self.context(role), 'unused', role, -1, prime=True)
+            self.assertEqual(owner.cleanup(failure('b2_' + role)), 'not_created')
+            with self.assertRaises(ValueError): owner.cleanup(failure('b1_' + role))
+            other_role = 'receiver' if role == 'intel' else 'intel'
+            with self.assertRaises(ValueError): owner.cleanup(failure('b2_' + other_role))
+            plain = n.CheckOwner(self.context(role), 'unused', role, -1)
+            self.assertEqual(plain.cleanup(failure('b1_' + role)), 'not_created')
+            with self.assertRaises(ValueError): plain.cleanup(failure('b2_' + role))
+        for kwargs in ({'capture_digest': 'b' * 64}, {'synthetic_digest': 'b' * 64}):
+            owner = n.CheckOwner(self.context('receiver'), 'unused', 'receiver', -1, **kwargs)
+            with self.assertRaises(ValueError): owner.cleanup(failure('b2_receiver'))
+            with self.assertRaises(ValueError): owner.cleanup(failure('b1_receiver'))
+
     def test_hello_failure_public_boundary_rejects_raw_fields_and_invalid_types(self):
         fact = {'stage': 'b1_intel', 'expected_peer_port': 12345, 'hello_received': False, 'ack_received': False,
                 'sent': 1, 'valid_peer_port_mismatches': 0, 'other_peer_ports': []}
@@ -659,7 +695,8 @@ class Discovery(unittest.TestCase):
         self.assertEqual(failure.hello_failure, fact)
         self.assertEqual(n.console_fact({'status': 'failed', 'hello_failure': failure.hello_failure})['hello_failure'], fact)
         success = {'hello_received': True, 'ack_received': True, 'sent': 2, 'valid_peer_port_mismatches': 0, 'other_peer_ports': []}
-        self.assertEqual(n.hello_result(success, 'b1_intel', 12345).record(), {'hello_received': True, 'ack_received': True, 'sent': 2})
+        for stage in ('b1_intel', 'b1_receiver', 'b2_intel', 'b2_receiver'):
+            self.assertEqual(n.hello_result(success, stage, 12345).record(), {'hello_received': True, 'ack_received': True, 'sent': 2})
         with self.assertRaises(ValueError): n.HelloFailure({**fact, **success})
         with self.assertRaises(ValueError): n.hello_result({**success, 'raw': 'private'}, 'b1_intel', 12345)
 

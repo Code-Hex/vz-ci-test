@@ -125,7 +125,7 @@ class BootBaseline:
 def hello_observation(value):
     exact(value, ('stage', 'expected_peer_port', 'hello_received', 'ack_received', 'sent',
                   'valid_peer_port_mismatches', 'other_peer_ports'))
-    require(type(value['stage']) is str and value['stage'] in ('b1_intel', 'b1_receiver') and type(value['expected_peer_port']) is int and
+    require(type(value['stage']) is str and value['stage'] in ('b1_intel', 'b1_receiver', 'b2_intel', 'b2_receiver') and type(value['expected_peer_port']) is int and
             1 <= value['expected_peer_port'] <= 65535 and type(value['hello_received']) is bool and type(value['ack_received']) is bool and
             type(value['sent']) is int and 0 <= value['sent'] <= 280 and type(value['valid_peer_port_mismatches']) is int and
             0 <= value['valid_peer_port_mismatches'] < 2 ** 31)
@@ -762,8 +762,8 @@ class CheckOwner:
     def cleanup(self, hello_failure=None):
         extra = {}
         if hello_failure is not None:
-            require(type(hello_failure) is HelloFailure and hello_failure.fact['stage'] == 'b1_' + self.role and
-                    not self.prime and self.synthetic_digest is None and self.capture_digest is None)
+            require(type(hello_failure) is HelloFailure and hello_failure.fact['stage'] == ('b2_' if self.prime else 'b1_') + self.role and
+                    self.synthetic_digest is None and self.capture_digest is None)
             extra['hello_failure'] = hello_failure.fact
         if self.check_id is None: return 'not_acknowledged' if self.attempted else 'not_created'
         try:
@@ -830,7 +830,7 @@ class ConnectedPeer:
 
 
 def hello(sock, endpoint, own_nonce, other_nonce, deadline, *, stage=None):
-    require(stage is None or stage in ('b1_intel', 'b1_receiver'))
+    require(stage is None or stage in ('b1_intel', 'b1_receiver', 'b2_intel', 'b2_receiver'))
     require(deadline - time.monotonic() >= 20)
     raw = udp.exchange(sock, (endpoint.ip, endpoint.port), bytes.fromhex(own_nonce[:32]), bytes.fromhex(other_nonce[:32]), 20)
     if stage is not None: return hello_result(raw, stage, endpoint.port)
@@ -969,14 +969,15 @@ def prime(ctx, token, cert, plan, boot_uuid, recovery_check_id, *, main_path, ha
                     require(validated['core_snapshot'] == snapshot)
                     break
                 time.sleep(.5)
-            stats = hello(ConnectedPeer(sock, address), plan.offer.endpoint, probe['packet_nonce'], probe['receiver_packet_nonce'], deadline)
+            stats = hello(ConnectedPeer(sock, address), plan.offer.endpoint, probe['packet_nonce'], probe['receiver_packet_nonce'], deadline, stage='b2_intel')
             final = prime_host_fact(plan, scope, endpoint, snapshot, stats)
             owner.publish(final, deadline)
             _, proof = wait_peer(ctx, token, 'receiver', ('prime_ack',), deadline, receiver_id, prime=True)
             require(proof.get('host_check_id') == owner.check_id and proof.get('receiver_check_id') == receiver_id and proof.get('host_plan') == final)
             return verify_prime_ack(ctx, token, proof, scope, snapshot['facts']['netdump_active_control'], deadline)
-        except Exception:
-            raise DiscoveryFailure(owner.cleanup()) from None
+        except Exception as error:
+            failure = error if type(error) is HelloFailure else None
+            raise DiscoveryFailure(owner.cleanup(failure), failure) from None
         finally:
             sock.close()
 
@@ -1008,7 +1009,7 @@ def serve_receiver(ctx, token, cert, *, main_path, purpose):
                     owner.publish(waiting_fact(offer, b1_plan, probe, snapshot), deadline)
                     break
                 time.sleep(1)
-            stats = hello(sock, Endpoint.from_record(probe['intel_public_endpoint']), probe['receiver_packet_nonce'], probe['packet_nonce'], deadline)
+            stats = hello(sock, Endpoint.from_record(probe['intel_public_endpoint']), probe['receiver_packet_nonce'], probe['packet_nonce'], deadline, stage='b2_receiver')
             _, final = wait_peer(ctx, token, 'intel', ('plan',), deadline, host_id, prime=True, boot_uuid=scope.boot_uuid)
             validate_prime_transition(probe, final, offer, b1_plan)
             proof = make_prime_proof(offer, b1_plan, final, stats, snapshot, owner.check_id, host_id)
@@ -1020,9 +1021,10 @@ def serve_receiver(ctx, token, cert, *, main_path, purpose):
         except DiscoveryFailure:
             if completed or not owner.attempted: raise
             raise DiscoveryFailure(owner.cleanup()) from None
-        except Exception:
+        except Exception as error:
             if completed: raise
-            raise DiscoveryFailure(owner.cleanup()) from None
+            failure = error if type(error) is HelloFailure else None
+            raise DiscoveryFailure(owner.cleanup(failure), failure) from None
         finally:
             sock.close()
 
