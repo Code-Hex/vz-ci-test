@@ -43,6 +43,38 @@ class Transaction(unittest.TestCase):
             again = core.finish_files(directory, marker, data, preboot, 'BBBBBBBB-2222-2222-2222-222222222222', None, save, sync)
             self.assertEqual(again, result)
 
+    def test_followup_mask_is_saved_and_verified_before_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data, preboot, directory, original, marker = self.fixture(Path(tmp).resolve())
+            core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(), debug_mask=0x102000)
+            self.assertEqual(core.flags(data.read_bytes(), allow_debug=True), '-v debug=0x102000')
+            result = core.finish_files(directory, marker, data, preboot, 'BBBBBBBB-2222-2222-2222-222222222222', 0x102000, save, sync)
+            self.assertEqual(result['active_bootargs_status'], 'observed_debug')
+            self.assertTrue(result['bootplist_restored'])
+            self.assertEqual(data.read_bytes(), original)
+            self.assertEqual(preboot.read_bytes(), original)
+
+    def test_mask_change_in_manifest_prevents_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data, preboot, directory, _original, marker = self.fixture(Path(tmp).resolve())
+            core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(), debug_mask=0x102000)
+            before = data.read_bytes(), preboot.read_bytes()
+            path = directory / 'bootplist-manifest.json'
+            manifest = json.loads(path.read_text()); manifest['debug_mask'] = 0x2000
+            path.write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError):
+                core.finish_files(directory, marker, data, preboot, 'BBBBBBBB-2222-2222-2222-222222222222', 0x102000, save, sync)
+            self.assertEqual((data.read_bytes(), preboot.read_bytes()), before)
+
+    def test_unsupported_mask_does_not_modify_files(self):
+        for mask in (True, None, '0x102000', 1):
+            with self.subTest(mask=mask), tempfile.TemporaryDirectory() as tmp:
+                data, preboot, directory, original, marker = self.fixture(Path(tmp).resolve())
+                with self.assertRaises(ValueError):
+                    core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(), debug_mask=mask)
+                self.assertEqual((data.read_bytes(), preboot.read_bytes()), (original, original))
+                self.assertFalse((directory / 'bootplist-manifest.json').exists())
+
     def test_other_debug_mask_is_observed_no_debug(self):
         with tempfile.TemporaryDirectory() as tmp:
             data, preboot, directory, _, marker = self.fixture(Path(tmp).resolve())

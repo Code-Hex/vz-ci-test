@@ -47,10 +47,11 @@ def flags(raw, *, allow_debug=False):
     return data['Kernel Flags']
 
 
-def stage_content(raw):
+def stage_content(raw, debug_mask=0x2000):
+    if type(debug_mask) is not int or debug_mask not in (0x2000, 0x102000): raise ValueError('debug_mask_invalid')
     original = flags(raw)
     data = plistlib.loads(raw)
-    data['Kernel Flags'] = original + (' ' if original else '') + 'debug=0x2000'
+    data['Kernel Flags'] = original + (' ' if original else '') + 'debug=0x' + format(debug_mask, 'x')
     boot.text(data['Kernel Flags'])
     return plistlib.dumps(data, fmt=plistlib.FMT_BINARY if raw.startswith(b'bplist00') else plistlib.FMT_XML, sort_keys=False)
 
@@ -280,7 +281,8 @@ def _load(directory, marker, data_path, preboot_path):
     validate_marker(marker)
     manifest = json.loads((directory / 'bootplist-manifest.json').read_text())
     if (not isinstance(manifest, dict) or manifest.get('marker') != marker or
-            manifest.get('paths') != {'data': str(data_path), 'preboot': str(preboot_path)}):
+            manifest.get('paths') != {'data': str(data_path), 'preboot': str(preboot_path)} or
+            type(manifest.get('debug_mask')) is not int or manifest['debug_mask'] not in (0x2000, 0x102000)):
         raise ValueError('manifest_invalid')
     saved = {}
     for name in ('data', 'preboot'):
@@ -290,9 +292,9 @@ def _load(directory, marker, data_path, preboot_path):
         staged = (directory / (name + '.staged')).read_bytes()
         if hashlib.sha256(original).hexdigest() != item.get('original_sha256') or hashlib.sha256(staged).hexdigest() != item.get('staged_sha256'):
             raise ValueError('backup_invalid')
-        if stage_content(original) != staged: raise ValueError('backup_invalid')
+        if stage_content(original, manifest['debug_mask']) != staged: raise ValueError('backup_invalid')
         saved[name] = {'original': original, 'staged': staged, 'meta': item['meta']}
-    return saved
+    return saved, manifest['debug_mask']
 
 
 def _pending(directory, prefix, marker, saved, *, require_done=False):
@@ -338,7 +340,7 @@ def _current_boot_uuid():
     return subprocess.check_output(['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'], timeout=10).decode('ascii').strip()
 
 
-def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner_uid=0, writer=write_if_expected, scope=None, boot_uuid=_current_boot_uuid):
+def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner_uid=0, writer=write_if_expected, scope=None, boot_uuid=_current_boot_uuid, debug_mask=0x2000):
     validate_marker(marker)
     directory = Path(directory); data_path = Path(data_path); preboot_path = Path(preboot_path)
     if (directory / 'bootplist-manifest.json').exists(): raise ValueError('already_staged')
@@ -351,8 +353,8 @@ def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner
         check = metadata_facts(path, originals[name])
         check['checks']['uid_root'] = originals[name]['uid'] == owner_uid
         if not metadata_allowed(check): raise ValueError('metadata_unsupported')
-    desired = {name: stage_content(item['raw']) for name, item in originals.items()}
-    manifest = {'marker': marker, 'paths': {name: str(path) for name, path in paths.items()}, 'scope': scope, 'files': {}}
+    desired = {name: stage_content(item['raw'], debug_mask) for name, item in originals.items()}
+    manifest = {'marker': marker, 'debug_mask': debug_mask, 'paths': {name: str(path) for name, path in paths.items()}, 'scope': scope, 'files': {}}
     for name in paths:
         original = originals[name]
         save(directory / (name + '.original'), original['raw'])
@@ -410,7 +412,7 @@ def rollback_files(directory, marker, data_path, preboot_path, save, sync, *, cu
             current_boot_uuid.upper() != marker['baseline'].upper()):
         raise ValueError('rollback_boot_mismatch')
     directory = Path(directory); data_path = Path(data_path); preboot_path = Path(preboot_path)
-    saved = _load(directory, marker, data_path, preboot_path)
+    saved, _ = _load(directory, marker, data_path, preboot_path)
     _pending(directory, 'stage', marker, saved); _pending(directory, 'restore', marker, saved)
     paths = {'data': data_path, 'preboot': preboot_path}
     current = {name: snapshot(path) for name, path in paths.items()}
@@ -431,9 +433,9 @@ def finish_files(directory, marker, data_path, preboot_path, current_boot_uuid, 
         raise ValueError('boot_invalid')
     if (active_status not in ('observed', 'unavailable') or (active_status == 'unavailable' and active_mask is not None) or
             (active_mask is not None and (type(active_mask) is not int or not 0 <= active_mask <= 0xffffffff))): raise ValueError('active_invalid')
+    saved, expected_mask = _load(directory, marker, data_path, preboot_path)
     if active_status == 'observed':
-        active_status = 'observed_debug' if active_mask == 0x2000 else 'observed_no_debug'
-    saved = _load(directory, marker, data_path, preboot_path)
+        active_status = 'observed_debug' if active_mask == expected_mask else 'observed_no_debug'
     _pending(directory, 'stage', marker, saved, require_done=True); _pending(directory, 'restore', marker, saved)
     try:
         if json.loads((directory / 'bootplist-stage-complete.json').read_text()) != {'marker': marker}: raise WriteUncertain()
@@ -479,9 +481,9 @@ def finish_files(directory, marker, data_path, preboot_path, current_boot_uuid, 
     return result
 
 
-def stage(directory, marker, save, sync):
+def stage(directory, marker, save, sync, *, debug_mask=0x2000):
     data, preboot, group, system = resolve_paths()
-    result = stage_files(directory, marker, data, preboot, save, sync, scope={'group': group, 'system': system})
+    result = stage_files(directory, marker, data, preboot, save, sync, scope={'group': group, 'system': system}, debug_mask=debug_mask)
     return result
 
 
