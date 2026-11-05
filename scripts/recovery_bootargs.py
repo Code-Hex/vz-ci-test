@@ -292,7 +292,8 @@ def kernel_field_state(name, *, read=None, timeout=5):
 
 
 def kernel_debug_state(*, read=None):
-    return {name: kernel_field_state(name, read=read) for name in KERNEL_FIELDS}
+    return {name: kernel_field_state(name, read=read, timeout=30 if index == 0 else 5)
+            for index, name in enumerate(KERNEL_FIELDS)}
 
 
 class MacPlatform:

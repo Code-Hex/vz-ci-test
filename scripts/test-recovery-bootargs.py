@@ -563,6 +563,27 @@ class Bootargs(unittest.TestCase):
         with self.assertRaises(ValueError): b.kernel_field_state('foreign',read=read)
         self.assertEqual(len(calls),2)
 
+    def test_initial_field_budget_accepts_real_5_1_second_output_while_single_default_stays_5(self):
+        calls=[]
+        def read(argv,limit,timeout,*,capture_stderr):
+            name=next(name for name in b.KERNEL_FIELDS if 'VZKSTATE v1 '+name+' ' in argv[-1])
+            self.assertEqual(argv,['/usr/sbin/dtrace','-q','-x','errtags','-n',b.kernel_field_program(name)])
+            self.assertEqual((limit,capture_stderr),(4096,True))
+            calls.append((name,timeout))
+            line='VZKSTATE v1 '+name+' '+b.KERNEL_FIELDS[name][1]+' 0\n\n'
+            program='import sys,time; time.sleep('+('5.1' if name=='debug_boot_arg' else '0')+'); sys.stdout.write('+repr(line)+')'
+            return b.capture([sys.executable,'-c',program],limit,timeout,capture_stderr=True)
+        short=b.kernel_field_state('debug_boot_arg',read=read)
+        self.assertEqual(short['status'],'unavailable')
+        self.assertEqual(short['error']['reason'],'timeout')
+        self.assertEqual(short['error']['output_bytes'],0)
+        self.assertEqual(calls,[('debug_boot_arg',5)])
+        calls.clear()
+        fields=b.kernel_debug_state(read=read)
+        self.assertEqual(fields['debug_boot_arg'],{'status':'observed','value':0})
+        self.assertEqual(calls,[('debug_boot_arg',30)]+[(name,5) for name in list(b.KERNEL_FIELDS)[1:]])
+        self.assertTrue(all(field['status']=='observed' for field in fields.values()))
+
     def test_kernel_field_parser_requires_exact_typed_marker_and_cli_one_lf(self):
         self.assertEqual(b.parse_kernel_field('debug_boot_arg',b'VZKSTATE v1 debug_boot_arg u32 8192\n\n'),8192)
         self.assertEqual(b.parse_kernel_field('dtrace_destructive_disallow',b'VZKSTATE v1 dtrace_destructive_disallow i32 -1\n\n'),-1)
@@ -594,8 +615,8 @@ class Bootargs(unittest.TestCase):
         def read(argv,limit,timeout,*,capture_stderr=False):
             self.assertTrue(capture_stderr)
             self.assertEqual(argv[:5],['/usr/sbin/dtrace','-q','-x','errtags','-n'])
-            self.assertEqual((limit,timeout),(4096,5))
             name=next(name for name in b.KERNEL_FIELDS if 'VZKSTATE v1 '+name+' ' in argv[-1])
+            self.assertEqual((limit,timeout),(4096,30 if name=='debug_boot_arg' else 5))
             kind=b.KERNEL_FIELDS[name][1]
             raw='VZKSTATE v1 '+name+' '+kind+' 0\n\n'
             return b.capture([sys.executable,'-c','import sys; sys.stdout.write('+repr(raw)+'); sys.exit(1)'],limit,timeout)
