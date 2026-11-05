@@ -584,6 +584,45 @@ class Bootargs(unittest.TestCase):
         self.assertEqual(calls,[('debug_boot_arg',30)]+[(name,5) for name in list(b.KERNEL_FIELDS)[1:]])
         self.assertTrue(all(field['status']=='observed' for field in fields.values()))
 
+    def test_critical_inventory_once_roundtrips_positive_and_negative_without_reread(self):
+        for number in (0x102000,0,None):
+            with self.subTest(number=number),tempfile.TemporaryDirectory() as tmp:
+                directory=Path(tmp); calls=[]
+                def read(argv,limit,timeout,*,capture_stderr):
+                    self.assertEqual(argv,['/usr/sbin/dtrace','-q','-x','errtags','-n',b.kernel_field_program('debug_boot_arg')])
+                    self.assertEqual((limit,timeout,capture_stderr),(4096,30,True)); calls.append(1)
+                    raw='VZKSTATE v1 debug_boot_arg u32 '+str(0 if number is None else number)+'\n\n'
+                    program='import sys; print('+repr(raw)+',end="")'
+                    if number is None: program+='; sys.stderr.write("[D_IDENT_UNDEF]"); sys.exit(1)'
+                    return b.capture([sys.executable,'-c',program],limit,timeout,capture_stderr=True)
+                inventory=b.KernelMaskInventory(read=read)
+                first=b.observe_once(directory,MARKER,inventory,self.save,lambda _:None,current_boot_uuid='B2')
+                second=b.observe_once(directory,MARKER,inventory,self.save,lambda _:None,current_boot_uuid='B2')
+                self.assertEqual(first,second); self.assertEqual(calls,[1])
+                if number is None:
+                    self.assertEqual(first['kernel_debug_state']['debug_boot_arg']['status'],'unavailable')
+                    self.assertEqual(first['kernel_debug_state']['debug_boot_arg']['error']['tags'],['D_IDENT_UNDEF'])
+                else: self.assertEqual(first['kernel_debug_state'],{'debug_boot_arg':{'status':'observed','value':number}})
+                self.assertEqual(first['optional_inventory_status'],'completed')
+                mismatch=b.observe_once(directory,MARKER,inventory,self.save,lambda _:None,current_boot_uuid='other')
+                self.assertEqual(mismatch,{'optional_inventory_status':'scope_mismatch'}); self.assertEqual(calls,[1])
+                changed={**MARKER,'source_identity':'f'*64}
+                self.assertEqual(b.observe_once(directory,changed,inventory,self.save,lambda _:None,current_boot_uuid='B2'),{'optional_inventory_status':'scope_mismatch'})
+                self.assertEqual(calls,[1])
+                (directory/'debug-boot-inventory-result.json').unlink()
+                self.assertEqual(b.observe_once(directory,MARKER,inventory,self.save,lambda _:None,current_boot_uuid='B2'),{'optional_inventory_status':'uncertain'})
+                self.assertEqual(calls,[1])
+
+    def test_critical_inventory_rejects_cached_extra_before_projection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp); scope={'marker':MARKER,'current_boot_uuid':'B2'}
+            self.save(directory/'debug-boot-inventory-started.json',json.dumps(scope).encode())
+            invalid={'status':'observed','value':0x102000,'raw':'must not be dropped into success'}
+            self.save(directory/'debug-boot-inventory-result.json',json.dumps({'scope':scope,'facts':{'kernel_debug_state':{'debug_boot_arg':invalid}}}).encode())
+            def forbidden(*args,**kwargs): self.fail('cached record triggered kernel read')
+            with self.assertRaises(ValueError):
+                b.observe_once(directory,MARKER,b.KernelMaskInventory(read=forbidden),self.save,lambda _:None,current_boot_uuid='B2')
+
     def test_kernel_field_parser_requires_exact_typed_marker_and_cli_one_lf(self):
         self.assertEqual(b.parse_kernel_field('debug_boot_arg',b'VZKSTATE v1 debug_boot_arg u32 8192\n\n'),8192)
         self.assertEqual(b.parse_kernel_field('dtrace_destructive_disallow',b'VZKSTATE v1 dtrace_destructive_disallow i32 -1\n\n'),-1)

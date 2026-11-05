@@ -84,7 +84,7 @@ def kernel_state_proven(facts):
     if type(states) is not dict:
         return False
     state = states.get('debug_boot_arg')
-    return (type(state) is dict and state.get('status') == 'observed' and
+    return (type(state) is dict and set(state) == {'status', 'value'} and state.get('status') == 'observed' and
             type(state.get('value')) is int and state['value'] == 0x102000)
 
 
@@ -262,7 +262,7 @@ def debug_lineage_matches(data, pending, ctx):
     facts = data.get("debug_boot_facts")
     if not debug_boot_proven(facts, ctx["debug_source"], expected_debug_mask(ctx)):
         return False
-    if kernel_state_mode(ctx) and not kernel_state_proven(facts):
+    if (kernel_state_mode(ctx) or panic_control_kind(ctx) == 'usdt-v1') and not kernel_state_proven(facts):
         return False
     if nvram_off_control(ctx) and not nvram_off_control_proven(facts):
         return False
@@ -1652,6 +1652,8 @@ def read_followup_debug(directory, config):
         raise ValueError("followup debug proof invalid")
     if nvram_off_control(config["context"]) and not nvram_off_control_proven(saved["facts"]):
         raise ValueError("NVRAM logging control proof invalid")
+    if panic_control_kind(config['context']) == 'usdt-v1' and not kernel_state_proven(saved['facts']):
+        raise ValueError('USDT runtime mask proof invalid')
     return saved
 
 
@@ -1884,13 +1886,26 @@ def followup_start(directory, config, current, facts, token, *, deadline=None):
     if not debug_boot_proven(facts, "bootplist", expected_debug_mask(config["context"])) or facts.get("current_boot_uuid") != current:
         raise ValueError("followup requires a restored debug boot")
     saved = {"scope": scope, "facts": facts}
-    private_write(directory / "panic-followup-debug.json", json.dumps(saved).encode())
-    sync_directory(directory)
-    handoff_started, capture_intent = False, None
     control_kind = panic_control_kind(config['context'])
+    if control_kind != 'usdt-v1':
+        private_write(directory / "panic-followup-debug.json", json.dumps(saved).encode())
+        sync_directory(directory)
+    handoff_started, capture_intent = False, None
     if control_kind == 'usdt-v1' and deadline is None:
         deadline = time.monotonic() + 180
     try:
+        if control_kind == 'usdt-v1':
+            optional = {'optional_inventory_status': 'uncertain'}
+            try:
+                if deadline - time.monotonic() < 32: raise TimeoutError('USDT mask observation budget unavailable')
+                optional = recovery_bootargs.observe_once(directory, debug_boot_marker(config), recovery_bootargs.KernelMaskInventory(),
+                                                          private_write, sync_directory, current_boot_uuid=current)
+            finally:
+                facts = {**facts, **optional}
+                saved['facts'] = facts
+                private_write(directory / "panic-followup-debug.json", json.dumps(saved).encode())
+                sync_directory(directory)
+            if not kernel_state_proven(facts): raise ValueError('USDT runtime mask not proven')
         if nvram_off_control(config["context"]) and not nvram_off_control_proven(facts):
             raise ValueError("NVRAM logging control not proven")
         prepared = recovery_panic_control.prepare(directory, config["nonce"], private_write, sync_directory,

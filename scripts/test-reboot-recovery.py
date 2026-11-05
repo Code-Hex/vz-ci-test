@@ -49,6 +49,94 @@ class Recovery(unittest.TestCase):
             self.assertFalse(r.boot_proof_matches({**data, 'debug_boot_facts': bad}, pending, ctx))
         self.assertFalse(r.kernel_state_proven({**facts, 'optional_inventory_status': 'uncertain'}))
 
+    def test_usdt_runtime_mask_requires_exact_critical_variant(self):
+        facts={'optional_inventory_status':'completed','kernel_debug_state':{'debug_boot_arg':{'status':'observed','value':0x102000}}}
+        self.assertTrue(r.kernel_state_proven(facts))
+        for state in ({'status':'observed','value':True},{'status':'observed','value':0},
+                      {'status':'observed','value':0x102000,'error':{}},
+                      {'status':'observed','value':0x102000,'extra':1},{'status':'unavailable'}):
+            self.assertFalse(r.kernel_state_proven({**facts,'kernel_debug_state':{'debug_boot_arg':state}}))
+
+    def test_usdt_mask_observation_latches_before_prepare_and_negative_never_fires(self):
+        for case in ('positive','zero','read_error','save_error','budget'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as tmp:
+                directory=Path(tmp); config,saved,_=self.followup_fixture()
+                config['context']['after_debug_boot']='panic-nonce-usdt'
+                current=saved['scope']['debug_boot_uuid']; reads=[]; prepared=[]; reports=[]
+                deadline=r.time.monotonic()+(31 if case=='budget' else 180)
+                actual_capture=r.recovery_bootargs.capture; actual_write=r.private_write
+                def read(argv,limit,timeout,*,capture_stderr):
+                    reads.append(1)
+                    self.assertEqual((limit,timeout,capture_stderr),(4096,30,True))
+                    if case=='read_error': raise RuntimeError('synthetic observation failure')
+                    raw='VZKSTATE v1 debug_boot_arg u32 '+str(0 if case=='zero' else 0x102000)+'\n\n'
+                    return actual_capture([r.sys.executable,'-c','print('+repr(raw)+',end="")'],limit,timeout,capture_stderr=True)
+                def write(path,data):
+                    if case=='save_error' and path.name=='panic-followup-debug.json': raise OSError('synthetic save failure')
+                    return actual_write(path,data)
+                def prepare(*args,**kwargs):
+                    prepared.append(1)
+                    self.assertEqual(case,'positive')
+                    self.assertEqual(kwargs['deadline'],deadline)
+                    self.assertTrue(r.kernel_state_proven(r.read_followup_debug(directory,config)['facts']))
+                    raise RuntimeError('stop at nonfaulting preparation boundary')
+                def forbidden(*args,**kwargs): self.fail('negative mask reached watch/fire')
+                def complete(_d,_c,_b,_t,output,success,reported_deadline):
+                    self.assertFalse(success)
+                    self.assertTrue(0 < reported_deadline-r.time.monotonic() <= 60)
+                    reports.append(r.json.loads(output['summary']))
+                with patch.object(r.recovery_bootargs,'capture',read),patch.object(r,'private_write',write), \
+                     patch.object(r.recovery_panic_control,'prepare',prepare),patch.object(r.recovery_panic_control,'fire',forbidden), \
+                     patch.object(r,'start_runtime_watch',forbidden),patch.object(r,'complete_recovery',complete):
+                    r.followup_start(directory,config,current,saved['facts'],'token',deadline=deadline)
+                self.assertEqual(prepared,[1] if case=='positive' else [])
+                self.assertEqual(len(reads),0 if case=='budget' else 1)
+                self.assertEqual(len(reports),1)
+                self.assertEqual(reports[0]['phase'],'panic_returned')
+                if case!='save_error':
+                    latched=r.json.loads((directory/'panic-followup-debug.json').read_text())
+                    self.assertEqual(latched['facts'],reports[0]['debug_boot_facts'])
+
+    def test_usdt_saved_mask_gates_watch_and_controller_and_collect_never_rereads(self):
+        config,saved,b3=self.followup_fixture(); config['context']['after_debug_boot']='panic-nonce-usdt'
+        config['python']=r.sys.executable
+        saved['facts'].update(optional_inventory_status='completed',kernel_debug_state={'debug_boot_arg':{'status':'observed','value':0x102000}})
+        trigger={'scope':saved['scope'],'helper_sha256':'f'*64,'helper_pid':123,'tracer_pid':456,'ready':True}
+        pending={'baseline_boot_uuid':config['baseline'],'nonce':config['nonce'],'cert_fingerprint':config['cert_fingerprint']}
+        def forbidden(*args,**kwargs): self.fail('saved proof caused native reread/fire/API')
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp); path=directory/'panic-followup-debug.json'
+            r.private_write(path,r.json.dumps(saved).encode())
+            for phase in ('panic_prepared','panic_intent','boot_observed'):
+                data=r.followup_summary(config,phase,b3,saved,panic_trigger=trigger)
+                self.assertEqual(data['debug_boot_facts'],saved['facts'])
+                self.assertTrue(r.debug_lineage_matches(data,pending,config['context']))
+            with patch.object(r,'load_config',lambda _:config),patch.object(r,'boot_uuid',lambda:saved['scope']['debug_boot_uuid']), \
+                 patch.object(r.recovery_bootargs,'kernel_field_state',forbidden),patch.object(r,'followup_start',forbidden):
+                r.collect(directory)
+            r.private_write(directory/'token',b'test-token')
+            received=[]
+            with patch.object(r,'load_config',lambda _:config),patch.object(r,'boot_uuid',lambda:b3), \
+                 patch.object(r.recovery_bootargs,'kernel_field_state',forbidden),patch.object(r,'followup_finish',lambda _d,_c,_b,value,_t:received.append(value)):
+                r.collect(directory)
+            self.assertEqual(received,[saved])
+            for state in ({'status':'observed','value':0},{'status':'observed','value':True},
+                          {'status':'observed','value':0x102000,'extra':1},{'status':'unavailable'}):
+                invalid=copy.deepcopy(saved); invalid['facts']['kernel_debug_state']['debug_boot_arg']=state
+                path.write_text(r.json.dumps(invalid))
+                with self.assertRaises(ValueError): r.read_followup_debug(directory,config)
+                data=r.followup_summary(config,'boot_observed',b3,invalid,panic_trigger=trigger)
+                self.assertFalse(r.debug_lineage_matches(data,pending,config['context']))
+                for current in (saved['scope']['debug_boot_uuid'],b3):
+                    with patch.object(r,'load_config',lambda _:config),patch.object(r,'boot_uuid',lambda:current), \
+                         patch.object(r.recovery_bootargs,'kernel_field_state',forbidden), \
+                         patch.object(r,'followup_start',forbidden),patch.object(r,'followup_finish',forbidden):
+                        with self.assertRaises(ValueError): r.collect(directory)
+                with patch.object(r,'load_config',lambda _:config),patch.object(r,'boot_uuid',lambda:saved['scope']['debug_boot_uuid']), \
+                     patch.object(r,'runtime_watch_executable_matches',lambda *_:True),patch.object(r,'api',forbidden), \
+                     patch.object(r.recovery_bootargs,'kernel_field_state',forbidden):
+                    with self.assertRaises(ValueError): r.runtime_watch(directory)
+
     def test_usdt_followup_is_local_and_uses_a_closed_control_kind(self):
         ctx = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
                'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,

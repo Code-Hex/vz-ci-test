@@ -296,6 +296,29 @@ def kernel_debug_state(*, read=None):
             for index, name in enumerate(KERNEL_FIELDS)}
 
 
+class KernelMaskInventory:
+    def __init__(self, *, read=None):
+        self.read = read
+
+    def inventory(self):
+        return {'kernel_debug_state': {'debug_boot_arg': kernel_field_state('debug_boot_arg', read=self.read, timeout=30)}}
+
+    @staticmethod
+    def summarize(facts):
+        if type(facts) is not dict or type(facts.get('kernel_debug_state')) is not dict or set(facts['kernel_debug_state']) != {'debug_boot_arg'}:
+            raise ValueError('kernel mask inventory invalid')
+        state = facts['kernel_debug_state']['debug_boot_arg']
+        if type(state) is not dict: raise ValueError('kernel mask inventory invalid')
+        if state.get('status') == 'observed':
+            if set(state) != {'status', 'value'}: raise ValueError('kernel mask inventory invalid')
+            kernel_field_value('debug_boot_arg', state['value'])
+        else:
+            if set(state) != {'status', 'error'} or state['status'] not in ('unavailable', 'invalid'):
+                raise ValueError('kernel mask inventory invalid')
+            kernel_error_summary(state['error'])
+        return optional_summary(facts)
+
+
 class MacPlatform:
     def read(self):
         return parse_nvram(capture(["/usr/sbin/nvram", "-x", "-p"]))
@@ -534,6 +557,7 @@ def optional_summary(data):
 
 
 def observe_once(directory, marker, platform, save, sync, *, current_boot_uuid):
+    summarize = platform.summarize if isinstance(platform, KernelMaskInventory) else optional_summary
     scope = {"marker": marker, "current_boot_uuid": current_boot_uuid}
     started = directory / "debug-boot-inventory-started.json"
     result = directory / "debug-boot-inventory-result.json"
@@ -548,12 +572,12 @@ def observe_once(directory, marker, platform, save, sync, *, current_boot_uuid):
         saved = json.loads(raw)
         if not isinstance(saved, dict) or saved.get("scope") != scope or not isinstance(saved.get("facts"), dict):
             return {"optional_inventory_status": "invalid"}
-        return {"optional_inventory_status": "completed", **optional_summary(saved["facts"])}
+        return {"optional_inventory_status": "completed", **summarize(saved["facts"])}
     if result.exists():
         return {"optional_inventory_status": "invalid"}
     save(started, json.dumps(scope).encode())
     sync(directory)
-    facts = optional_summary(platform.inventory())
+    facts = summarize(platform.inventory())
     encoded = json.dumps({"scope": scope, "facts": facts}).encode()
     if len(encoded) > 16384:
         return {"optional_inventory_status": "invalid"}
