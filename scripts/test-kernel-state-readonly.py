@@ -21,11 +21,15 @@ ENV={'GITHUB_ACTIONS':'true','GITHUB_EVENT_NAME':'workflow_dispatch','GITHUB_REP
 
 def report():
     error={'reason':'unknown','exit_code':None,'output_bytes':None,'output_sha256':None,'tags':[]}
-    return {'protocol':'kernel-field-readonly-v1','scope':'normal_boot_no_staging','context':g.checked_context(ENV),
+    value={'protocol':'kernel-field-readonly-v2','scope':'normal_boot_no_staging','context':g.checked_context(ENV),
         'sources':{name:'a'*64 for name in ('script','workflow','bootargs','registry')},
         'kernel':{'live_uuid':g.KERNEL_UUID,'file_uuid':g.KERNEL_UUID},
         'boot_profile':{'status':'unavailable'},
         'fields':{name:{'status':'unavailable','error':dict(error)} for name in g.FIELD_NAMES},'completed':True}
+    value['readings']=[{'attempt':attempt,'budget_seconds':budget,'elapsed_ms':0,
+                        'result':copy.deepcopy(value['fields']['debug_boot_arg'])}
+                       for attempt,budget in (('first',30),('repeat',5))]
+    return value
 
 
 class KernelState(unittest.TestCase):
@@ -35,6 +39,7 @@ class KernelState(unittest.TestCase):
         value['fields'].update(debug_boot_arg={'status':'observed','value':0x102000},
             dtrace_destructive_disallow={'status':'observed','value':-1},
             coprocessor_paniclog_flush={'status':'observed','value':False})
+        value['readings'][0]['result']=copy.deepcopy(value['fields']['debug_boot_arg'])
         self.assertIs(g.validate_report(value)['fields']['coprocessor_paniclog_flush']['value'],False)
         for change in ({'raw':'private'},{'completed':1},{'scope':'B2_mask_proven'}):
             with self.assertRaises(g.GateFailure): g.validate_report({**value,**change})
@@ -56,6 +61,37 @@ class KernelState(unittest.TestCase):
         for kernel in ({'live_uuid':g.KERNEL_UUID}, {**value['kernel'],'file_uuid':'bad'},
                        {**value['kernel'],'raw_path':'/private/secret'}):
             with self.assertRaises(g.GateFailure): g.validate_report({**value,'kernel':kernel})
+
+    def test_first_repeat_are_always_planned_and_first_result_is_not_overwritten(self):
+        for first_failed in (False,True):
+            with self.subTest(first_failed=first_failed):
+                calls=[]
+                def read(argv,limit,timeout,*,capture_stderr):
+                    name=next(name for name in g.FIELD_NAMES if 'VZKSTATE v1 '+name+' ' in argv[-1])
+                    self.assertEqual(argv,['/usr/sbin/dtrace','-q','-x','errtags','-n',g.boot.kernel_field_program(name)])
+                    calls.append((name,timeout))
+                    line='VZKSTATE v1 '+name+' '+g.boot.KERNEL_FIELDS[name][1]+' 0\n\n'
+                    program='import sys; sys.stdout.write('+repr(line)+')'
+                    if len(calls)==1 and first_failed: program+='; sys.stderr.write("[D_IDENT_UNDEF]"); sys.exit(1)'
+                    return g.boot.capture([sys.executable,'-c',program],limit,timeout,capture_stderr=True)
+                fields,readings=g.read_fields(read=read)
+                self.assertEqual(calls,[('debug_boot_arg',30),('debug_boot_arg',5)]+[(name,5) for name in g.FIELD_NAMES[1:]])
+                self.assertEqual(fields['debug_boot_arg'],readings[0]['result'])
+                self.assertEqual(fields['debug_boot_arg']['status'],'unavailable' if first_failed else 'observed')
+                self.assertEqual(readings[1]['result'],{'status':'observed','value':0})
+                self.assertEqual([item['attempt'] for item in readings],['first','repeat'])
+                self.assertTrue(all(type(item['elapsed_ms']) is int and 0<=item['elapsed_ms']<=140000 for item in readings))
+                self.assertEqual(g.validate_report({**report(),'fields':fields,'readings':readings})['readings'],readings)
+
+    def test_readings_schema_rejects_wrong_order_budget_elapsed_extra_and_first_mismatch(self):
+        value=report()
+        for readings in (list(reversed(value['readings'])),value['readings'][:1],value['readings']*2):
+            with self.assertRaises(g.GateFailure): g.validate_report({**value,'readings':readings})
+        for change in ({'budget_seconds':5},{'budget_seconds':True},{'elapsed_ms':True},{'elapsed_ms':-1},
+                       {'elapsed_ms':140001},{'raw':'private'},{'result':{'status':'observed','value':0}}):
+            readings=copy.deepcopy(value['readings']); readings[0].update(change)
+            with self.assertRaises(g.GateFailure): g.validate_report({**value,'readings':readings})
+        with self.assertRaises(g.GateFailure): g.validate_report({**value,'protocol':'kernel-field-readonly-v1'})
 
     def test_context_and_sources_reject_unknown_or_wrong_typed_metadata(self):
         for change in ({'GITHUB_ACTIONS':'false'},{'GITHUB_EVENT_NAME':'pull_request'},{'GITHUB_REPOSITORY':'foreign'},
@@ -128,7 +164,7 @@ def read(*args,**kwargs):
  child='import os,time; from pathlib import Path; Path('+repr(sys.argv[2])+').write_text(str(os.getpid())); time.sleep(60)'
  return g.boot.capture([sys.executable,'-c',child],4096,timeout=30,capture_stderr=True)
 try:
- with g.signal_guard(): g.boot.kernel_debug_state(read=read)
+ with g.signal_guard(): g.read_fields(read=read)
 except g.GateFailure as error:
  reason=error.reason
 print(json.dumps({'reason':reason,'calls':len(calls),'restored':all(signal.getsignal(n)==v for n,v in prior.items())}),flush=True)

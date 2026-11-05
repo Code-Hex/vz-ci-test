@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 
 import recovery_bootargs as boot
 
@@ -81,9 +82,31 @@ def read_boot_profile(read=boot.capture):
     except (ValueError,TypeError): return {'status':'invalid'}
 
 
+def read_fields(*, read=None):
+    readings=[]
+    for attempt,budget in (('first',30),('repeat',5)):
+        started=time.monotonic()
+        result=boot.kernel_field_state('debug_boot_arg',read=read,timeout=budget)
+        readings.append({'attempt':attempt,'budget_seconds':budget,
+                         'elapsed_ms':int((time.monotonic()-started)*1000),'result':result})
+    fields={'debug_boot_arg':readings[0]['result']}
+    for name in FIELD_NAMES[1:]: fields[name]=boot.kernel_field_state(name,read=read)
+    return fields,readings
+
+
+def validate_field(name,field):
+    require(type(field) is dict)
+    if field.get('status')=='observed':
+        require(set(field)=={'status','value'})
+        boot.kernel_field_value(name,field['value'])
+    else:
+        require(set(field)=={'status','error'} and field['status'] in ('unavailable','invalid'))
+        boot.kernel_error_summary(field['error'])
+
+
 def validate_report(value):
-    require(type(value) is dict and set(value)=={'protocol','scope','context','sources','kernel','boot_profile','fields','completed'})
-    require(value['protocol']=='kernel-field-readonly-v1' and value['scope']=='normal_boot_no_staging' and value['completed'] is True)
+    require(type(value) is dict and set(value)=={'protocol','scope','context','sources','kernel','boot_profile','fields','readings','completed'})
+    require(value['protocol']=='kernel-field-readonly-v2' and value['scope']=='normal_boot_no_staging' and value['completed'] is True)
     validate_context(value['context'])
     require(type(value['sources']) is dict and set(value['sources'])=={'script','workflow','bootargs','registry'} and
             all(hexadecimal(item) for item in value['sources'].values()))
@@ -98,14 +121,15 @@ def validate_report(value):
     else: require(set(profile)=={'status'} and profile['status'] in ('unavailable','invalid'))
     fields=value['fields']
     require(type(fields) is dict and set(fields)==set(FIELD_NAMES))
-    for name,field in fields.items():
-        require(type(field) is dict)
-        if field.get('status')=='observed':
-            require(set(field)=={'status','value'})
-            boot.kernel_field_value(name,field['value'])
-        else:
-            require(set(field)=={'status','error'} and field['status'] in ('unavailable','invalid'))
-            boot.kernel_error_summary(field['error'])
+    for name,field in fields.items(): validate_field(name,field)
+    readings=value['readings']
+    require(type(readings) is list and len(readings)==2)
+    for reading,(attempt,budget) in zip(readings,(('first',30),('repeat',5))):
+        require(type(reading) is dict and set(reading)=={'attempt','budget_seconds','elapsed_ms','result'} and
+                reading['attempt']==attempt and type(reading['budget_seconds']) is int and reading['budget_seconds']==budget and
+                type(reading['elapsed_ms']) is int and 0<=reading['elapsed_ms']<=140000)
+        validate_field('debug_boot_arg',reading['result'])
+    require(fields['debug_boot_arg']==readings[0]['result'])
     return json.loads(json.dumps(value,sort_keys=True))
 
 
@@ -123,7 +147,7 @@ def interrupted_signal(_number,_frame):
 def signal_guard():
     previous={number:signal.signal(number,handler) for number,handler in
               ((signal.SIGALRM,deadline_signal),(signal.SIGTERM,interrupted_signal),(signal.SIGINT,interrupted_signal))}
-    signal.setitimer(signal.ITIMER_REAL,110)
+    signal.setitimer(signal.ITIMER_REAL,140)
     try: yield
     finally:
         signal.setitimer(signal.ITIMER_REAL,0)
@@ -152,9 +176,9 @@ def main():
             sources=source_hashes(__file__,boot.__file__,boot.kdp_registry.__file__)
             kernel=read_kernel_identity()
             profile=read_boot_profile()
-            fields=boot.kernel_debug_state()
-            value=validate_report({'protocol':'kernel-field-readonly-v1','scope':'normal_boot_no_staging',
-                'context':context,'sources':sources,'kernel':kernel,'boot_profile':profile,'fields':fields,'completed':True})
+            fields,readings=read_fields()
+            value=validate_report({'protocol':'kernel-field-readonly-v2','scope':'normal_boot_no_staging',
+                'context':context,'sources':sources,'kernel':kernel,'boot_profile':profile,'fields':fields,'readings':readings,'completed':True})
             write_report(value,os.environ['RUNNER_TEMP'])
             print(json.dumps(value,sort_keys=True),flush=True)
         return 0

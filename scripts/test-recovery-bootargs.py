@@ -548,6 +548,21 @@ class Bootargs(unittest.TestCase):
         self.assertEqual(b.capture([sys.executable,'-c','print("a"*4095)'],4096,timeout=1),b'a'*4095+b'\n')
         with self.assertRaises(ValueError): b.capture([sys.executable,'-c','print("a"*4096)'],4096,timeout=1)
 
+    def test_single_field_reader_default_and_explicit_budget_preserve_fixed_program(self):
+        calls=[]
+        def read(argv,limit,timeout,*,capture_stderr):
+            self.assertEqual((limit,capture_stderr),(4096,True))
+            calls.append((argv,timeout))
+            return b.capture([sys.executable,'-c','print("VZKSTATE v1 debug_boot_arg u32 0\\n")'],limit,timeout,capture_stderr=True)
+        self.assertEqual(b.kernel_field_state('debug_boot_arg',read=read),{'status':'observed','value':0})
+        self.assertEqual(b.kernel_field_state('debug_boot_arg',read=read,timeout=30),{'status':'observed','value':0})
+        self.assertEqual([item[1] for item in calls],[5,30])
+        self.assertTrue(all(item[0]==['/usr/sbin/dtrace','-q','-x','errtags','-n',b.kernel_field_program('debug_boot_arg')] for item in calls))
+        for timeout in (True,0,31,1.5,'5'):
+            with self.assertRaises(ValueError): b.kernel_field_state('debug_boot_arg',read=read,timeout=timeout)
+        with self.assertRaises(ValueError): b.kernel_field_state('foreign',read=read)
+        self.assertEqual(len(calls),2)
+
     def test_kernel_field_parser_requires_exact_typed_marker_and_cli_one_lf(self):
         self.assertEqual(b.parse_kernel_field('debug_boot_arg',b'VZKSTATE v1 debug_boot_arg u32 8192\n\n'),8192)
         self.assertEqual(b.parse_kernel_field('dtrace_destructive_disallow',b'VZKSTATE v1 dtrace_destructive_disallow i32 -1\n\n'),-1)

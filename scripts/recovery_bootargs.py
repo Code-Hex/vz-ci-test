@@ -269,27 +269,30 @@ def kernel_failure(reason, error=None, raw=None):
         'output_sha256': hashlib.sha256(combined).hexdigest() if collected else None, 'tags': tags})
 
 
-def kernel_debug_state(*, read=None):
+def kernel_field_state(name, *, read=None, timeout=5):
+    if type(name) is not str or name not in KERNEL_FIELDS: raise ValueError("kernel debug field invalid")
+    if type(timeout) is not int or timeout not in (5, 30): raise ValueError("kernel debug timeout invalid")
     read = capture if read is None else read
-    result = {}
-    for name in KERNEL_FIELDS:
-        raw = None
-        try:
-            raw = read(["/usr/sbin/dtrace", "-q", "-x", "errtags", "-n", kernel_field_program(name)], 4096, timeout=5, capture_stderr=True)
-            result[name] = {"status": "observed", "value": parse_kernel_field(name, raw)}
-        except subprocess.CalledProcessError as error:
-            result[name] = {"status": "unavailable", "error": kernel_failure('command_failed', error)}
-        except subprocess.TimeoutExpired as error:
-            result[name] = {"status": "unavailable", "error": kernel_failure('timeout', error)}
-        except CaptureLimit as error:
-            result[name] = {"status": "unavailable", "error": kernel_failure('output_limit', error)}
-        except OSError as error:
-            result[name] = {"status": "unavailable", "error": kernel_failure('os_error', error)}
-        except subprocess.SubprocessError as error:
-            result[name] = {"status": "unavailable", "error": kernel_failure('unknown', error)}
-        except ValueError:
-            result[name] = {"status": "invalid", "error": kernel_failure('output_invalid', raw=raw)}
-    return result
+    raw = None
+    try:
+        raw = read(["/usr/sbin/dtrace", "-q", "-x", "errtags", "-n", kernel_field_program(name)], 4096, timeout=timeout, capture_stderr=True)
+        return {"status": "observed", "value": parse_kernel_field(name, raw)}
+    except subprocess.CalledProcessError as error:
+        return {"status": "unavailable", "error": kernel_failure('command_failed', error)}
+    except subprocess.TimeoutExpired as error:
+        return {"status": "unavailable", "error": kernel_failure('timeout', error)}
+    except CaptureLimit as error:
+        return {"status": "unavailable", "error": kernel_failure('output_limit', error)}
+    except OSError as error:
+        return {"status": "unavailable", "error": kernel_failure('os_error', error)}
+    except subprocess.SubprocessError as error:
+        return {"status": "unavailable", "error": kernel_failure('unknown', error)}
+    except ValueError:
+        return {"status": "invalid", "error": kernel_failure('output_invalid', raw=raw)}
+
+
+def kernel_debug_state(*, read=None):
+    return {name: kernel_field_state(name, read=read) for name in KERNEL_FIELDS}
 
 
 class MacPlatform:
