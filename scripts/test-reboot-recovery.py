@@ -480,7 +480,7 @@ class Recovery(unittest.TestCase):
                 self.assertEqual(r.json.loads(output["summary"])["phase"], "panic_returned")
                 events.append("returned")
             with patch.object(r.recovery_panic_control, "prepare", prepare), patch.object(r.recovery_panic_control, "fire", fire), \
-                    patch.object(r.recovery_nvram_panic, "read_panic_info", lambda: ("unavailable", None)), \
+                    patch.object(r.recovery_nvram_panic, "read_panic_info", lambda: self.fail("boot 2 loaded IOKit before spawning tools")), \
                     patch.object(r, "publish_followup", publish), patch.object(r, "complete_recovery", complete), \
                     patch.object(r.recovery_reports, "encrypt_bundle", encrypt), \
                     patch.object(r, "boot_uuid", lambda: saved["scope"]["debug_boot_uuid"]):

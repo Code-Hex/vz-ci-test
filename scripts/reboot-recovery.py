@@ -431,6 +431,11 @@ def prepare_root(payload):
         raise ValueError("empty boot session")
     if panic_followup(ctx):
         recovery_panic_control.build(directory, nonce, private_write, sync_directory)
+        baseline_status, baseline_raw = recovery_nvram_panic.read_panic_info()
+        marker = {"binding": binding(ctx), "nonce": nonce, "baseline": baseline, "source_identity": debug_source_identity()}
+        private_write(directory / "panic-followup-baseline.json", json.dumps({"marker": marker, "boot_stage": "initial",
+                      "status": baseline_status, "sha256": hashlib.sha256(baseline_raw).hexdigest() if baseline_raw is not None else None}).encode())
+        sync_directory(directory)
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "public_key", "binding": binding(ctx),
                           "nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public,
                           "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "debug_source": ctx["debug_source"], "after_debug_boot": ctx.get("after_debug_boot", "none"), "cert_fingerprint": fingerprint})
@@ -1318,10 +1323,6 @@ def followup_start(directory, config, current, facts, token):
     private_write(directory / "panic-followup-debug.json", json.dumps(saved).encode())
     sync_directory(directory)
     try:
-        baseline_status, baseline = recovery_nvram_panic.read_panic_info()
-        private_write(directory / "panic-followup-baseline.json", json.dumps({"scope": scope, "status": baseline_status,
-                      "sha256": hashlib.sha256(baseline).hexdigest() if baseline is not None else None}).encode())
-        sync_directory(directory)
         prepared = recovery_panic_control.prepare(directory, config["nonce"], private_write, sync_directory)
         publish_followup(directory, config, token, followup_summary(config, "panic_prepared", current, saved, prepared=prepared),
                          "Nonce panic control prepared")
@@ -1340,7 +1341,7 @@ def followup_start(directory, config, current, facts, token):
         failure = {"status": "failed", "kind": type(error).__name__}
     private_write(directory / "panic-followup-returned.json", json.dumps({"scope": scope, **failure}).encode())
     sync_directory(directory)
-    names = tuple(label + "." + channel for label in ("build", "sign", "listing", "trace", "panic-compile", "tracer") for channel in ("stdout", "stderr")) + ("prepare-failure.json",)
+    names = tuple(label + "." + channel for label in ("build", "sign", "listing", "trace", "panic-compile", "tracer") for channel in ("stdout", "stderr")) + ("prepare-failure.json", "timeout-ps.stdout", "timeout-ps.stderr", "timeout-sample.stdout", "timeout-sample.stderr", "timeout-diagnostic.json")
     failure["files"] = {name: {"exists": (directory / "panic-control" / name).exists(),
                               "bytes": (directory / "panic-control" / name).stat().st_size if (directory / "panic-control" / name).exists() else None}
                         for name in names}
