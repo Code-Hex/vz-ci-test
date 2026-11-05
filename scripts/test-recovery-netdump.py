@@ -166,6 +166,85 @@ class Discovery(unittest.TestCase):
         host = n.prime_host_fact(plan, scope, n.Endpoint('1.1.1.1', 49000), snapshot, n.HelloStats(True, True, 30))
         return n.make_prime_proof(plan.offer, plan.public_fact(), host, n.HelloStats(True, True, 35), snapshot, 11, 10)
 
+    def capture_proof(self):
+        plan = dataclasses.replace(self.prime_plan(), offer=dataclasses.replace(self.offer(), purpose='capture'))
+        scope = self.prime_scope()
+        check = self.core_check()
+        summary = json.loads(check['output']['summary'])
+        summary['after_debug_boot'] = 'panic-nonce-netdump'
+        check['output']['summary'] = json.dumps(summary)
+        snapshot = n.core_snapshot(check, scope, plan.public_fact())
+        host = n.prime_host_fact(plan, scope, n.Endpoint('1.1.1.1', 49000), snapshot, n.HelloStats(True, True, 30))
+        return n.make_prime_proof(plan.offer, plan.public_fact(), host, n.HelloStats(True, True, 35), snapshot, 11, 10)
+
+    def actual_intent(self):
+        proof = self.capture_proof()
+        scope = self.prime_scope()
+        facts = copy.deepcopy(proof['core_snapshot']['facts'])
+        facts['netdump_prime'] = {'status': 'verified', 'proof': proof}
+        prepared = {key: 'e' * 64 for key in ('control_sha256', 'preflight_sha256', 'getter_sha256', 'helper_source_sha256', 'helper_sha256')}
+        prepared.update(nonce_sha256=hashlib.sha256(scope.nonce.encode()).hexdigest(), observe_status='passed', compile_status='passed')
+        trigger = {'scope': {'binding': scope.binding, 'nonce': scope.nonce, 'baseline': self.B1,
+                            'source_identity': scope.core_identity, 'debug_boot_uuid': self.B2},
+                   'helper_sha256': 'e' * 64, 'helper_pid': 1234, 'tracer_pid': 1235, 'ready': True}
+        return {'protocol': 'vz-recovery-v1', 'phase': 'panic_intent', **{key: scope.record()[key] for key in ('binding', 'nonce', 'baseline_boot_uuid', 'cert_fingerprint')},
+                'current_boot_uuid': self.B2, 'debug_boot_uuid': self.B2, 'trigger': 'reboot-quick', 'debug_boot': True,
+                'debug_source': 'bootplist', 'after_debug_boot': 'panic-nonce-netdump', 'debug_boot_facts': facts,
+                'result_owner': 'capture-controller', 'panic_trigger': trigger, 'prepared': prepared}
+
+    def test_capture_intent_requires_actual_ready_same_scope_restored_control_and_handoff(self):
+        proof, intent = self.capture_proof(), self.actual_intent()
+        scope = n.validate_actual_intent(intent, proof, 9)
+        self.assertEqual(scope.helper_pid, 1234)
+        self.assertEqual(scope.intent_sha256, n.digest(intent))
+        for path, bad in ((('result_owner',), 'mac'), (('phase',), 'panic_prepared'),
+                          (('current_boot_uuid',), self.B1), (('panic_trigger', 'ready'), False),
+                          (('panic_trigger', 'helper_pid'), True), (('prepared', 'helper_sha256'), '0' * 64),
+                          (('debug_boot_facts', 'bootplist_restored'), False),
+                          (('debug_boot_facts', 'netdump_prime', 'status'), 'pending')):
+            changed = copy.deepcopy(intent)
+            target = changed
+            for key in path[:-1]: target = target[key]
+            target[path[-1]] = bad
+            with self.subTest(path=path), self.assertRaises(ValueError): n.validate_actual_intent(changed, proof, 9)
+
+    def test_capture_final_refresh_nonce_binds_actual_intent_and_canonical_result(self):
+        proof, intent = self.capture_proof(), self.actual_intent()
+        scope = n.validate_actual_intent(intent, proof, 9)
+        self.assertNotEqual(n.capture_packet_nonce(scope, 'intel'), n.prime_packet_nonce(self.prime_scope(), 'intel', proof['offer']['nonce']))
+        self.assertNotEqual(n.capture_packet_nonce(scope, 'intel'), n.capture_packet_nonce(scope, 'receiver'))
+        other = dataclasses.replace(scope, intent_sha256='0' * 64)
+        self.assertNotEqual(n.capture_packet_nonce(scope, 'intel'), n.capture_packet_nonce(other, 'intel'))
+        armed = n.capture.make_armed(scope, prime_proof_sha256=n.digest(proof), offer_digest=n.digest(proof['offer']),
+                                     peer=proof['host_plan']['intel_public_endpoint'], receiver_check_id=12)
+        self.assertEqual(n.validate_capture_phase(armed, proof, intent, 9), armed)
+        for key, bad in (('receiver_check_id', True), ('peer', {'ip': '1.1.1.1', 'port': 49001}), ('prime_proof_sha256', '0' * 64)):
+            with self.assertRaises(ValueError): n.validate_capture_phase({**armed, key: bad}, proof, intent, 9)
+
+    def test_root_intent_check_identity_and_capture_terminal_records_reject_tampering(self):
+        proof, intent = self.capture_proof(), self.actual_intent()
+        scope = n.validate_actual_intent(intent, proof, 9)
+        check = self.core_check()
+        check['output'] = {'title': 'Nonce panic intent durable', 'summary': json.dumps(intent), 'text': ''}
+        self.assertEqual(n.root_capture_intent(check, proof), intent)
+        for field, bad in (('id', True), ('status', 'completed'), ('head_sha', '0' * 40), ('external_id', 'foreign')):
+            with self.assertRaises(ValueError): n.root_capture_intent({**check, field: bad}, proof)
+        armed = n.capture.make_armed(scope, prime_proof_sha256=n.digest(proof), offer_digest=n.digest(proof['offer']),
+                                     peer=proof['host_plan']['intel_public_endpoint'], receiver_check_id=12)
+        stream = n.capture.FragmentStream(scope.nonce[:16])
+        stream.finish('deadline')
+        cipher = b'envelope shape only'
+        value = {**armed, 'phase': 'captured', 'result': n.capture.kernel_result(scope, stream), 'eof_ack': 'not_applicable',
+                 'envelope': {'ciphertext': base64.b64encode(cipher).decode(), 'cipher_sha256': hashlib.sha256(cipher).hexdigest(), 'cert_fingerprint': 'c' * 64}}
+        self.assertEqual(n.validate_capture_phase(value, proof, intent, 9), value)
+        self.assertEqual(n.validate_capture_phase({**value, 'phase': 'failed'}, proof, intent, 9)['phase'], 'failed')
+        self.assertEqual(n.validate_capture_phase({**armed, 'phase': 'waiting_intent'}, proof, intent, 9)['phase'], 'waiting_intent')
+        for changed in ({**value, 'raw': 'private'}, {**value, 'eof_ack': 'sent_unconfirmed'}, {**value, 'receiver_check_id': True},
+                        {**value, 'envelope': {**value['envelope'], 'cert_fingerprint': '0' * 64}},
+                        {**value, 'result': {**value['result'], 'scope': {**scope.record(), 'helper_pid': 999}}}):
+            with self.assertRaises(ValueError): n.validate_capture_phase(changed, proof, intent, 9)
+        self.assertNotIn('ciphertext', n.canonical(n.console_fact(value)))
+
     def test_prime_proof_is_userspace_only_and_rejects_scope_control_and_b1_packet_replay(self):
         proof, scope = self.prime_proof(), self.prime_scope()
         control = proof['core_snapshot']['facts']['netdump_active_control']
@@ -405,6 +484,140 @@ class Discovery(unittest.TestCase):
         self.assertEqual(name, 'Netdump synthetic capture 123')
         self.assertEqual(external, 'netdump-synthetic/123/1/' + 'a' * 40 + '/' + 'b' * 64)
         with self.assertRaises(ValueError): n.check_attributes(ctx, 'intel', synthetic_digest='b' * 64)
+
+    def test_eof_ack_waits_for_commit_and_duplicate_eof_does_not_commit_again(self):
+        plan = self.plan()
+        filename, body = n.synthetic_fixture(plan.offer, plan.public_fact())
+        entered, release = threading.Event(), threading.Event()
+        committed, outcome, errors = [], [], []
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            receiver.bind(('127.0.0.1', 0)); sender.bind(('127.0.0.1', 0))
+            def commit(stream):
+                self.assertEqual(stream.data, body)
+                entered.set()
+                if not release.wait(2): raise TimeoutError('test_commit_timeout')
+                committed.append(stream.data)
+                return {'commit_returned': True}
+            def receive():
+                try:
+                    outcome.append(n.receive_and_commit(receiver, sender.getsockname(), filename, n.udp.SYNTHETIC_PREFIX,
+                                                        time.monotonic() + 3, time.monotonic() + 3, commit,
+                                                        n.WireBudget(), retry_seconds=1))
+                except Exception as error: errors.append(error)
+            thread = threading.Thread(target=receive)
+            thread.start()
+            try:
+                n.send_synthetic(sender, receiver.getsockname(), filename, body, time.monotonic() + 2)
+                eof = n.udp.wire.encode_eof(4)
+                sender.sendto(eof, receiver.getsockname())
+                self.assertTrue(entered.wait(1))
+                sender.settimeout(.05)
+                with self.assertRaises(socket.timeout): sender.recvfrom(4096)
+                release.set()
+                sender.settimeout(.5)
+                self.assertEqual(n.udp.wire.decode_ack(sender.recvfrom(4096)[0]), 4)
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as noise:
+                    noise.sendto(b'foreign packet', receiver.getsockname())
+                    sender.settimeout(.1)
+                    with self.assertRaises(socket.timeout): sender.recvfrom(4096)
+                sender.settimeout(.5)
+                sender.sendto(eof, receiver.getsockname())
+                self.assertEqual(n.udp.wire.decode_ack(sender.recvfrom(4096)[0]), 4)
+            finally:
+                release.set()
+                thread.join(4)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(committed, [body])
+            self.assertTrue(outcome[0][2])
+
+    def test_failed_commit_never_sends_eof_ack_on_real_udp(self):
+        plan = self.plan()
+        filename, body = n.synthetic_fixture(plan.offer, plan.public_fact())
+        failures, commits = [], []
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            receiver.bind(('127.0.0.1', 0)); sender.bind(('127.0.0.1', 0))
+            def reject(stream):
+                commits.append(stream.data)
+                raise ValueError('commit_rejected')
+            def receive():
+                try:
+                    n.receive_and_commit(receiver, sender.getsockname(), filename, n.udp.SYNTHETIC_PREFIX,
+                                         time.monotonic() + 2, time.monotonic() + 2, reject, n.WireBudget())
+                except ValueError: failures.append('rejected')
+            thread = threading.Thread(target=receive)
+            thread.start()
+            n.send_synthetic(sender, receiver.getsockname(), filename, body, time.monotonic() + 2)
+            sender.sendto(n.udp.wire.encode_eof(4), receiver.getsockname())
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            sender.settimeout(.05)
+            with self.assertRaises(socket.timeout): sender.recvfrom(4096)
+            self.assertEqual(commits, [body])
+            self.assertEqual(failures, ['rejected'])
+
+    def test_outer_wire_quota_preserves_an_already_accepted_fragment(self):
+        filename, body = n.synthetic_fixture(self.plan().offer, self.plan().public_fact())
+        streams = []
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            receiver.bind(('127.0.0.1', 0)); sender.bind(('127.0.0.1', 0))
+            def receive():
+                streams.append(n.receive_fragment(receiver, sender.getsockname(), filename, n.udp.SYNTHETIC_PREFIX,
+                                                   time.monotonic() + 2, first_payload_idle=True, budget=n.WireBudget(packets=4094)))
+            thread = threading.Thread(target=receive)
+            thread.start()
+            n.udp._wire_packet(sender, receiver.getsockname(), n.udp.wire.encode_wrq(filename), 0, time.monotonic() + 2)
+            packet = n.udp.wire.encode_paniclog_data(1, body[:512], filename, b'Y' * 17)
+            n.udp._wire_packet(sender, receiver.getsockname(), packet, 1, time.monotonic() + 2)
+            sender.sendto(n.udp.wire.encode_paniclog_data(2, body[512:1024], filename, b'Y' * 17), receiver.getsockname())
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(streams[0].termination, 'limit')
+            self.assertEqual(streams[0].data, body[:512])
+            self.assertFalse(streams[0].eof_accepted)
+
+    def test_closed_receiver_preserves_accepted_data_and_still_commits(self):
+        filename, body = n.synthetic_fixture(self.plan().offer, self.plan().public_fact())
+        commits, outcomes, errors = [], [], []
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        receiver.bind(('127.0.0.1', 0))
+        address = receiver.getsockname()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.bind(('127.0.0.1', 0))
+            def commit(stream):
+                commits.append(stream.data)
+                return {'stored': True}
+            def receive():
+                try:
+                    outcomes.append(n.receive_and_commit(receiver, sender.getsockname(), filename, n.udp.SYNTHETIC_PREFIX,
+                                                         time.monotonic() + 2, time.monotonic() + 2, commit, n.WireBudget()))
+                except Exception as error: errors.append(type(error).__name__)
+            thread = threading.Thread(target=receive)
+            thread.start()
+            try:
+                n.udp._wire_packet(sender, address, n.udp.wire.encode_wrq(filename), 0, time.monotonic() + 2)
+                packet = n.udp.wire.encode_paniclog_data(1, body[:512], filename, b'Y' * 17)
+                n.udp._wire_packet(sender, address, packet, 1, time.monotonic() + 2)
+            finally:
+                receiver.close()
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(commits, [body[:512]])
+            self.assertEqual(outcomes[0][0].termination, 'io_error')
+            self.assertFalse(outcomes[0][0].eof_accepted)
+
+    def test_actual_first_packet_wait_uses_deadline_and_wire_quota_is_shared(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            stream = n.receive_fragment(sock, ('127.0.0.1', 1), 'a' * 16, b'panic(', time.monotonic() + .08,
+                                        idle_seconds=.01, first_payload_idle=True)
+            self.assertEqual(stream.termination, 'deadline')
+            self.assertEqual(stream.data, b'')
+        budget = n.WireBudget(packets=4095)
+        self.assertTrue(budget.accept(b'a'))
+        self.assertFalse(budget.accept(b'a'))
+        self.assertFalse(n.WireBudget(byte_count=2 * 1024 * 1024).accept(b'a'))
 
     def test_connected_adapter_runs_existing_hello_ack_on_real_udp(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as a, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as b:

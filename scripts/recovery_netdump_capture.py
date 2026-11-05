@@ -11,7 +11,7 @@ PROTOCOL = 'netdump-capture-v1'
 PRIME_KEYS = ('binding', 'nonce', 'baseline_boot_uuid', 'boot_uuid', 'core_identity', 'cert_fingerprint', 'recovery_check_id')
 SCOPE_KEYS = PRIME_KEYS + ('intent_sha256', 'helper_sha256', 'helper_pid', 'tracer_pid')
 UUID = re.compile(r'[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}')
-TERMINATIONS = ('eof', 'limit', 'invalid', 'idle', 'deadline')
+TERMINATIONS = ('eof', 'limit', 'invalid', 'idle', 'deadline', 'io_error')
 
 
 def require(condition):
@@ -129,7 +129,7 @@ class FragmentStream:
         return ack
 
     def finish(self, reason):
-        require(type(reason) is str and reason in ('idle', 'deadline', 'limit'))
+        require(type(reason) is str and reason in ('idle', 'deadline', 'limit', 'io_error'))
         if self.termination is None: self._termination = reason
 
     def public_fact(self):

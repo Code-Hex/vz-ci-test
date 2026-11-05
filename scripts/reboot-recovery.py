@@ -11,6 +11,7 @@ import recovery_arrival
 import recovery_sources
 import recovery_netdump_settings
 import recovery_netdump
+import recovery_netdump_capture
 import json
 import math
 import os
@@ -44,7 +45,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
-              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "netdump-prime") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "netdump-prime", "panic-nonce-netdump") and
               (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
@@ -76,8 +77,21 @@ def netdump_prime(ctx):
     return ctx.get('after_debug_boot') == 'netdump-prime'
 
 
+def netdump_capture(ctx):
+    return ctx.get('after_debug_boot') == 'panic-nonce-netdump'
+
+
+def netdump_mode(ctx):
+    return 'capture' if netdump_capture(ctx) else 'prime' if netdump_prime(ctx) else None
+
+
+def require_root_writer(directory, config):
+    if netdump_capture(config['context']) and (directory / 'capture-handoff-started.json').exists():
+        raise ValueError('capture root ownership transferred')
+
+
 def expected_debug_mask(ctx):
-    if netdump_prime(ctx):
+    if netdump_mode(ctx):
         return recovery_netdump_settings.DEBUG_MASK
     return 0x102000 if panic_followup(ctx) else 0x2000
 
@@ -87,7 +101,7 @@ def report_required(ctx):
 
 
 def certificate_required(ctx):
-    return report_required(ctx) or netdump_prime(ctx)
+    return report_required(ctx) or netdump_mode(ctx) is not None
 
 
 def netdump_context(ctx):
@@ -99,8 +113,8 @@ def netdump_plan(config):
     plan = recovery_netdump.DiscoveryPlan.from_record(config['netdump_plan'])
     core, network = recovery_netdump.source_identity(__file__)
     recovery_netdump.match_offer(plan.offer.record(), netdump_context(config['context']),
-                                config['cert_fingerprint'], core, dict(network), 'prime')
-    if (plan.offer.purpose != 'prime' or plan.nonce != config['nonce'] or plan.stats is None or
+                                config['cert_fingerprint'], core, dict(network), netdump_mode(config['context']))
+    if (plan.offer.purpose != netdump_mode(config['context']) or plan.nonce != config['nonce'] or plan.stats is None or
             plan.baseline is None or plan.baseline.baseline_boot_uuid != config['baseline'] or
             plan.baseline.profile() != config['initial_boot_argument_profile']):
         raise ValueError('netdump plan scope mismatch')
@@ -259,7 +273,7 @@ def debug_lineage_matches(data, pending, ctx):
 
 
 def boot_proof_matches(data, pending, ctx):
-    return (mode_matches(data, pending, ctx) and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx) and
+    return (not netdump_capture(ctx) and mode_matches(data, pending, ctx) and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx) and
             data.get("phase") == "boot_observed" and data.get("nonce") == pending["nonce"] and
             data.get("baseline_boot_uuid") == pending["baseline_boot_uuid"] and
             reboot_observed(pending["baseline_boot_uuid"], data.get("current_boot_uuid")) and
@@ -633,14 +647,15 @@ def prepare_root(payload):
     baseline = boot_uuid()
     if not baseline:
         raise ValueError("empty boot session")
-    initial_boot_argument_profile = observe_boot_argument_profile() if panic_followup(ctx) or netdump_prime(ctx) else {"status": "unavailable"}
+    initial_boot_argument_profile = observe_boot_argument_profile() if panic_followup(ctx) or netdump_mode(ctx) else {"status": "unavailable"}
     plan = None
-    if netdump_prime(ctx):
+    if netdump_mode(ctx):
         baseline_fact = recovery_netdump.BootBaseline.from_profile(baseline, initial_boot_argument_profile)
         plan = recovery_netdump.discover(netdump_context(ctx), token, cert, nonce, main_path=__file__,
-                                         purpose='prime', baseline=baseline_fact)
-    if panic_followup(ctx):
+                                         purpose=netdump_mode(ctx), baseline=baseline_fact)
+    if panic_followup(ctx) or netdump_capture(ctx):
         recovery_panic_control.build(directory, nonce, private_write, sync_directory)
+    if panic_followup(ctx):
         baseline_status, baseline_raw = recovery_nvram_panic.read_panic_info()
         marker = {"binding": binding(ctx), "nonce": nonce, "baseline": baseline, "source_identity": debug_source_identity()}
         private_write(directory / "panic-followup-baseline.json", json.dumps({"marker": marker, "boot_stage": "initial",
@@ -1107,7 +1122,7 @@ def debug_owner(directory, config, current):
             debug_event(directory, config, "bootplist_inflight", current)
             fact = recovery_bootplist.stage(directory, marker, private_write, sync_directory, debug_mask=expected_debug_mask(config["context"]),
                                                nvram_paniclog=0 if nvram_off_control(config["context"]) else None,
-                                               netdump_settings=netdump_plan(config).settings if netdump_prime(config['context']) else None)
+                                               netdump_settings=netdump_plan(config).settings if netdump_mode(config['context']) else None)
             debug_event(directory, config, "bootplist_staged", current, bootplist_stage=fact)
         else:
             recovery_bootargs.stage(directory, marker, platform, private_write, sync_directory)
@@ -1455,6 +1470,7 @@ def panic_capture(directory, config, current, deadline):
 
 
 def publish_debug_core(directory, config, current, facts, token):
+    require_root_writer(directory, config)
     scope = {"marker": debug_boot_marker(config), "current_boot_uuid": current}
     path = directory / "debug-boot-core.json"
     if path.exists():
@@ -1494,6 +1510,11 @@ def followup_summary(config, phase, current, saved, **details):
 
 
 def publish_followup(directory, config, token, summary, title):
+    require_root_writer(directory, config)
+    _publish_followup(config, token, summary, title)
+
+
+def _publish_followup(config, token, summary, title):
     output = {"title": title, "summary": json.dumps(summary), "text": ""}
     if len(json.dumps(output).encode()) > 58000:
         raise ValueError("followup output oversized")
@@ -1506,6 +1527,95 @@ def publish_followup(directory, config, token, summary, title):
     actual = check["output"]
     if actual.get("title") != title or actual.get("summary") != output["summary"] or actual.get("text") not in (None, ""):
         raise ValueError("followup acknowledgement content mismatch")
+
+
+def publish_capture_intent(directory, config, token, summary):
+    if not netdump_capture(config['context']) or summary.get('phase') != 'panic_intent' or summary.get('result_owner') != 'capture-controller':
+        raise ValueError('capture handoff intent invalid')
+    scope = recovery_netdump_capture.CaptureScope.from_trigger(netdump_scope(config, summary['current_boot_uuid']).record(),
+                recovery_netdump.digest(summary), summary['panic_trigger'])
+    private_write(directory / 'capture-handoff-started.json', json.dumps({'scope': scope.record(), 'intent_sha256': scope.intent_sha256}).encode())
+    sync_directory(directory)
+    _publish_followup(config, token, summary, 'Nonce panic intent durable')
+    return scope
+
+
+def publish_capture_fire_status(directory, config, token, intent, output):
+    scope = recovery_netdump_capture.CaptureScope.from_trigger(netdump_scope(config, intent['current_boot_uuid']).record(),
+                recovery_netdump.digest(intent), intent['panic_trigger'])
+    owner = {'protocol': 'vz-capture-fire-status-v1', 'scope': scope.record()}
+    private_write(directory / 'capture-fire-status-started.json', json.dumps(owner).encode())
+    sync_directory(directory)
+    external = 'capture-fire/' + hashlib.sha256(json.dumps(owner, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    payload = {'name': 'Capture fire status ' + config['context']['run_id'], 'head_sha': config['context']['sha'],
+               'external_id': external, 'status': 'completed', 'conclusion': 'neutral', 'output': output}
+    if len(json.dumps(output).encode()) > 58000: raise ValueError('fire status output oversized')
+    check = api('POST', CHECKS, token, payload)
+    number = check.get('id')
+    if type(number) is not int or number <= 0: raise ValueError('fire status identifier invalid')
+    actual = api('GET', CHECKS + '/' + str(number), token)
+    if (actual.get('id') != number or actual.get('name') != payload['name'] or actual.get('head_sha') != payload['head_sha'] or
+            actual.get('external_id') != external or actual.get('app', {}).get('id') != 15368 or actual.get('app', {}).get('slug') != 'github-actions' or
+            actual.get('details_url') != 'https://github.com/Code-Hex/vz-ci-test/runs/' + str(number) or
+            actual.get('status') != 'completed' or actual.get('conclusion') != 'neutral' or
+            any(actual.get('output', {}).get(key) != output.get(key) for key in ('title', 'summary', 'text'))):
+        raise ValueError('fire status acknowledgement invalid')
+
+
+def safe_fire_return(value):
+    if type(value) is not dict: return {}
+    result = {}
+    for key, allowed in (('phase', ('returned', 'unknown', 'not_released')), ('release_status', ('released', 'unknown', 'not_released'))):
+        if value.get(key) in allowed: result[key] = value[key]
+    for key in ('tracer_exit', 'helper_exit'):
+        if type(value.get(key)) is int and -255 <= value[key] <= 255: result[key] = value[key]
+    for key in ('wait_intervals', 'ownership_faults'):
+        if type(value.get(key)) is int and 0 <= value[key] < 2**63: result[key] = value[key]
+    if type(value.get('output_overflow')) is bool: result['output_overflow'] = value['output_overflow']
+    return result
+
+
+def capture_intent_snapshot(check, pending, ctx):
+    if (not netdump_capture(ctx) or pending is None or select_check([check], ctx) is None or
+            check.get('id') != pending['check_id'] or check.get('status') != 'in_progress' or check.get('conclusion') is not None):
+        raise ValueError('capture intent identity invalid')
+    data = json.loads(check.get('output', {}).get('summary', '{}'))
+    if (not mode_matches(data, pending, ctx) or data.get('protocol') != 'vz-recovery-v1' or
+            data.get('phase') != 'panic_intent' or data.get('result_owner') != 'capture-controller' or
+            data.get('binding') != binding(ctx) or data.get('nonce') != pending['nonce'] or
+            data.get('baseline_boot_uuid') != pending['baseline_boot_uuid']):
+        raise ValueError('capture intent scope invalid')
+    expected = recovery_netdump.PrimeScope(binding(ctx), pending['nonce'], pending['baseline_boot_uuid'],
+        data['current_boot_uuid'], debug_source_identity(), pending['cert_fingerprint'], check['id'])
+    result = data['debug_boot_facts']['netdump_prime']
+    if type(result) is not dict or set(result) != {'status', 'proof'} or result['status'] != 'verified':
+        raise ValueError('capture prime proof missing')
+    actual = recovery_netdump.validate_actual_intent(data, result['proof'], check['id'])
+    scope = recovery_netdump_capture.CaptureScope.from_trigger(expected.record(), recovery_netdump.digest(data), data['panic_trigger'])
+    if actual != scope: raise ValueError('capture intent source invalid')
+    return {'scope': scope.record(), 'intent': data}
+
+
+def close_capture_root(ctx, token, pending, snapshot, receiver_check_id, successful):
+    scope = recovery_netdump_capture.CaptureScope.from_record(snapshot['scope'])
+    if receiver_check_id is not None and (type(receiver_check_id) is not int or receiver_check_id <= 0 or receiver_check_id == scope.recovery_check_id):
+        raise ValueError('capture result identifier invalid')
+    url = CHECKS + '/' + str(scope.recovery_check_id)
+    current = capture_intent_snapshot(api('GET', url, token, timeout=5), pending, ctx)
+    if current != snapshot: raise ValueError('capture intent changed before close')
+    summary = {**snapshot['intent'], 'phase': 'capture_controller_closed',
+               'capture_bookkeeping': {'intent_sha256': scope.intent_sha256, 'scope': scope.record(),
+                                       'receiver_check_id': receiver_check_id, 'captured': successful}}
+    output = {'title': 'Capture controller closed', 'summary': json.dumps(summary), 'text': ''}
+    if len(json.dumps(output).encode()) > 58000: raise ValueError('capture close output oversized')
+    payload = {'status': 'completed', 'conclusion': 'neutral' if successful else 'failure', 'output': output}
+    api('PATCH', url, token, payload, timeout=5)
+    saved = api('GET', url, token, timeout=5)
+    if (select_check([saved], ctx) is None or saved.get('id') != scope.recovery_check_id or
+            saved.get('status') != payload['status'] or saved.get('conclusion') != payload['conclusion'] or
+            any(saved.get('output', {}).get(key) != output[key] for key in ('title', 'summary')) or
+            saved.get('output', {}).get('text') not in (None, '')):
+        raise ValueError('capture close acknowledgement invalid')
 
 
 def read_followup_debug(directory, config):
@@ -1525,13 +1635,15 @@ def read_followup_debug(directory, config):
 
 def runtime_watch_identity(config, scope, helper_sha256):
     recovery_panic_control.validate_scope(scope)
-    if (not panic_followup(config['context']) or
+    if (not (panic_followup(config['context']) or netdump_capture(config['context'])) or
             scope != {**debug_boot_marker(config), 'debug_boot_uuid': scope['debug_boot_uuid']} or
             config['debug_source_identity'] != debug_source_identity() or
             not isinstance(helper_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', helper_sha256)):
         raise ValueError('runtime watch identity invalid')
-    return {'protocol': 'vz-runtime-watch-v1', 'role': 'runtime-watch',
-            'scope': scope, 'helper_sha256': helper_sha256}
+    result = {'protocol': 'vz-runtime-watch-v1', 'role': 'runtime-watch',
+              'scope': scope, 'helper_sha256': helper_sha256}
+    if netdump_capture(config['context']): result['lifetime_seconds'] = 240
+    return result
 
 
 def runtime_watch_external(identity):
@@ -1581,6 +1693,8 @@ def runtime_watch_stage(directory, identity, previous):
 
 
 def runtime_watch_ready(receipt, identity, pid, launched, now):
+    lifetime = identity.get('lifetime_seconds', 120)
+    if type(lifetime) is not int or lifetime not in (120, 240): raise ValueError('runtime watch lifetime invalid')
     if (not isinstance(receipt, dict) or set(receipt) != {'identity', 'check_id', 'pid', 'started_monotonic',
             'deadline_monotonic', 'acknowledged'} or receipt['identity'] != identity or
             type(receipt['check_id']) is not int or receipt['check_id'] <= 0 or
@@ -1588,8 +1702,8 @@ def runtime_watch_ready(receipt, identity, pid, launched, now):
             any(type(receipt[k]) not in (int, float) or not math.isfinite(receipt[k])
                 for k in ('started_monotonic', 'deadline_monotonic')) or
             not launched <= receipt['started_monotonic'] <= now or
-            receipt['deadline_monotonic'] != receipt['started_monotonic'] + 120 or
-            receipt['deadline_monotonic'] - now < 60):
+            receipt['deadline_monotonic'] != receipt['started_monotonic'] + lifetime or
+            receipt['deadline_monotonic'] - now < (180 if lifetime == 240 else 60)):
         raise ValueError('runtime watch readiness invalid')
     return receipt['deadline_monotonic']
 
@@ -1660,18 +1774,19 @@ def start_runtime_watch(directory, config, scope, prepared):
 
 def runtime_watch(directory):
     started = time.monotonic()
-    deadline = started + 120
+    lifetime = 120
+    deadline = started + lifetime
     def expired(_signum, _frame):
         raise TimeoutError('runtime watch deadline')
     previous = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, 120)
+    signal.setitimer(signal.ITIMER_REAL, lifetime)
     check_id = None
     identity = token = None
     sequence = 0
     observation = ('before_release', None)
     def fact(phase):
         return {**identity, 'phase': phase, 'sequence': sequence, 'pid': os.getpid(),
-                'elapsed_ms': min(120000, max(0, int((time.monotonic() - started) * 1000))),
+                'elapsed_ms': min(lifetime * 1000, max(0, int((time.monotonic() - started) * 1000))),
                 'stage': observation[0], 'release_record_sha256': observation[1]}
     def send(phase):
         remaining = deadline - time.monotonic() - (5 if phase == 'heartbeat' else 0)
@@ -1684,6 +1799,10 @@ def runtime_watch(directory):
             raise ValueError('runtime watch check changed')
     try:
         config = load_config(directory)
+        if netdump_capture(config['context']):
+            lifetime = 240
+            deadline = started + lifetime
+            signal.setitimer(signal.ITIMER_REAL, max(.001, deadline - time.monotonic()))
         if not runtime_watch_executable_matches(directory, config['python']):
             raise ValueError('runtime watch executable changed')
         saved = read_followup_debug(directory, config)
@@ -1734,6 +1853,7 @@ def runtime_watch(directory):
 
 
 def followup_start(directory, config, current, facts, token):
+    require_root_writer(directory, config)
     if config["debug_source_identity"] != debug_source_identity():
         raise ValueError("followup source identity mismatch")
     scope = {**debug_boot_marker(config), "debug_boot_uuid": current}
@@ -1743,6 +1863,7 @@ def followup_start(directory, config, current, facts, token):
     saved = {"scope": scope, "facts": facts}
     private_write(directory / "panic-followup-debug.json", json.dumps(saved).encode())
     sync_directory(directory)
+    handoff_started, capture_intent = False, None
     try:
         if nvram_off_control(config["context"]) and not nvram_off_control_proven(facts):
             raise ValueError("NVRAM logging control not proven")
@@ -1750,21 +1871,41 @@ def followup_start(directory, config, current, facts, token):
         publish_followup(directory, config, token, followup_summary(config, "panic_prepared", current, saved, prepared=prepared),
                          "Nonce panic control prepared")
         watch = start_runtime_watch(directory, config, scope, prepared)
-        if not runtime_watch_alive(watch):
+        if not runtime_watch_alive(watch, minimum=180 if netdump_capture(config['context']) else 60):
             raise ValueError('runtime watch not ready for fire')
         def on_ready(trigger):
+            nonlocal handoff_started, capture_intent
             if trigger.get("scope") != scope or trigger.get("helper_sha256") != prepared["helper_sha256"] or trigger.get("ready") is not True:
                 raise ValueError("panic trigger identity mismatch")
-            if not runtime_watch_alive(watch, minimum=30):
+            if not runtime_watch_alive(watch, minimum=150 if netdump_capture(config['context']) else 30):
                 return False
             private_write(directory / "panic-followup-trigger.json", json.dumps(trigger).encode())
             sync_directory(directory)
-            publish_followup(directory, config, token,
-                             followup_summary(config, "panic_intent", current, saved, panic_trigger=trigger, prepared=prepared),
-                             "Nonce panic intent durable")
+            summary = followup_summary(config, "panic_intent", current, saved, panic_trigger=trigger, prepared=prepared)
+            if netdump_capture(config['context']):
+                summary['result_owner'] = 'capture-controller'
+                capture_intent = summary
+                handoff_started = True
+                publish_capture_intent(directory, config, token, summary)
+                try:
+                    arm_deadline = min(time.monotonic() + 90, watch['deadline_monotonic'] - 30)
+                    if arm_deadline - time.monotonic() < 70:
+                        return False
+                    armed = recovery_netdump.arm_capture(netdump_context(config['context']), token, facts['netdump_prime']['proof'],
+                        summary, config['check_id'], arm_deadline)
+                    expected = recovery_netdump_capture.CaptureScope.from_trigger(netdump_scope(config, current).record(),
+                        recovery_netdump.digest(summary), trigger)
+                    if (type(armed) is not dict or armed.get('phase') != 'armed' or
+                            recovery_netdump_capture.CaptureScope.from_record(armed['scope']) != expected or
+                            type(armed.get('receiver_check_id')) is not int or armed['receiver_check_id'] <= 0):
+                        raise ValueError('capture acknowledgement invalid')
+                except (TypeError, KeyError, AttributeError):
+                    raise ValueError('capture acknowledgement invalid') from None
+            else:
+                publish_followup(directory, config, token, summary, 'Nonce panic intent durable')
             return boot_uuid() == current and runtime_watch_alive(watch, minimum=30)
         returned = recovery_panic_control.fire(directory, scope, prepared, private_write, sync_directory, on_ready, boot_uuid)
-        failure = {"status": "returned", "result": returned}
+        failure = {"status": "returned", "result": safe_fire_return(returned) if netdump_capture(config['context']) else returned}
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, urllib.error.URLError) as error:
         failure = {"status": "failed", "kind": type(error).__name__}
     private_write(directory / "panic-followup-returned.json", json.dumps({"scope": scope, **failure}).encode())
@@ -1777,6 +1918,9 @@ def followup_start(directory, config, current, facts, token):
     failure["fire_intent"] = (directory / "panic-control" / "intent.json").exists()
     failure["release_attempt"] = (directory / "panic-control" / "release-attempt.json").exists()
     summary = followup_summary(config, "panic_returned", current, saved, panic_control=failure)
+    if handoff_started or (directory / 'capture-handoff-started.json').exists():
+        summary.update(result_owner='capture-controller', handoff_attempted=True,
+                       intent_sha256=recovery_netdump.digest(capture_intent))
     output = {"title": "Nonce panic control returned", "summary": json.dumps(summary)}
     fragments = {}
     budget = 32768
@@ -1799,6 +1943,10 @@ def followup_start(directory, config, current, facts, token):
         except (OSError, ValueError, subprocess.SubprocessError):
             summary["failure_encryption"] = "unavailable"
             output["summary"] = json.dumps(summary)
+    if handoff_started or (directory / 'capture-handoff-started.json').exists():
+        try: publish_capture_fire_status(directory, config, token, capture_intent, output)
+        except (OSError, ValueError, RuntimeError, TypeError, KeyError, AttributeError, subprocess.SubprocessError, urllib.error.URLError): pass
+        return
     complete_recovery(directory, config, current, token, output, False, time.monotonic() + 60)
 
 
@@ -1853,6 +2001,7 @@ def followup_finish(directory, config, current, saved, token):
 
 
 def complete_recovery(directory, config, current, token, output, successful, deadline):
+    require_root_writer(directory, config)
     payload = {"status": "completed", "conclusion": "success" if successful else "failure", "output": output}
     while time.monotonic() < deadline:
         try:
@@ -1883,6 +2032,8 @@ def collect(directory):
     config = load_config(directory)
     if (directory / "completed.json").exists():
         return
+    if netdump_capture(config['context']) and any((directory / name).exists() for name in ('panic-followup-debug.json', 'capture-handoff-started.json')):
+        return
     current = boot_uuid()
     if panic_followup(config["context"]) and (directory / "panic-followup-debug.json").exists():
         saved = read_followup_debug(directory, config)
@@ -1902,7 +2053,7 @@ def collect(directory):
                 debug_facts = recovery_bootplist.finish(directory, debug_boot_marker(config), private_write, sync_directory,
                                                         current_boot_uuid=current,
                                                         baseline_boot_argument_profile=config.get('initial_boot_argument_profile')
-                                                        if netdump_prime(config['context']) else None)
+                                                        if netdump_mode(config['context']) else None)
             else:
                 debug_facts = recovery_bootargs.finish(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory,
                                                        current_boot_uuid=current, inventory=False)
@@ -1957,9 +2108,12 @@ def collect(directory):
         if panic_followup(config["context"]):
             followup_start(directory, config, current, debug_facts, token)
             return
-        if netdump_prime(config['context']):
+        if netdump_mode(config['context']):
             debug_facts['netdump_prime'] = run_netdump_prime_once(directory, config, current, debug_facts, token, deadline)
-        if netdump_prime(config['context']):
+            if netdump_capture(config['context']) and debug_facts['netdump_prime'].get('status') == 'verified':
+                followup_start(directory, config, current, debug_facts, token)
+                return
+        if netdump_mode(config['context']):
             debug_facts['optional_inventory_status'] = 'skipped_netdump_control'
         elif debug_restored(debug_facts, config["context"]["debug_source"]):
             try:
@@ -1990,7 +2144,7 @@ def collect(directory):
     successful = config["context"].get("trigger", "reboot") in ("reboot", "reboot-quick") or capture_state == "captured"
     if config.get("debug_boot", False):
         successful = successful and debug_boot_proven(debug_facts, config["context"]["debug_source"], expected_debug_mask(config["context"]))
-    if netdump_prime(config['context']):
+    if netdump_mode(config['context']):
         successful = successful and debug_facts.get('netdump_prime', {}).get('status') == 'verified'
     output = {"title": "Recovery observed" if successful else "Panic report unavailable", "summary": summary}
     if envelope:
@@ -2082,11 +2236,15 @@ def sudo_call(operation, payload, timeout=40):
 
 
 def controller(ctx, token):
-    deadline = time.monotonic() + (1080 if panic_followup(ctx) or netdump_prime(ctx) else 600)
+    deadline = time.monotonic() + (1080 if panic_followup(ctx) or netdump_mode(ctx) else 600)
     check_id = None
     pending = None
     sealed = False
+    capture_seal_attempted = False
     proof = False
+    handoff, capture_result = None, None
+    capture_check_id = None
+    capture_close_outcome = None
 
     def interrupted(_signum, _frame):
         raise SystemExit(143)
@@ -2101,6 +2259,32 @@ def controller(ctx, token):
                         raise ValueError("check identity changed")
                     check_id = check["id"]
                     data = json.loads(check.get("output", {}).get("summary", "{}"))
+                    if netdump_capture(ctx) and handoff is not None and data.get('phase') != 'panic_intent':
+                        raise ValueError('capture root phase changed after handoff')
+                    if netdump_capture(ctx) and pending is not None and data.get('phase') == 'panic_intent':
+                        current = capture_intent_snapshot(check, pending, ctx)
+                        if handoff is not None and current != handoff: raise ValueError('capture handoff changed')
+                        handoff = current
+                        capture_result = recovery_netdump.read_capture(netdump_context(ctx), token,
+                            data['debug_boot_facts']['netdump_prime']['proof'], data, check_id, deadline)
+                        if capture_result is not None:
+                            number = capture_result['receiver_check_id']
+                            if type(number) is not int or number <= 0 or (capture_check_id is not None and number != capture_check_id):
+                                raise ValueError('capture receiver identifier changed')
+                            capture_check_id = number
+                        if capture_result is not None and capture_result.get('phase') in ('captured', 'failed'):
+                            successful = False
+                            if capture_result['phase'] == 'captured':
+                                result = recovery_netdump_capture.validate_result(capture_result['result'],
+                                    recovery_netdump_capture.CaptureScope.from_record(handoff['scope']))
+                                successful = result['status'] == 'fresh_fragment' and result['freshness'] == 'verified'
+                            if not successful: raise RuntimeError('capture result unverified')
+                            capture_close_outcome = True
+                            close_capture_root(ctx, token, pending, handoff, capture_result['receiver_check_id'], capture_close_outcome)
+                            proof = True
+                            print(json.dumps({'event': 'controller_capture_proof', 'check_id': check_id,
+                                              'receiver_check_id': capture_result['receiver_check_id']}), flush=True)
+                            return
                     if check.get("status") == "completed":
                         matches = pending is not None and boot_proof_matches(data, pending, ctx)
                         if matches and report_required(ctx):
@@ -2136,16 +2320,19 @@ def controller(ctx, token):
                                                      "nonce": nonce, "baseline_boot_uuid": baseline, "ciphertext": pending["ciphertext"],
                                                      "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "debug_source": ctx["debug_source"], "after_debug_boot": ctx.get("after_debug_boot", "none"),
                                                      "cert_fingerprint": fingerprint})
-                        api("PATCH", CHECKS + "/" + str(check_id), token,
-                            {"output": {"title": "Controller credential sealed", "summary": sealed_summary}})
-                        sealed = True
-                        print(json.dumps({"event": "controller_token_sealed", "check_id": check_id}), flush=True)
+                        if not netdump_capture(ctx) or not capture_seal_attempted:
+                            capture_seal_attempted = netdump_capture(ctx)
+                            api("PATCH", CHECKS + "/" + str(check_id), token,
+                                {"output": {"title": "Controller credential sealed", "summary": sealed_summary}})
+                            sealed = True
+                            print(json.dumps({"event": "controller_token_sealed", "check_id": check_id}), flush=True)
                     elif pending is not None and (sealed_matches(data, pending, ctx) or armed_matches(data, pending, ctx)):
                         if not sealed:
                             print(json.dumps({"event": "controller_token_sealed_recovered", "check_id": check_id}), flush=True)
                         sealed = True
             except (OSError, urllib.error.URLError, subprocess.SubprocessError):
-                pass
+                if capture_close_outcome is not None:
+                    raise
             time.sleep(min(3, max(0, deadline - time.monotonic())))
         raise RuntimeError("controller timed out")
     finally:
@@ -2153,15 +2340,21 @@ def controller(ctx, token):
         if not proof:
             if check_id is not None:
                 try:
-                    current = api("GET", CHECKS + "/" + str(check_id), token, timeout=5)
-                    if select_check([current], ctx) is not None and current.get("status") != "completed":
-                        payload = {"status": "completed", "conclusion": "failure"}
-                        if not ctx.get("debug_boot", False) and ctx.get("trigger") != "reboot-quick":
-                            payload["output"] = {"title": "Recovery not observed",
-                                                 "summary": "Controller stopped before recovery proof; this does not prove a reboot or kernel failure."}
-                        api("PATCH", CHECKS + "/" + str(check_id), token,
-                            payload, timeout=5)
-                except (OSError, urllib.error.URLError, ValueError):
+                    if netdump_capture(ctx):
+                        if handoff is not None and capture_close_outcome is None:
+                            capture_close_outcome = False
+                            close_capture_root(ctx, token, pending, handoff,
+                                capture_check_id, capture_close_outcome)
+                    else:
+                        current = api("GET", CHECKS + "/" + str(check_id), token, timeout=5)
+                        if select_check([current], ctx) is not None and current.get("status") != "completed":
+                            payload = {"status": "completed", "conclusion": "failure"}
+                            if not ctx.get("debug_boot", False) and ctx.get("trigger") != "reboot-quick":
+                                payload["output"] = {"title": "Recovery not observed",
+                                                     "summary": "Controller stopped before recovery proof; this does not prove a reboot or kernel failure."}
+                            api("PATCH", CHECKS + "/" + str(check_id), token,
+                                payload, timeout=5)
+                except (OSError, urllib.error.URLError, ValueError, TypeError, KeyError, AttributeError):
                     pass
 
 
@@ -2191,7 +2384,7 @@ def main():
                             "nvram_helper": os.environ.pop("RECOVERY_NVRAM_HELPER", ""),
                             "nvram_source_sha256": hashlib.sha256(Path("probes/nvram_backend.c").read_bytes()).hexdigest()
                             if ctx.get("debug_boot") and ctx.get("trigger") == "reboot-quick" and ctx["debug_source"] == "nvram" else ""},
-                            timeout=360 if netdump_prime(ctx) else 120), end="", flush=True)
+                            timeout=360 if netdump_mode(ctx) else 120), end="", flush=True)
         elif op == "arm":
             print(sudo_call("arm-root", {"context": ctx, "token": token}, timeout=510), end="", flush=True)
             deadline = time.monotonic() + 20

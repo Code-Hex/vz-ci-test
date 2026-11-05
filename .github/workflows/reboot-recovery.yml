@@ -50,6 +50,7 @@ on:
           - panic-nonce
           - panic-nonce-nvram-off
           - netdump-prime
+          - panic-nonce-netdump
         default: none
       report_cert:
         description: Public recipient certificate for encrypted panic reports
@@ -176,7 +177,7 @@ jobs:
           path: ${{ runner.temp }}/debug/netdump-discovery.json
           if-no-files-found: warn
   netdump_receiver:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only && !inputs.netdump_synthetic_capture_only && inputs.after_debug_boot == 'netdump-prime' && inputs.debug_boot && inputs.debug_source == 'bootplist' && inputs.trigger == 'reboot-quick' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only && !inputs.netdump_synthetic_capture_only && (inputs.after_debug_boot == 'netdump-prime' || inputs.after_debug_boot == 'panic-nonce-netdump') && inputs.debug_boot && inputs.debug_source == 'bootplist' && inputs.trigger == 'reboot-quick' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -187,22 +188,23 @@ jobs:
       KDP_PORT_MODE: kernel-source
       KDP_STUN_HOST: stun.cloudflare.com
       KDP_STUN_PORT: '3478'
+      NETDUMP_RECEIVER_COMMAND: ${{ inputs.after_debug_boot == 'panic-nonce-netdump' && 'capture-receiver' || 'prime-receiver' }}
     steps:
       - name: Check out trusted diagnostic scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Keep the receiver through the non-panic reboot
+      - name: Keep the receiver through the debug boot control
         env:
           GITHUB_TOKEN: ${{ github.token }}
           KDP_REPORT_CERT: ${{ inputs.report_cert }}
-        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/recovery_netdump.py prime-receiver
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/recovery_netdump.py "$NETDUMP_RECEIVER_COMMAND"
       - name: Preserve the filtered network control
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: netdump-prime-receiver-${{ github.run_id }}-${{ github.run_attempt }}
+          name: netdump-${{ inputs.after_debug_boot == 'panic-nonce-netdump' && 'capture' || 'prime' }}-receiver-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/debug/netdump-discovery.json
           if-no-files-found: warn
   netdump_synthetic_capture:

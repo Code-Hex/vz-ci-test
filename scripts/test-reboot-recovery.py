@@ -1,5 +1,6 @@
 import importlib.util
 import contextlib
+import copy
 import io
 import os
 from pathlib import Path
@@ -14,6 +15,363 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def capture_fixture(self):
+        config, saved, b3 = self.followup_fixture()
+        ctx = config['context']
+        ctx['after_debug_boot'] = 'panic-nonce-netdump'
+        config['debug_boot'] = True
+        n = r.recovery_netdump
+        profile = r.recovery_bootargs.boot_argument_profile('')
+        config['initial_boot_argument_profile'] = profile
+        core, network = n.source_identity(r.__file__)
+        offer = n.ReceiverOffer(r.binding(ctx), 'c' * 32, n.Endpoint('1.1.1.1', 10248), 43210,
+                                config['cert_fingerprint'], core, network, 'capture')
+        settings = r.recovery_netdump_settings.NetdumpSettings('1.1.1.1', '192.168.64.1', 10248, config['nonce'][:16])
+        plan = n.DiscoveryPlan(offer, config['nonce'], n.Endpoint('8.8.8.8', 40000), '192.168.64.2', 'en0', settings,
+                               n.HelloStats(True, True, 10), n.BootBaseline.from_profile(config['baseline'], profile))
+        config['netdump_plan'] = plan.record()
+        current = saved['scope']['debug_boot_uuid']
+        scope = r.netdump_scope(config, current)
+        facts = saved['facts']
+        facts['active_debug_mask'] = 0x22040
+        facts['netdump_active_control'] = r.recovery_netdump_settings.active_control('debug=0x22040 ' + ' '.join(settings.tokens()), settings, profile)
+        facts['owner_events'] = [{'event': event, 'source_identity': core, 'actual_boot_uuid': config['baseline']}
+                                for event in ('staged', 'bootplist_staged', 'intent')]
+        facts['owner_events'][1]['bootplist_stage'] = {'data': 'staged', 'preboot': 'staged', 'metadata_preserved': True}
+        base = {'protocol': 'vz-recovery-v1', 'phase': 'boot_core', 'binding': r.binding(ctx), 'nonce': config['nonce'],
+                'baseline_boot_uuid': config['baseline'], 'current_boot_uuid': current, 'trigger': 'reboot-quick',
+                'cert_fingerprint': config['cert_fingerprint'], 'debug_boot': True, 'debug_source': 'bootplist',
+                'after_debug_boot': ctx['after_debug_boot'], 'debug_boot_facts': facts}
+        check = {'id': config['check_id'], 'name': 'Runner recovery 123', 'head_sha': ctx['sha'], 'external_id': r.binding(ctx),
+                 'app': {'id': 15368, 'slug': 'github-actions'}, 'details_url': r.API.replace('api.github.com/repos', 'github.com') + '/runs/' + str(config['check_id']),
+                 'status': 'in_progress', 'conclusion': None, 'output': {'title': 'Boot core recovered', 'summary': r.json.dumps(base), 'text': ''}}
+        snapshot = n.core_snapshot(check, scope, plan.public_fact())
+        host = n.prime_host_fact(plan, scope, n.Endpoint('8.8.8.8', 40001), snapshot, n.HelloStats(True, True, 20))
+        proof = n.make_prime_proof(offer, plan.public_fact(), host, n.HelloStats(True, True, 20), snapshot, 12, 11)
+        facts['netdump_prime'] = {'status': 'verified', 'proof': proof}
+        prepared = {key: 'f' * 64 for key in ('control_sha256', 'preflight_sha256', 'getter_sha256', 'helper_source_sha256', 'helper_sha256')}
+        prepared.update(nonce_sha256=r.hashlib.sha256(config['nonce'].encode()).hexdigest(), observe_status='passed', compile_status='passed')
+        trigger = {'scope': saved['scope'], 'helper_sha256': prepared['helper_sha256'], 'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
+        intent = r.followup_summary(config, 'panic_intent', current, saved, prepared=prepared, panic_trigger=trigger, result_owner='capture-controller')
+        check['output'] = {'title': 'Nonce panic intent durable', 'summary': r.json.dumps(intent), 'text': ''}
+        pending = {'nonce': config['nonce'], 'baseline_boot_uuid': config['baseline'],
+                   'cert_fingerprint': config['cert_fingerprint'], 'check_id': config['check_id']}
+        return config, saved, intent, check, pending, prepared
+
+    def test_netdump_capture_mode_keeps_legacy_report_and_b3_semantics(self):
+        ctx = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
+               'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,
+               'trigger': 'reboot-quick', 'debug_boot': True, 'debug_source': 'bootplist', 'after_debug_boot': 'panic-nonce-netdump'}
+        self.assertTrue(r.valid_context(ctx, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        self.assertEqual(r.netdump_mode(ctx), 'capture')
+        self.assertTrue(r.netdump_capture(ctx))
+        self.assertTrue(r.certificate_required(ctx))
+        self.assertFalse(r.report_required(ctx))
+        self.assertFalse(r.panic_followup(ctx))
+        self.assertEqual(r.expected_debug_mask(ctx), 0x22040)
+        for change in ({'trigger': 'reboot'}, {'debug_boot': False}, {'debug_source': 'nvram'}):
+            self.assertFalse(r.valid_context({**ctx, **change}, 'Darwin', 'x86_64', r.KERNEL_UUID))
+
+    def test_capture_duplicate_collect_returns_before_boot_query_token_or_b3_capture(self):
+        config, _saved, _b3 = self.followup_fixture()
+        config['context']['after_debug_boot'] = 'panic-nonce-netdump'
+        for filename in ('panic-followup-debug.json', 'capture-handoff-started.json'):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                r.private_write(directory / filename, b'{partial')
+                def forbidden(*_args, **_kwargs): self.fail('duplicate capture collect performed work')
+                with patch.object(r, 'load_config', return_value=config), patch.object(r, 'boot_uuid', forbidden), \
+                     patch.object(r, 'followup_finish', forbidden), patch.object(r, 'api', forbidden):
+                    r.collect(directory)
+
+    def test_capture_writer_fence_is_distinct_from_the_followup_dedup_marker(self):
+        config, saved, _b3 = self.followup_fixture()
+        config['context']['after_debug_boot'] = 'panic-nonce-netdump'
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            r.private_write(directory / 'panic-followup-debug.json', b'{}')
+            r.require_root_writer(directory, config)
+            r.private_write(directory / 'capture-handoff-started.json', b'{partial')
+            def forbidden(*_args, **_kwargs): self.fail('fenced writer attempted API')
+            with patch.object(r, 'api', forbidden):
+                for writer in (
+                    lambda: r.publish_debug_core(directory, config, saved['scope']['debug_boot_uuid'], saved['facts'], 'token'),
+                    lambda: r.publish_followup(directory, config, 'token', {}, 'forbidden'),
+                    lambda: r.complete_recovery(directory, config, saved['scope']['debug_boot_uuid'], 'token', {}, False, 0)):
+                    with self.assertRaises(ValueError): writer()
+
+    def test_capture_intent_marker_precedes_an_uncertain_root_patch(self):
+        config, _saved, intent, _check, _pending, _prepared = self.capture_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            calls = []
+            def api(method, url, _token, payload=None, **_kwargs):
+                self.assertEqual((method, url), ('PATCH', r.CHECKS + '/9'))
+                record = r.json.loads((directory / 'capture-handoff-started.json').read_text())
+                self.assertEqual(record['intent_sha256'], r.recovery_netdump.digest(intent))
+                self.assertEqual(record['scope']['helper_pid'], 123)
+                self.assertEqual(r.json.loads(payload['output']['summary'])['result_owner'], 'capture-controller')
+                calls.append('patch')
+                raise TimeoutError('unknown_server_commit')
+            with patch.object(r, 'api', api):
+                with self.assertRaises(TimeoutError): r.publish_capture_intent(directory, config, 'token', intent)
+                with self.assertRaises(ValueError): r.complete_recovery(directory, config, intent['current_boot_uuid'], 'token', {}, False, 0)
+            self.assertEqual(calls, ['patch'])
+
+    def test_capture_controller_failure_without_committed_handoff_never_patches_root(self):
+        config, _saved, _intent, check, _pending, _prepared = self.capture_fixture()
+        check['output']['summary'] = r.json.dumps({'phase': 'armed'})
+        calls = []
+        def api(method, *_args, **_kwargs):
+            calls.append(method)
+            return check
+        def stop(_seconds): raise RuntimeError('controller_stopped_before_handoff')
+        with patch.object(r, 'list_check', return_value=check), patch.object(r, 'api', api), \
+             patch.object(r.time, 'sleep', stop), patch.object(r.signal, 'signal', lambda *_: None):
+            with self.assertRaises(RuntimeError): r.controller(config['context'], 'token')
+        self.assertEqual(calls, [])
+
+    def test_capture_controller_close_rechecks_exact_owner_intent_and_preserves_bookkeeping(self):
+        config, _saved, intent, check, pending, _prepared = self.capture_fixture()
+        snapshot = r.capture_intent_snapshot(check, pending, config['context'])
+        for mutation in ('owner', 'intent', 'completed_failure'):
+            server = copy.deepcopy(check)
+            if mutation == 'completed_failure': server.update(status='completed', conclusion='failure')
+            else:
+                summary = r.json.loads(server['output']['summary'])
+                if mutation == 'owner': summary['result_owner'] = 'other'
+                else: summary['panic_trigger']['helper_pid'] = 124
+                server['output']['summary'] = r.json.dumps(summary)
+            calls = []
+            def api(method, *_args, **_kwargs):
+                calls.append(method)
+                return server
+            with self.subTest(mutation=mutation), patch.object(r, 'api', api), self.assertRaises(ValueError):
+                r.close_capture_root(config['context'], 'token', pending, snapshot, 13, False)
+            self.assertEqual(calls, ['GET'])
+        server, calls = copy.deepcopy(check), []
+        def api(method, _url, _token, payload=None, **_kwargs):
+            calls.append(method)
+            if method == 'PATCH': server.update(copy.deepcopy(payload))
+            result = copy.deepcopy(server)
+            if result['status'] == 'completed': result['output']['text'] = None
+            return result
+        with patch.object(r, 'api', api): r.close_capture_root(config['context'], 'token', pending, snapshot, 13, True)
+        self.assertEqual(calls, ['GET', 'PATCH', 'GET'])
+        self.assertEqual(server['conclusion'], 'neutral')
+        book = r.json.loads(server['output']['summary'])['capture_bookkeeping']
+        self.assertEqual(book, {'intent_sha256': r.recovery_netdump.digest(intent), 'scope': snapshot['scope'], 'receiver_check_id': 13, 'captured': True})
+
+    def test_capture_runtime_watch_has_a_distinct_finite_budget_without_changing_legacy(self):
+        config, saved, _b3 = self.followup_fixture()
+        legacy = r.runtime_watch_identity(config, saved['scope'], 'f' * 64)
+        self.assertNotIn('lifetime_seconds', legacy)
+        config['context']['after_debug_boot'] = 'panic-nonce-netdump'
+        identity = r.runtime_watch_identity(config, saved['scope'], 'f' * 64)
+        self.assertEqual(identity['lifetime_seconds'], 240)
+        started = 17.000000001
+        receipt = {'identity': identity, 'check_id': 17, 'pid': 123, 'started_monotonic': started,
+                   'deadline_monotonic': started + 240, 'acknowledged': True}
+        self.assertEqual(r.runtime_watch_ready(receipt, identity, 123, 16, 30), started + 240)
+        with self.assertRaises(ValueError): r.runtime_watch_ready(receipt, identity, 123, 16, 100)
+        with self.assertRaises(ValueError): r.runtime_watch_ready({**receipt, 'deadline_monotonic': started + 120}, identity, 123, 16, 30)
+
+    def test_capture_handoff_uncertainty_and_fire_return_never_complete_the_root_check(self):
+        for outcome in ('patch_unknown', 'marker_write_failed', 'bad_arm', 'returned'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config, saved, _intent, root, _pending, prepared = self.capture_fixture()
+                current = saved['scope']['debug_boot_uuid']
+                r.private_write(directory / 'report-cert.pem', b'public certificate fixture')
+                root_phases, fire_status, releases = [], {}, []
+                def prepare(*_args):
+                    (directory / 'panic-control').mkdir()
+                    return prepared
+                def api(method, url, _token, payload=None, **_kwargs):
+                    if url == r.CHECKS + '/9':
+                        if method == 'PATCH':
+                            phase = r.json.loads(payload['output']['summary'])['phase']
+                            root_phases.append(phase)
+                            self.assertNotEqual(payload.get('status'), 'completed')
+                            root.update(copy.deepcopy(payload))
+                            if phase == 'panic_intent':
+                                self.assertTrue((directory / 'capture-handoff-started.json').exists())
+                                if outcome == 'patch_unknown': raise TimeoutError('unknown_patch_commit')
+                        return copy.deepcopy(root)
+                    if method == 'POST':
+                        self.assertTrue(payload['name'].startswith('Capture fire status '))
+                        fire_status.update(copy.deepcopy(payload), id=17, app={'id': 15368, 'slug': 'github-actions'},
+                                           details_url='https://github.com/Code-Hex/vz-ci-test/runs/17')
+                        return copy.deepcopy(fire_status)
+                    self.assertEqual((method, url), ('GET', r.CHECKS + '/17'))
+                    return copy.deepcopy(fire_status)
+                original_save = r.private_write
+                def save(path, data):
+                    if outcome == 'marker_write_failed' and path.name == 'capture-handoff-started.json':
+                        raise OSError('handoff_storage_failed')
+                    original_save(path, data)
+                def arm(_ctx, _token, proof, intent, root_id, deadline):
+                    self.assertEqual(root_id, 9)
+                    self.assertGreaterEqual(deadline - r.time.monotonic(), 70)
+                    if outcome == 'bad_arm': return None
+                    scope = r.recovery_netdump_capture.CaptureScope.from_trigger(r.netdump_scope(config, current).record(),
+                        r.recovery_netdump.digest(intent), intent['panic_trigger'])
+                    return r.recovery_netdump_capture.make_armed(scope, prime_proof_sha256=r.recovery_netdump.digest(proof),
+                        offer_digest=r.recovery_netdump.digest(proof['offer']), peer=proof['host_plan']['intel_public_endpoint'], receiver_check_id=13)
+                def fire(_directory, scope, _prepared, _save, _sync, ready, _boot):
+                    trigger = {'scope': scope, 'helper_sha256': prepared['helper_sha256'], 'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
+                    if ready(trigger): releases.append('G')
+                    return {'phase': 'returned', 'release_status': 'released', 'raw': 'private_return_must_not_leak'}
+                def forbidden(*_args, **_kwargs): self.fail('handoff path used Root completion')
+                watch = {'child': object(), 'deadline_monotonic': r.time.monotonic() + 240}
+                with patch.object(r.recovery_panic_control, 'prepare', prepare), patch.object(r.recovery_panic_control, 'fire', fire), \
+                     patch.object(r, 'api', api), patch.object(r, 'private_write', save), \
+                     patch.object(r.recovery_netdump, 'arm_capture', arm), patch.object(r, 'start_runtime_watch', return_value=watch), \
+                     patch.object(r, 'runtime_watch_alive', return_value=True), patch.object(r, 'boot_uuid', return_value=current), \
+                     patch.object(r, 'complete_recovery', forbidden):
+                    r.followup_start(directory, config, current, saved['facts'], 'token')
+                self.assertEqual(root_phases, ['panic_prepared'] if outcome == 'marker_write_failed' else ['panic_prepared', 'panic_intent'])
+                self.assertEqual(releases, ['G'] if outcome == 'returned' else [])
+                self.assertEqual(fire_status['conclusion'], 'neutral')
+                summary = r.json.loads(fire_status['output']['summary'])
+                self.assertIs(summary['handoff_attempted'], True)
+                self.assertNotIn('private_return_must_not_leak', r.json.dumps(fire_status))
+
+    def test_capture_failure_before_handoff_keeps_mac_root_completion_authority(self):
+        config, saved, _intent, _check, _pending, _prepared = self.capture_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, events = Path(tmp), []
+            def fail(*_args): raise TimeoutError('prepare_failed')
+            def complete(_directory, _config, _current, _token, output, successful, _deadline):
+                r.require_root_writer(directory, config)
+                self.assertFalse(successful)
+                self.assertFalse((directory / 'capture-handoff-started.json').exists())
+                self.assertEqual(r.json.loads(output['summary'])['phase'], 'panic_returned')
+                events.append('root_failure')
+            def forbidden(*_args, **_kwargs): self.fail('pre-handoff failure reached fire status')
+            with patch.object(r.recovery_panic_control, 'prepare', fail), patch.object(r, 'complete_recovery', complete), \
+                 patch.object(r, 'publish_capture_fire_status', forbidden):
+                r.followup_start(directory, config, saved['scope']['debug_boot_uuid'], saved['facts'], 'token')
+            self.assertEqual(events, ['root_failure'])
+
+    def test_capture_collect_orders_restore_core_prime_followup_without_b3_or_inventory(self):
+        config, saved, _intent, _check, _pending, _prepared = self.capture_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, events = Path(tmp), []
+            r.private_write(directory / 'token', b'token')
+            r.private_write(directory / 'ready.json', r.json.dumps({'preboot_patch': True, 'baseline': config['baseline'], 'nonce': config['nonce']}).encode())
+            for event in saved['facts']['owner_events']:
+                r.debug_event(directory, config, event['event'], config['baseline'],
+                    **({'bootplist_stage': event['bootplist_stage']} if event['event'] == 'bootplist_staged' else {}))
+            def restore(*_args, **kwargs):
+                self.assertEqual(kwargs['baseline_boot_argument_profile'], config['initial_boot_argument_profile'])
+                events.append('restore')
+                return copy.deepcopy(saved['facts'])
+            def core(_directory, _config, _current, facts, _token):
+                events.append('core_ack'); return facts
+            def prime(*_args):
+                events.append('prime_ack'); return saved['facts']['netdump_prime']
+            def followup(_directory, _config, _current, facts, _token):
+                self.assertEqual(facts['netdump_prime']['status'], 'verified')
+                events.append('followup')
+            def forbidden(*_args, **_kwargs): self.fail('capture used legacy completion or optional inventory')
+            with patch.object(r, 'load_config', return_value=config), patch.object(r, 'boot_uuid', return_value=saved['scope']['debug_boot_uuid']), \
+                 patch.object(r.recovery_bootplist, 'finish', restore), patch.object(r, 'publish_debug_core', core), \
+                 patch.object(r, 'run_netdump_prime_once', prime), patch.object(r, 'followup_start', followup), \
+                 patch.object(r.recovery_bootargs, 'observe_once', forbidden), patch.object(r, 'complete_recovery', forbidden), \
+                 patch.object(r, 'followup_finish', forbidden):
+                r.collect(directory)
+            self.assertEqual(events, ['restore', 'core_ack', 'prime_ack', 'followup'])
+
+    def test_capture_controller_uses_independent_result_and_closes_only_canonical_handoff(self):
+        for outcome in ('fresh', 'unverified', 'failed', 'armed_then_lost', 'close_patch_unknown', 'close_get_unknown'):
+            with self.subTest(outcome=outcome):
+                config, _saved, intent, root_check, pending, _prepared = self.capture_fixture()
+                scope = r.recovery_netdump_capture.CaptureScope.from_record(r.capture_intent_snapshot(root_check, pending, config['context'])['scope'])
+                received = {'phase': 'failed', 'receiver_check_id': 13}
+                if outcome == 'armed_then_lost': received = {'phase': 'armed', 'receiver_check_id': 13}
+                elif outcome != 'failed':
+                    stream = r.recovery_netdump_capture.FragmentStream('fragment')
+                    body = ('panic(cpu 0 caller 0x1234): dtrace: panic action at probe pid123:helper:vz_nonce_' + config['nonce'] +
+                            ':entry (ecb 0xabcd)\nKernel UUID: ' + (r.KERNEL_UUID if outcome in ('fresh', 'close_patch_unknown', 'close_get_unknown') else '0' * 36) + '\n').encode()
+                    wire = r.recovery_netdump_capture.wire
+                    stream.receive(wire.encode_wrq('fragment'))
+                    stream.receive(wire.encode_paniclog_data(1, body, 'fragment', b'Y' * 9))
+                    stream.finish('idle')
+                    received = {'phase': 'captured', 'receiver_check_id': 13,
+                                'result': r.recovery_netdump_capture.kernel_result(scope, stream)}
+                public = {key: intent[key] for key in ('protocol', 'binding', 'nonce', 'baseline_boot_uuid', 'trigger',
+                    'debug_boot', 'debug_source', 'after_debug_boot', 'cert_fingerprint')}
+                public.update(phase='public_key', public_key='public-key-boundary')
+                server = copy.deepcopy(root_check)
+                server['output'] = {'summary': r.json.dumps(public)}
+                calls, turns, reads, closes, close_gets = [], [], [], [], []
+                def listing(*_args):
+                    turns.append(True)
+                    if len(turns) > 1: server.update(copy.deepcopy(root_check))
+                    return copy.deepcopy(server)
+                def api(method, _url, _token, payload=None, **_kwargs):
+                    if method == 'PATCH':
+                        phase = r.json.loads(payload['output']['summary'])['phase']
+                        calls.append(phase)
+                        server.update(copy.deepcopy(payload))
+                        if phase == 'capture_controller_closed':
+                            closes.append(payload['conclusion'])
+                            if outcome == 'close_patch_unknown': raise TimeoutError('unknown_close_patch')
+                    elif outcome == 'close_get_unknown' and closes and not close_gets:
+                        close_gets.append(True)
+                        raise TimeoutError('unknown_close_get')
+                    if outcome in ('close_patch_unknown', 'close_get_unknown') and closes:
+                        return copy.deepcopy(root_check)
+                    return copy.deepcopy(server)
+                def read(_ctx, _token, proof, actual_intent, root_id, _deadline):
+                    self.assertEqual(root_id, 9)
+                    self.assertEqual(actual_intent, intent)
+                    self.assertEqual(proof, intent['debug_boot_facts']['netdump_prime']['proof'])
+                    reads.append(True)
+                    if outcome in ('close_patch_unknown', 'close_get_unknown') and len(reads) > 1:
+                        raise RuntimeError('unexpected_outer_retry')
+                    return None if outcome == 'armed_then_lost' and len(reads) > 1 else received
+                def sleep(_seconds):
+                    if outcome == 'armed_then_lost' and len(reads) > 1: raise RuntimeError('bounded_test_stop')
+                output = io.StringIO()
+                with patch.object(r, 'list_check', listing), patch.object(r, 'api', api), \
+                     patch.object(r, 'encrypt_token', return_value=b'sealed'), patch.object(r.time, 'sleep', sleep), \
+                     patch.object(r.signal, 'signal', lambda *_: None), patch.object(r.recovery_netdump, 'read_capture', read), \
+                     contextlib.redirect_stdout(output):
+                    if outcome == 'fresh': r.controller(config['context'], 'controller-token')
+                    else:
+                        with self.assertRaises((RuntimeError, TimeoutError)): r.controller(config['context'], 'controller-token')
+                self.assertEqual(reads, [True, True] if outcome == 'armed_then_lost' else [True])
+                self.assertEqual(calls, ['sealed_token', 'capture_controller_closed'])
+                self.assertEqual(server['conclusion'], 'neutral' if outcome in ('fresh', 'close_patch_unknown', 'close_get_unknown') else 'failure')
+                self.assertEqual(closes, ['neutral'] if outcome in ('fresh', 'close_patch_unknown', 'close_get_unknown') else ['failure'])
+                book = r.json.loads(server['output']['summary'])['capture_bookkeeping']
+                self.assertEqual(book['intent_sha256'], scope.intent_sha256)
+                self.assertEqual(book['receiver_check_id'], 13)
+                self.assertNotIn('panic(cpu', output.getvalue())
+
+    def test_capture_controller_never_reseals_after_an_uncertain_seal_attempt(self):
+        config, _saved, intent, check, _pending, _prepared = self.capture_fixture()
+        public = {key: intent[key] for key in ('protocol', 'binding', 'nonce', 'baseline_boot_uuid', 'trigger',
+            'debug_boot', 'debug_source', 'after_debug_boot', 'cert_fingerprint')}
+        public.update(phase='public_key', public_key='public-key-boundary')
+        check['output']['summary'] = r.json.dumps(public)
+        patches, sleeps = [], []
+        def api(method, *_args, **_kwargs):
+            self.assertEqual(method, 'PATCH')
+            patches.append(True)
+            raise TimeoutError('unknown_seal_commit')
+        def sleep(_seconds):
+            sleeps.append(True)
+            if len(sleeps) == 2: raise RuntimeError('bounded_test_stop')
+        with patch.object(r, 'list_check', return_value=check), patch.object(r, 'api', api), \
+             patch.object(r, 'encrypt_token', return_value=b'sealed'), patch.object(r.time, 'sleep', sleep), \
+             patch.object(r.signal, 'signal', lambda *_: None):
+            with self.assertRaises(RuntimeError): r.controller(config['context'], 'controller-token')
+        self.assertEqual(patches, [True])
+
+
     def test_netdump_private_plan_binds_the_boot_mode_and_initial_profile(self):
         n = r.recovery_netdump
         ctx = {'run_id': '123', 'attempt': '1', 'sha': 'a' * 40, 'after_debug_boot': 'netdump-prime'}

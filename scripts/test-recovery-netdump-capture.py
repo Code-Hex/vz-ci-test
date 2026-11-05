@@ -193,13 +193,14 @@ class Capture(unittest.TestCase):
         self.assertIsNone(stream.receive(wire.encode_eof(2)))
         self.assertEqual(capture.kernel_result(self.scope(), stream)['status'], 'unverified')
 
-    def test_external_limit_keeps_empty_or_fresh_partial_body_consistent(self):
-        for body, expected in ((None, 'unverified'), (self.body(), 'fresh_fragment')):
-            with self.subTest(status=expected):
+    def test_external_limit_or_io_error_keeps_empty_or_fresh_partial_body_consistent(self):
+        for reason, body, expected in ((reason, body, status) for reason in ('limit', 'io_error')
+                                      for body, status in ((None, 'unverified'), (self.body(), 'fresh_fragment'))):
+            with self.subTest(reason=reason, status=expected):
                 stream = self.stream(body)
-                stream.finish('limit')
+                stream.finish(reason)
                 result = capture.kernel_result(self.scope(), stream)
-                self.assertEqual(result['termination'], 'limit')
+                self.assertEqual(result['termination'], reason)
                 self.assertEqual(result['status'], expected)
                 self.assertEqual(result['byte_count'], len(body) if body is not None else 0)
                 self.assertEqual(result['completeness'], 'unknown')
@@ -207,7 +208,7 @@ class Capture(unittest.TestCase):
                 self.assertIsNone(stream.pending_eof_ack)
                 self.assertEqual(capture.validate_result(result, self.scope()), result)
                 stream.finish('deadline')
-                self.assertEqual(stream.termination, 'limit')
+                self.assertEqual(stream.termination, reason)
 
     def test_armed_and_result_boundaries_reject_foreign_scope_peer_and_boolean_counts(self):
         scope = self.scope()
