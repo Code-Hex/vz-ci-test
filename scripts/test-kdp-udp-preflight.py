@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import os
 import tempfile
@@ -9,9 +8,7 @@ import time
 from pathlib import Path
 import unittest
 
-spec = importlib.util.spec_from_file_location("udp", Path(__file__).with_name("kdp-udp-preflight.py"))
-r = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(r)
+import kdp_udp_preflight as r
 
 
 class Udp(unittest.TestCase):

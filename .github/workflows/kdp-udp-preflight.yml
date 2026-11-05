@@ -50,7 +50,7 @@ jobs:
       - name: Check UDP connectivity with disposable identifiers
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/kdp-udp-preflight.py
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/kdp_udp_preflight.py
       - name: Preserve the bounded network result
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
