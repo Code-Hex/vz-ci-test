@@ -76,6 +76,50 @@ class Recovery(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.runtime_watch_ready(receipt, identity, 123, 9.0, 71.0)
 
+    def test_runtime_watch_ready_accepts_fractional_producer_deadlines(self):
+        config, saved, _ = self.followup_fixture()
+        identity = r.runtime_watch_identity(config, saved['scope'], 'f' * 64)
+        for started in (17.000000001, 27.123456789, 42.123456789, 72.123456789, 1024.0001):
+            receipt = {'identity': identity, 'check_id': 17, 'pid': 123, 'started_monotonic': started,
+                       'deadline_monotonic': started + 120, 'acknowledged': True}
+            with self.subTest(started=started):
+                self.assertEqual(r.runtime_watch_ready(receipt, identity, 123, started - .1, started + .1), started + 120)
+
+    def test_runtime_watch_ready_is_published_complete_and_never_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            receipt = {'acknowledged': True, 'identity': {'fixture': 'complete'}}
+            real_write = r.private_write
+            def write(path, data):
+                self.assertIn(path.name, ('runtime-watch-ready.pending.json', 'runtime-watch-ready.claim.json'))
+                self.assertFalse((directory / 'runtime-watch-ready.json').exists())
+                real_write(path, data)
+            with patch.object(r, 'private_write', write):
+                r.publish_runtime_watch_ready(directory, receipt)
+            target = directory / 'runtime-watch-ready.json'
+            self.assertEqual(r.json.loads(target.read_bytes()), receipt)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            self.assertFalse((directory / 'runtime-watch-ready.pending.json').exists())
+            with self.assertRaises(ValueError):
+                r.publish_runtime_watch_ready(directory, {'replacement': True})
+            self.assertEqual(r.json.loads(target.read_bytes()), receipt)
+
+    def test_runtime_watch_retries_an_incomplete_release_observation(self):
+        config, saved, _ = self.followup_fixture()
+        identity = r.runtime_watch_identity(config, saved['scope'], 'f' * 64)
+        release = {'scope': saved['scope'], 'helper_sha256': 'f' * 64, 'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
+        raw = r.json.dumps(release).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'panic-control').mkdir()
+            path = directory / 'panic-control' / 'release-attempt.json'
+            r.private_write(path, b'{')
+            r.private_write(directory / 'panic-followup-trigger.json', raw)
+            partial = r.runtime_watch_stage(directory, identity, ('before_release', None))
+            self.assertEqual(partial, ('invalid', None))
+            path.write_bytes(raw)
+            self.assertEqual(r.runtime_watch_stage(directory, identity, partial), ('release_observed', r.hashlib.sha256(raw).hexdigest()))
+
     def test_runtime_watch_reaper_waits_for_a_real_child(self):
         child = subprocess.Popen([r.sys.executable, '-c', 'pass'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         waiter = r.reap_runtime_watch(child)
@@ -198,6 +242,7 @@ class Recovery(unittest.TestCase):
             directory = Path(tmp)
             config, saved, _ = self.followup_fixture()
             config['python'] = str(Path(r.sys.executable).resolve())
+            (directory / 'panic-control').mkdir()
             child = subprocess.Popen([r.sys.executable, '-c', 'import time; time.sleep(60)'])
             try:
                 with patch.object(r, 'runtime_watch_executable_matches', lambda *_: True), \

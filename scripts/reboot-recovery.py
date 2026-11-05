@@ -1406,7 +1406,7 @@ def runtime_watch_release(raw, trigger_raw, identity):
 
 
 def runtime_watch_stage(directory, identity, previous):
-    if previous[0] != 'before_release':
+    if previous[0] == 'release_observed':
         return previous
     try:
         raw = recovery_panic_control.read_private(directory / 'panic-control' / 'release-attempt.json', 0o600, 4096)
@@ -1429,10 +1429,22 @@ def runtime_watch_ready(receipt, identity, pid, launched, now):
             any(type(receipt[k]) not in (int, float) or not math.isfinite(receipt[k])
                 for k in ('started_monotonic', 'deadline_monotonic')) or
             not launched <= receipt['started_monotonic'] <= now or
-            receipt['deadline_monotonic'] - receipt['started_monotonic'] != 120 or
+            receipt['deadline_monotonic'] != receipt['started_monotonic'] + 120 or
             receipt['deadline_monotonic'] - now < 60):
         raise ValueError('runtime watch readiness invalid')
     return receipt['deadline_monotonic']
+
+
+def publish_runtime_watch_ready(directory, receipt):
+    target = directory / 'runtime-watch-ready.json'
+    if target.exists() or target.is_symlink():
+        raise ValueError('runtime watch readiness already published')
+    data = json.dumps(receipt).encode()
+    private_write(directory / 'runtime-watch-ready.claim.json', hashlib.sha256(data).hexdigest().encode())
+    pending = directory / 'runtime-watch-ready.pending.json'
+    private_write(pending, data)
+    os.rename(pending, target)
+    sync_directory(directory)
 
 
 def reap_runtime_watch(child):
@@ -1458,10 +1470,11 @@ def start_runtime_watch(directory, config, scope, prepared):
     private_write(directory / 'runtime-watch-launch.json', json.dumps(identity).encode())
     sync_directory(directory)
     launched = time.monotonic()
-    child = subprocess.Popen([config['python'], str(copied), 'runtime-watch', str(directory)],
-                             env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LC_ALL': 'C', 'PYTHONDONTWRITEBYTECODE': '1'},
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True)
+    with recovery_panic_control.open_private(directory / 'panic-control' / 'watch.stderr') as errors:
+        child = subprocess.Popen([config['python'], str(copied), 'runtime-watch', str(directory)],
+                                 env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LC_ALL': 'C', 'PYTHONDONTWRITEBYTECODE': '1'},
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors,
+                                 start_new_session=True)
     try:
         reap_runtime_watch(child)
         while time.monotonic() - launched < 25:
@@ -1472,6 +1485,7 @@ def start_runtime_watch(directory, config, scope, prepared):
             except FileNotFoundError:
                 time.sleep(0.1)
                 continue
+            private_write(directory / 'panic-control' / 'watch-ready.json', raw)
             deadline = runtime_watch_ready(json.loads(raw), identity, child.pid, launched, time.monotonic())
             watch = {'child': child, 'deadline_monotonic': deadline}
             if not runtime_watch_alive(watch):
@@ -1538,9 +1552,8 @@ def runtime_watch(directory):
                 check['output'].get('title') != output['title'] or check['output'].get('text') not in (None, '')):
             raise ValueError('runtime watch acknowledgement invalid')
         check_id = created_id
-        private_write(directory / 'runtime-watch-ready.json', json.dumps({'identity': identity, 'check_id': check_id,
-            'pid': os.getpid(), 'started_monotonic': started, 'deadline_monotonic': deadline, 'acknowledged': True}).encode())
-        sync_directory(directory)
+        publish_runtime_watch_ready(directory, {'identity': identity, 'check_id': check_id,
+            'pid': os.getpid(), 'started_monotonic': started, 'deadline_monotonic': deadline, 'acknowledged': True})
         while deadline - time.monotonic() > 5:
             time.sleep(min(5, max(0, deadline - time.monotonic() - 5)))
             observation = runtime_watch_stage(directory, identity, observation)
@@ -1595,7 +1608,7 @@ def followup_start(directory, config, current, facts, token):
         failure = {"status": "failed", "kind": type(error).__name__}
     private_write(directory / "panic-followup-returned.json", json.dumps({"scope": scope, **failure}).encode())
     sync_directory(directory)
-    names = tuple(label + "." + channel for label in ("build", "sign", "listing", "trace", "panic-compile", "tracer") for channel in ("stdout", "stderr")) + ("prepare-failure.json", "timeout-ps.stdout", "timeout-ps.stderr", "timeout-sample.stdout", "timeout-sample.stderr", "timeout-diagnostic.json")
+    names = tuple(label + "." + channel for label in ("build", "sign", "listing", "trace", "panic-compile", "tracer") for channel in ("stdout", "stderr")) + ("prepare-failure.json", "timeout-ps.stdout", "timeout-ps.stderr", "timeout-sample.stdout", "timeout-sample.stderr", "timeout-diagnostic.json", "watch-ready.json", "watch.stderr")
     failure["files"] = {name: {"exists": (directory / "panic-control" / name).exists(),
                               "bytes": (directory / "panic-control" / name).stat().st_size if (directory / "panic-control" / name).exists() else None}
                         for name in names}
