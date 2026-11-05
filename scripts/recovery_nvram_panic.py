@@ -75,6 +75,21 @@ def classify_usdt(raw, nonce, helper_pid):
     return _classify(raw, probe.selector, header)
 
 
+def syscall_marker(nonce, helper_pid):
+    if type(nonce) is not str or not re.fullmatch(r'[0-9a-f]{64}', nonce):
+        raise ValueError('invalid nonce')
+    if type(helper_pid) is not int or not 0 < helper_pid < 2**31:
+        raise ValueError('invalid helper pid')
+    return 'vz-reboot-panic:' + nonce + ':' + str(helper_pid)
+
+
+def classify_syscall(raw, nonce, helper_pid):
+    marker = syscall_marker(nonce, helper_pid)
+    header = re.compile(rb'^panic\(cpu [0-9]+(?: caller (?:0x)?[0-9a-fA-F]+)?\): userspace panic: (' +
+                        re.escape(marker.encode('ascii')) + rb')(?:\r?\n|$)')
+    return _classify(raw, marker, header)
+
+
 def _classify(raw, expected, header):
     if not isinstance(raw, bytes):
         raise TypeError('raw must be bytes')

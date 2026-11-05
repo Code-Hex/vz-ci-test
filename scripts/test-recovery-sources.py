@@ -12,7 +12,7 @@ NAMES = ('recovery.py', 'recovery_reports.py', 'recovery_bootargs.py', 'recovery
          'recovery_nvram_panic.py', 'recovery_panic_control.py', 'panic-source-preflight.py',
          'recovery_arrival.py', 'kdp_registry.py', 'recovery_netdump_settings.py', 'recovery_sources.py',
          'recovery_netdump.py', 'kdp_udp_preflight.py', 'kdp_crashdump.py', 'recovery_netdump_capture.py',
-         'udp_observer.py', 'nonce_usdt.py')
+         'udp_observer.py', 'nonce_usdt.py', 'recovery_reboot_panic.py')
 
 
 class Sources(unittest.TestCase):
@@ -84,6 +84,7 @@ class Sources(unittest.TestCase):
                        'main = Path(sys.argv[1]); sys.path.insert(0, str(main.parent)); '
                        'module = runpy.run_path(str(main), run_name="copied_module"); '
                        'import nonce_usdt; assert Path(nonce_usdt.__file__).resolve() == (main.parent / "nonce_usdt.py").resolve(); '
+                       'import recovery_reboot_panic; assert Path(recovery_reboot_panic.__file__).resolve() == (main.parent / "recovery_reboot_panic.py").resolve(); '
                        'print(module["debug_source_identity"]())')
             result = subprocess.run([sys.executable, '-c', program, str(private / 'recovery.py')],
                                     env={'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'},

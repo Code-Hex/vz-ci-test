@@ -51,6 +51,7 @@ on:
           - panic-nonce-nvram-off
           - panic-nonce-usdt
           - panic-nonce-usdt-nvram-off
+          - panic-nonce-syscall
           - kernel-state
           - netdump-prime
           - panic-nonce-netdump

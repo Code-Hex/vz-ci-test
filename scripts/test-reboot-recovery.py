@@ -15,6 +15,201 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def syscall_fixture(self):
+        config, saved, b3 = self.followup_fixture()
+        config['context'].update(after_debug_boot='panic-nonce-syscall', actions='true', repo=r.REPO,
+                                 ref='refs/heads/main', event='workflow_dispatch', runner_environment='github-hosted')
+        saved['facts'].update(optional_inventory_status='completed',
+                             kernel_debug_state={'debug_boot_arg': {'status': 'observed', 'value': 0x102000}})
+        return config, saved, b3
+
+    def test_syscall_mode_is_closed_and_requires_existing_panic_proof(self):
+        config, saved, b3 = self.syscall_fixture(); ctx = config['context']
+        self.assertTrue(r.valid_context(ctx, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        self.assertTrue(r.panic_followup(ctx))
+        self.assertTrue(r.report_required(ctx)); self.assertTrue(r.certificate_required(ctx))
+        self.assertEqual(r.panic_control_kind(ctx), 'reboot-panic-v1')
+        self.assertEqual(r.expected_debug_mask(ctx), 0x102000)
+        self.assertFalse(r.nvram_off_control(ctx)); self.assertIsNone(r.netdump_mode(ctx))
+        for change in ({'trigger': 'reboot'}, {'debug_boot': False}, {'debug_source': 'nvram'},
+                       {'after_debug_boot': 'panic-nonce-syscall-extra'}):
+            self.assertFalse(r.valid_context({**ctx, **change}, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        pending = {'nonce': config['nonce'], 'baseline_boot_uuid': config['baseline'], 'cert_fingerprint': config['cert_fingerprint']}
+        trigger = {'scope': saved['scope'], 'helper_sha256': 'f'*64, 'helper_pid': 123, 'ready': True}
+        summary = r.followup_summary(config, 'boot_observed', b3, saved, panic_trigger=trigger)
+        self.assertEqual(summary['control_kind'], 'reboot-panic-v1'); self.assertEqual(summary['flags'], 3072)
+        self.assertTrue(r.debug_lineage_matches(summary, pending, ctx))
+        self.assertFalse(r.panic_envelope_matches(summary, '', pending, ctx))
+        for change in ({'flags': True}, {'flags': 3072.0}, {'flags': 0x2c00}, {'control_kind': 'usdt-v1'},
+                       {'panic_trigger': {**trigger, 'tracer_pid': 456}}, {'panic_trigger': {**trigger, 'helper_pid': True}},
+                       {'debug_boot_facts': {**saved['facts'], 'kernel_debug_state': {'debug_boot_arg': {'status': 'observed', 'value': 0}}}}):
+            self.assertFalse(r.debug_lineage_matches({**summary, **change}, pending, ctx))
+        for mode in ('panic-nonce', 'panic-nonce-usdt', 'panic-nonce-usdt-nvram-off'):
+            self.assertFalse(r.boot_proof_matches(summary, pending, {**ctx, 'after_debug_boot': mode}))
+
+    def test_syscall_watch_variant_accepts_only_single_child_trigger(self):
+        config, saved, _ = self.syscall_fixture()
+        identity = r.runtime_watch_identity(config, saved['scope'], 'f'*64)
+        self.assertEqual(identity['control_kind'], 'reboot-panic-v1')
+        trigger = {'scope': saved['scope'], 'helper_sha256': 'f'*64, 'helper_pid': 123, 'ready': True}
+        raw = r.json.dumps(trigger).encode()
+        self.assertEqual(r.runtime_watch_release(raw, raw, identity), r.hashlib.sha256(raw).hexdigest())
+        for change in ({'tracer_pid': 456}, {'helper_pid': True}, {'helper_pid': 0}, {'ready': False}):
+            invalid = r.json.dumps({**trigger, **change}).encode()
+            with self.assertRaises(ValueError): r.runtime_watch_release(invalid, invalid, identity)
+        for variant in ({k:v for k,v in identity.items() if k != 'control_kind'},
+                        {**identity, 'control_kind': 'usdt-v1'}, {**identity, 'control_kind': None}):
+            with self.assertRaises(ValueError): r.runtime_watch_release(raw, raw, variant)
+        old_config = {**config, 'context': {**config['context'], 'after_debug_boot': 'panic-nonce-usdt'}}
+        old = r.runtime_watch_identity(old_config, saved['scope'], 'f'*64)
+        self.assertNotIn('control_kind', old)
+        old_raw = r.json.dumps({**trigger, 'tracer_pid': 456}).encode()
+        self.assertEqual(r.runtime_watch_release(old_raw, old_raw, old), r.hashlib.sha256(old_raw).hexdigest())
+        with self.assertRaises(ValueError): r.runtime_watch_release(old_raw, old_raw, identity)
+
+    def test_syscall_saved_mask_gate_prevents_reread_on_b2_and_b3(self):
+        config, saved, b3 = self.syscall_fixture(); current = saved['scope']['debug_boot_uuid']
+        def forbidden(*args, **kwargs): self.fail('saved syscall proof reread or refire')
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            r.private_write(directory/'panic-followup-debug.json', r.json.dumps(saved).encode())
+            r.private_write(directory/'token', b'test-token')
+            self.assertEqual(r.read_followup_debug(directory, config), saved)
+            captured = []
+            for boot in (current, b3):
+                with patch.object(r, 'load_config', lambda _:config), patch.object(r, 'boot_uuid', lambda:boot), \
+                     patch.object(r.recovery_bootargs, 'kernel_field_state', forbidden), patch.object(r, 'followup_start', forbidden), \
+                     patch.object(r, 'followup_finish', lambda _d,_c,_b,value,_t:captured.append(value)):
+                    r.collect(directory)
+            self.assertEqual(captured, [saved])
+            for state in ({'status':'observed','value':0}, {'status':'observed','value':0x102000,'extra':1}, {'status':'unavailable'}):
+                bad = copy.deepcopy(saved); bad['facts']['kernel_debug_state']['debug_boot_arg'] = state
+                (directory/'panic-followup-debug.json').write_text(r.json.dumps(bad))
+                with self.assertRaises(ValueError): r.read_followup_debug(directory, config)
+
+    def test_syscall_mask_precedes_own_prepare_and_latches_failure(self):
+        for case in ('positive', 'negative', 'unavailable', 'budget', 'save_error'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp); config, saved, _ = self.syscall_fixture(); calls = []; reports = []
+                deadline = r.time.monotonic() + (20 if case == 'budget' else 180)
+                original_write = r.private_write
+                def read(*args, **kwargs):
+                    calls.append('read')
+                    if case == 'unavailable': raise OSError('read unavailable')
+                    return ('VZKSTATE v1 debug_boot_arg u32 '+str(0 if case == 'negative' else 0x102000)+'\n\n').encode()
+                def write(path, data):
+                    if case == 'save_error' and path.name == 'panic-followup-debug.json': raise OSError('save failed')
+                    return original_write(path, data)
+                def prepare(_d, _n, _save, _sync, *, context, deadline):
+                    calls.append('prepare'); self.assertEqual(context, config['context'])
+                    self.assertTrue(r.kernel_state_proven(r.read_followup_debug(directory, config)['facts']))
+                    raise RuntimeError('stop before fire')
+                def forbidden(*args, **kwargs): self.fail('wrong control or unproven mask reached fire')
+                def complete(_d, _c, _b, _t, output, success, report_deadline):
+                    self.assertFalse(success); self.assertTrue(0 < report_deadline-r.time.monotonic() <= 60)
+                    reports.append(r.json.loads(output['summary']))
+                with patch.object(r.recovery_bootargs, 'capture', read), patch.object(r, 'private_write', write), \
+                     patch.object(r.recovery_reboot_panic, 'prepare', prepare), patch.object(r.recovery_reboot_panic, 'fire', forbidden), \
+                     patch.object(r.recovery_panic_control, 'prepare', forbidden), patch.object(r.recovery_panic_control, 'fire', forbidden), \
+                     patch.object(r, 'start_runtime_watch', forbidden), patch.object(r, 'complete_recovery', complete):
+                    r.followup_start(directory, config, saved['scope']['debug_boot_uuid'], saved['facts'], 'token', deadline=deadline)
+                self.assertEqual(calls, ['read','prepare'] if case == 'positive' else [] if case == 'budget' else ['read'])
+                self.assertEqual(len(reports), 1); self.assertEqual(reports[0]['flags'], 3072)
+                if case != 'save_error':
+                    latched = r.json.loads((directory/'panic-followup-debug.json').read_text())
+                    self.assertEqual(latched['facts'], reports[0]['debug_boot_facts'])
+
+    def test_syscall_prepare_fire_and_ack_use_one_kind_and_original_deadline(self):
+        for ack in (True, False):
+            with self.subTest(ack=ack), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp); config, saved, _ = self.syscall_fixture(); events = []; reports = []
+                current = saved['scope']['debug_boot_uuid']; deadline = r.time.monotonic()+180
+                prepared = {'helper_sha256':'f'*64}; watch = {'deadline_monotonic':deadline}
+                trigger = {'scope':saved['scope'],'helper_sha256':'f'*64,'helper_pid':123,'ready':True}
+                def read(*args, **kwargs): return b'VZKSTATE v1 debug_boot_arg u32 1056768\n\n'
+                def prepare(_d, _n, _save, _sync, *, context, deadline):
+                    self.assertEqual(context, config['context']); self.assertTrue(r.kernel_state_proven(saved['facts']))
+                    events.append('prepare'); return prepared
+                def publish(_d, _c, _t, summary, _title):
+                    self.assertEqual(summary['flags'], 3072); events.append(summary['phase'])
+                    if summary['phase'] == 'panic_intent' and not ack: raise OSError('ACK unavailable')
+                def fire(_d, scope, value, _save, _sync, ready, current_boot_uuid, *, context, deadline):
+                    self.assertEqual(context, config['context']); self.assertEqual(scope, saved['scope'])
+                    self.assertEqual(value, prepared); self.assertEqual(deadline, watch['deadline_monotonic']-30)
+                    self.assertEqual(current_boot_uuid(), current)
+                    events.append('ready')
+                    self.assertTrue(ready(trigger))
+                    events.append('accepted')
+                    return {'phase':'returned','release_status':'released','helper_exit':1,'result':-1,'errno':1,
+                            'output_complete':True,'output_overflow':False,'ownership_faults':0}
+                def forbidden(*args, **kwargs): self.fail('syscall used DTrace control')
+                with patch.object(r.recovery_bootargs,'capture',read), patch.object(r.recovery_reboot_panic,'prepare',prepare), \
+                     patch.object(r.recovery_reboot_panic,'fire',fire), patch.object(r.recovery_panic_control,'prepare',forbidden), \
+                     patch.object(r.recovery_panic_control,'fire',forbidden), patch.object(r,'publish_followup',publish), \
+                     patch.object(r,'start_runtime_watch',lambda *_:watch), patch.object(r,'runtime_watch_alive',lambda *_a,**_k:True), \
+                     patch.object(r,'boot_uuid',lambda:current), patch.object(r,'complete_recovery',lambda *_a:reports.append((_a[5],r.json.loads(_a[4]['summary'])))):
+                    r.followup_start(directory, config, current, saved['facts'], 'token', deadline=deadline)
+                self.assertEqual(events,['prepare','panic_prepared','ready','panic_intent']+(['accepted'] if ack else []))
+                self.assertEqual(len(reports),1); self.assertFalse(reports[0][0])
+                self.assertEqual(reports[0][1]['panic_control']['status'],'returned' if ack else 'failed')
+                self.assertEqual(r.json.loads((directory/'panic-followup-trigger.json').read_text()),trigger)
+
+    def test_syscall_b3_classifier_and_cms_preserve_mode_flags_and_missing_body_failure(self):
+        for body in ('fresh', 'missing', 'wrong_nonce', 'wrong_pid'):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp); config, saved, b3 = self.syscall_fixture(); trigger = {
+                    'scope':saved['scope'],'helper_sha256':'f'*64,'helper_pid':123,'ready':True}
+                prepared = {'helper_sha256':'f'*64}; (directory/'panic-control').mkdir()
+                for name,value in (('panic-followup-trigger.json',trigger),('panic-control/release-attempt.json',trigger),
+                                   ('panic-control/intent.json',{'scope':saved['scope'],'prepared':prepared})):
+                    r.private_write(directory/name,r.json.dumps(value).encode())
+                r.private_write(directory/'report-cert.pem',b'certificate boundary')
+                nonce = '0'*64 if body == 'wrong_nonce' else config['nonce']
+                raw = ('panic(cpu 0 caller 0x1): userspace panic: '+r.recovery_nvram_panic.syscall_marker(nonce,124 if body == 'wrong_pid' else 123)+
+                       '\nKernel UUID: '+r.KERNEL_UUID+'\n').encode() if body != 'missing' else None
+                cipher = b'encrypted boundary'; completed = []; metadata_seen = []
+                def validate(_d,_n,value,*,context):
+                    self.assertEqual(context,config['context']); self.assertEqual(value,prepared)
+                def encrypt(_cert,metadata,report):
+                    self.assertEqual(report,raw); metadata_seen.append(metadata)
+                    self.assertEqual(metadata['after_debug_boot'],'panic-nonce-syscall')
+                    self.assertEqual(metadata['control_kind'],'reboot-panic-v1'); self.assertEqual(metadata['flags'],3072)
+                    self.assertEqual(metadata['helper_pid'],123); self.assertEqual(metadata['helper_sha256'],'f'*64)
+                    self.assertEqual(set(metadata), {'binding','nonce','kernel_uuid','baseline_boot_uuid','debug_boot_uuid',
+                        'current_boot_uuid','source_identity','classification','after_debug_boot','control_kind','flags','helper_pid','helper_sha256'})
+                    self.assertEqual(metadata['source_identity'], config['debug_source_identity'])
+                    self.assertEqual(metadata['binding'], r.binding(config['context']))
+                    self.assertEqual(metadata['nonce'], config['nonce']); self.assertEqual(metadata['kernel_uuid'], r.KERNEL_UUID)
+                    self.assertEqual(metadata['baseline_boot_uuid'], config['baseline'])
+                    self.assertEqual(metadata['debug_boot_uuid'], saved['scope']['debug_boot_uuid'])
+                    self.assertEqual(metadata['current_boot_uuid'], b3)
+                    return {'ciphertext':r.base64.b64encode(cipher).decode(),'cipher_sha256':r.hashlib.sha256(cipher).hexdigest(),
+                            'cert_fingerprint':config['cert_fingerprint']}
+                def forbidden(*args,**kwargs): self.fail('syscall used old classifier or validation')
+                with patch.object(r.recovery_reboot_panic,'validate_prepared',validate), patch.object(r.recovery_panic_control,'validate_prepared',forbidden), \
+                     patch.object(r.recovery_nvram_panic,'classify_usdt',forbidden),patch.object(r.recovery_nvram_panic,'classify',forbidden), \
+                     patch.object(r.recovery_nvram_panic,'read_panic_info',lambda:('observed' if raw else 'unavailable',raw)), \
+                     patch.object(r.recovery_reports,'encrypt_bundle',encrypt), \
+                     patch.object(r,'complete_recovery',lambda *_a:completed.append((_a[5],r.json.loads(_a[4]['summary'])))):
+                    r.followup_finish(directory,config,b3,saved,'token')
+                self.assertEqual(len(metadata_seen),int(raw is not None)); self.assertEqual(completed[0][0],body=='fresh')
+                self.assertEqual(completed[0][1]['flags'],3072)
+                self.assertEqual(completed[0][1]['capture_state'],'fresh_fragment' if body=='fresh' else 'unavailable' if body=='missing' else 'encrypted_unvalidated')
+
+    def test_syscall_b3_rejects_malformed_or_two_child_trigger_before_capture(self):
+        for change in ({'tracer_pid':456}, {'helper_pid':True}, {'helper_pid':0}, {'ready':False}, {'extra':1}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                directory=Path(tmp); config,saved,b3=self.syscall_fixture(); (directory/'panic-control').mkdir()
+                trigger={'scope':saved['scope'],'helper_sha256':'f'*64,'helper_pid':123,'ready':True,**change}
+                for name,value in (('panic-followup-trigger.json',trigger),('panic-control/release-attempt.json',trigger),
+                                   ('panic-control/intent.json',{'scope':saved['scope'],'prepared':{'helper_sha256':'f'*64}})):
+                    r.private_write(directory/name,r.json.dumps(value).encode())
+                def forbidden(*args,**kwargs): self.fail('invalid trigger reached validation/capture/encryption')
+                with patch.object(r.recovery_reboot_panic,'validate_prepared',forbidden), \
+                     patch.object(r.recovery_nvram_panic,'read_panic_info',forbidden), \
+                     patch.object(r.recovery_reports,'encrypt_bundle',forbidden):
+                    with self.assertRaises(ValueError): r.followup_finish(directory,config,b3,saved,'token')
+
     def test_kernel_state_mode_has_no_panic_or_certificate_path(self):
         ctx = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
                'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,

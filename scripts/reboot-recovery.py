@@ -7,6 +7,7 @@ import recovery_bootargs
 import recovery_bootplist
 import recovery_nvram_panic
 import recovery_panic_control
+import recovery_reboot_panic
 import recovery_arrival
 import recovery_sources
 import recovery_netdump_settings
@@ -45,7 +46,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
-              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "kernel-state", "netdump-prime", "panic-nonce-netdump") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "panic-nonce-syscall", "kernel-state", "netdump-prime", "panic-nonce-netdump") and
               (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
@@ -66,11 +67,29 @@ def panic_mode(ctx):
 
 
 def panic_followup(ctx):
-    return ctx.get("after_debug_boot", "none") in ("panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off")
+    return ctx.get("after_debug_boot", "none") in ("panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "panic-nonce-syscall")
 
 
 def panic_control_kind(ctx):
+    if ctx.get('after_debug_boot') == 'panic-nonce-syscall':
+        return 'reboot-panic-v1'
     return 'usdt-v1' if ctx.get('after_debug_boot') in ('panic-nonce-usdt', 'panic-nonce-usdt-nvram-off') else 'pid-v1'
+
+
+def followup_control(ctx):
+    if panic_control_kind(ctx) == 'reboot-panic-v1':
+        return recovery_reboot_panic, {'context': ctx}
+    return recovery_panic_control, {'control_kind': panic_control_kind(ctx)}
+
+
+def panic_trigger_valid(trigger, scope, control_kind):
+    if control_kind not in ('pid-v1', 'usdt-v1', 'reboot-panic-v1'):
+        return False
+    pids = ('helper_pid',) if control_kind == 'reboot-panic-v1' else ('helper_pid', 'tracer_pid')
+    return (isinstance(trigger, dict) and set(trigger) == {'scope', 'helper_sha256', 'ready', *pids} and
+            trigger['scope'] == scope and trigger['ready'] is True and
+            isinstance(trigger['helper_sha256'], str) and bool(re.fullmatch(r'[0-9a-f]{64}', trigger['helper_sha256'])) and
+            all(type(trigger[name]) is int and 0 < trigger[name] < 2**31 for name in pids))
 
 
 def kernel_state_mode(ctx):
@@ -262,7 +281,7 @@ def debug_lineage_matches(data, pending, ctx):
     facts = data.get("debug_boot_facts")
     if not debug_boot_proven(facts, ctx["debug_source"], expected_debug_mask(ctx)):
         return False
-    if (kernel_state_mode(ctx) or panic_control_kind(ctx) == 'usdt-v1') and not kernel_state_proven(facts):
+    if (kernel_state_mode(ctx) or panic_control_kind(ctx) in ('usdt-v1', 'reboot-panic-v1')) and not kernel_state_proven(facts):
         return False
     if nvram_off_control(ctx) and not nvram_off_control_proven(facts):
         return False
@@ -284,13 +303,13 @@ def debug_lineage_matches(data, pending, ctx):
         return False
     if len({value.upper() for value in boots}) != 3 or facts.get("current_boot_uuid") != boots[1]:
         return False
+    if panic_control_kind(ctx) == 'reboot-panic-v1' and (data.get('control_kind') != 'reboot-panic-v1' or
+            type(data.get('flags')) is not int or data['flags'] != 3072):
+        return False
     trigger = data.get("panic_trigger")
     scope = {"binding": binding(ctx), "nonce": pending["nonce"], "baseline": boots[0],
              "source_identity": debug_source_identity(), "debug_boot_uuid": boots[1]}
-    return (isinstance(trigger, dict) and set(trigger) == {"scope", "helper_sha256", "helper_pid", "tracer_pid", "ready"} and
-            trigger["scope"] == scope and trigger["ready"] is True and
-            isinstance(trigger["helper_sha256"], str) and bool(re.fullmatch(r"[0-9a-f]{64}", trigger["helper_sha256"])) and
-            all(type(trigger[name]) is int and 0 < trigger[name] < 2**31 for name in ("helper_pid", "tracer_pid")))
+    return panic_trigger_valid(trigger, scope, panic_control_kind(ctx))
 
 
 def boot_proof_matches(data, pending, ctx):
@@ -675,8 +694,10 @@ def prepare_root(payload):
         plan = recovery_netdump.discover(netdump_context(ctx), token, cert, nonce, main_path=__file__,
                                          purpose=netdump_mode(ctx), baseline=baseline_fact)
     if panic_followup(ctx) or netdump_capture(ctx):
-        recovery_panic_control.build(directory, nonce, private_write, sync_directory,
-                                     control_kind=panic_control_kind(ctx))
+        control, options = followup_control(ctx)
+        if panic_control_kind(ctx) == 'reboot-panic-v1':
+            options['source_path'] = Path(__file__).resolve().parent.parent / 'probes' / 'reboot_panic.c'
+        control.build(directory, nonce, private_write, sync_directory, **options)
     if panic_followup(ctx):
         baseline_status, baseline_raw = recovery_nvram_panic.read_panic_info()
         marker = {"binding": binding(ctx), "nonce": nonce, "baseline": baseline, "source_identity": debug_source_identity()}
@@ -1524,6 +1545,8 @@ def publish_debug_core(directory, config, current, facts, token):
 
 def followup_summary(config, phase, current, saved, **details):
     ctx = config["context"]
+    if panic_control_kind(ctx) == 'reboot-panic-v1':
+        details = {**details, 'control_kind': 'reboot-panic-v1', 'flags': 3072}
     return {"protocol": "vz-recovery-v1", "phase": phase, "binding": binding(ctx), "nonce": config["nonce"],
             "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
             "trigger": ctx["trigger"], "debug_boot": True, "debug_source": ctx["debug_source"],
@@ -1652,7 +1675,7 @@ def read_followup_debug(directory, config):
         raise ValueError("followup debug proof invalid")
     if nvram_off_control(config["context"]) and not nvram_off_control_proven(saved["facts"]):
         raise ValueError("NVRAM logging control proof invalid")
-    if panic_control_kind(config['context']) == 'usdt-v1' and not kernel_state_proven(saved['facts']):
+    if panic_control_kind(config['context']) in ('usdt-v1', 'reboot-panic-v1') and not kernel_state_proven(saved['facts']):
         raise ValueError('USDT runtime mask proof invalid')
     return saved
 
@@ -1666,6 +1689,7 @@ def runtime_watch_identity(config, scope, helper_sha256):
         raise ValueError('runtime watch identity invalid')
     result = {'protocol': 'vz-runtime-watch-v1', 'role': 'runtime-watch',
               'scope': scope, 'helper_sha256': helper_sha256}
+    if panic_control_kind(config['context']) == 'reboot-panic-v1': result['control_kind'] = 'reboot-panic-v1'
     if netdump_capture(config['context']): result['lifetime_seconds'] = 240
     return result
 
@@ -1691,11 +1715,12 @@ def runtime_watch_release(raw, trigger_raw, identity):
     if len(raw) > 4096 or len(trigger_raw) > 4096:
         raise ValueError('runtime watch release oversized')
     record, trigger = json.loads(raw), json.loads(trigger_raw)
-    if (not isinstance(record, dict) or set(record) != {'scope', 'helper_sha256', 'helper_pid', 'tracer_pid', 'ready'} or
-            record != trigger or record['scope'] != identity['scope'] or
-            record['helper_sha256'] != identity['helper_sha256'] or record['ready'] is not True or
-            any(type(record[k]) is not int or not 0 < record[k] < 2**31 for k in ('helper_pid', 'tracer_pid')) or
-            record['helper_pid'] == record['tracer_pid']):
+    if 'control_kind' in identity and identity['control_kind'] != 'reboot-panic-v1':
+        raise ValueError('runtime watch control kind invalid')
+    kind = identity.get('control_kind', 'pid-v1')
+    if (not panic_trigger_valid(record, identity['scope'], kind) or
+            record != trigger or record['helper_sha256'] != identity['helper_sha256'] or
+            (kind != 'reboot-panic-v1' and record['helper_pid'] == record['tracer_pid'])):
         raise ValueError('runtime watch release invalid')
     return hashlib.sha256(raw).hexdigest()
 
@@ -1833,8 +1858,8 @@ def runtime_watch(directory):
         if boot_uuid() != saved['scope']['debug_boot_uuid']:
             raise ValueError('runtime watch boot changed')
         prepared = json.loads(recovery_panic_control.read_private(directory / 'panic-control' / 'prepared.json', 0o600, 8192))
-        recovery_panic_control.validate_prepared(directory, config['nonce'], prepared,
-                                                 control_kind=panic_control_kind(config['context']))
+        control, options = followup_control(config['context'])
+        control.validate_prepared(directory, config['nonce'], prepared, **options)
         identity = runtime_watch_identity(config, saved['scope'], prepared['helper_sha256'])
         launch = json.loads(recovery_panic_control.read_private(directory / 'runtime-watch-launch.json', 0o600, 4096))
         if launch != identity or runtime_watch_stage(directory, identity, observation) != observation:
@@ -1887,14 +1912,16 @@ def followup_start(directory, config, current, facts, token, *, deadline=None):
         raise ValueError("followup requires a restored debug boot")
     saved = {"scope": scope, "facts": facts}
     control_kind = panic_control_kind(config['context'])
-    if control_kind != 'usdt-v1':
+    runtime_mask = control_kind in ('usdt-v1', 'reboot-panic-v1')
+    control, options = followup_control(config['context'])
+    if not runtime_mask:
         private_write(directory / "panic-followup-debug.json", json.dumps(saved).encode())
         sync_directory(directory)
     handoff_started, capture_intent = False, None
-    if control_kind == 'usdt-v1' and deadline is None:
+    if runtime_mask and deadline is None:
         deadline = time.monotonic() + 180
     try:
-        if control_kind == 'usdt-v1':
+        if runtime_mask:
             optional = {'optional_inventory_status': 'uncertain'}
             try:
                 if deadline - time.monotonic() < 32: raise TimeoutError('USDT mask observation budget unavailable')
@@ -1908,8 +1935,8 @@ def followup_start(directory, config, current, facts, token, *, deadline=None):
             if not kernel_state_proven(facts): raise ValueError('USDT runtime mask not proven')
         if nvram_off_control(config["context"]) and not nvram_off_control_proven(facts):
             raise ValueError("NVRAM logging control not proven")
-        prepared = recovery_panic_control.prepare(directory, config["nonce"], private_write, sync_directory,
-                                                  control_kind=control_kind, deadline=deadline)
+        prepared = control.prepare(directory, config["nonce"], private_write, sync_directory,
+                                   deadline=deadline, **options)
         publish_followup(directory, config, token, followup_summary(config, "panic_prepared", current, saved, prepared=prepared),
                          "Nonce panic control prepared")
         watch = start_runtime_watch(directory, config, scope, prepared)
@@ -1917,6 +1944,8 @@ def followup_start(directory, config, current, facts, token, *, deadline=None):
             raise ValueError('runtime watch not ready for fire')
         def on_ready(trigger):
             nonlocal handoff_started, capture_intent
+            if control_kind == 'reboot-panic-v1' and not panic_trigger_valid(trigger, scope, control_kind):
+                raise ValueError('syscall trigger identity mismatch')
             if trigger.get("scope") != scope or trigger.get("helper_sha256") != prepared["helper_sha256"] or trigger.get("ready") is not True:
                 raise ValueError("panic trigger identity mismatch")
             if not runtime_watch_alive(watch, minimum=150 if netdump_capture(config['context']) else 30):
@@ -1946,18 +1975,22 @@ def followup_start(directory, config, current, facts, token, *, deadline=None):
             else:
                 publish_followup(directory, config, token, summary, 'Nonce panic intent durable')
             return boot_uuid() == current and runtime_watch_alive(watch, minimum=30)
-        fire_deadline = min(deadline, watch['deadline_monotonic'] - 30) if control_kind == 'usdt-v1' else None
-        returned = recovery_panic_control.fire(directory, scope, prepared, private_write, sync_directory, on_ready, boot_uuid,
-                                               control_kind=control_kind, deadline=fire_deadline)
+        fire_deadline = min(deadline, watch['deadline_monotonic'] - 30) if runtime_mask else None
+        returned = control.fire(directory, scope, prepared, private_write, sync_directory, on_ready, boot_uuid,
+                                deadline=fire_deadline, **options)
         failure = {"status": "returned", "result": safe_fire_return(returned) if netdump_capture(config['context']) else returned}
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, urllib.error.URLError) as error:
         failure = {"status": "failed", "kind": type(error).__name__}
     private_write(directory / "panic-followup-returned.json", json.dumps({"scope": scope, **failure}).encode())
     sync_directory(directory)
     labels = ("build", "sign", "listing", "trace", "panic-compile", "tracer")
+    if control_kind == 'reboot-panic-v1':
+        labels = ('build', 'sign', 'preflight', 'helper')
     if control_kind == 'usdt-v1':
         labels += ('header', 'compile-listing', 'fire-listing')
     names = tuple(label + "." + channel for label in labels for channel in ("stdout", "stderr")) + ("prepare-failure.json", "timeout-ps.stdout", "timeout-ps.stderr", "timeout-spindump.stdout", "timeout-spindump.stderr", "timeout-diagnostic.json", "watch-ready.json", "watch.stderr")
+    if control_kind == 'reboot-panic-v1':
+        names += ('build.json', 'sign.json', 'signature.json', 'prepare-boot.json', 'helper.stdout.json')
     failure["files"] = {name: {"exists": (directory / "panic-control" / name).exists(),
                               "bytes": (directory / "panic-control" / name).stat().st_size if (directory / "panic-control" / name).exists() else None}
                         for name in names}
@@ -2000,6 +2033,8 @@ def followup_start(directory, config, current, facts, token, *, deadline=None):
 def classify_followup(raw, config, trigger):
     if raw is None:
         return {"status": "unavailable", "freshness": "unverified", "completeness": "unknown", "encoding": None}
+    if panic_control_kind(config['context']) == 'reboot-panic-v1':
+        return recovery_nvram_panic.classify_syscall(raw, config['nonce'], trigger['helper_pid'])
     if panic_control_kind(config['context']) == 'usdt-v1':
         return recovery_nvram_panic.classify_usdt(raw, config['nonce'], trigger['helper_pid'])
     return recovery_nvram_panic.classify(raw, config['nonce'])
@@ -2015,8 +2050,10 @@ def followup_finish(directory, config, current, saved, token):
     release = json.loads((directory / "panic-control" / "release-attempt.json").read_text())
     if trigger != release or trigger.get("scope") != scope or intent.get("scope") != scope:
         raise ValueError("followup release evidence invalid")
-    recovery_panic_control.validate_prepared(directory, config["nonce"], intent.get("prepared"),
-                                             control_kind=panic_control_kind(config['context']))
+    control, options = followup_control(config['context'])
+    if panic_control_kind(config['context']) == 'reboot-panic-v1' and not panic_trigger_valid(trigger, scope, 'reboot-panic-v1'):
+        raise ValueError('syscall release evidence invalid')
+    control.validate_prepared(directory, config["nonce"], intent.get("prepared"), **options)
     if trigger.get("helper_sha256") != intent["prepared"]["helper_sha256"]:
         raise ValueError("followup helper mismatch")
     observation = directory / "panic-followup-observation.json"
@@ -2041,6 +2078,9 @@ def followup_finish(directory, config, current, saved, token):
         metadata = {"binding": binding(config["context"]), "nonce": config["nonce"], "kernel_uuid": KERNEL_UUID,
                     "baseline_boot_uuid": config["baseline"], "debug_boot_uuid": scope["debug_boot_uuid"],
                     "current_boot_uuid": current, "source_identity": config["debug_source_identity"], "classification": classification}
+        if panic_control_kind(config['context']) == 'reboot-panic-v1':
+            metadata.update(after_debug_boot=config['context']['after_debug_boot'], control_kind='reboot-panic-v1', flags=3072,
+                            helper_pid=trigger['helper_pid'], helper_sha256=trigger['helper_sha256'])
         if panic_control_kind(config['context']) == 'usdt-v1':
             metadata.update(after_debug_boot=config['context']['after_debug_boot'], control_kind='usdt-v1',
                             helper_pid=trigger['helper_pid'], helper_sha256=trigger['helper_sha256'])

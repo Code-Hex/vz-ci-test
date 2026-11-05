@@ -150,4 +150,112 @@ class UsdtPanicData(unittest.TestCase):
         with self.assertRaises(TypeError): panic.classify_usdt('not bytes', USDT_NONCE, 123)
 
 
+SYSCALL_MARKER = 'vz-reboot-panic:' + USDT_NONCE + ':123'
+SYSCALL_HEADER = (b'panic(cpu 1 caller 0xffffff8000012345): userspace panic: '
+                  b'vz-reboot-panic:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:123\n')
+SYSCALL_REPORT = SYSCALL_HEADER + b'Kernel UUID: 87453B1D-A163-31FA-B33B-0FB4BE78E6E8\n'
+SYSCALL_PACKED = base64.b64decode(
+    '8LA7PUaN4XVQDDQOs9llOQiGN5vNZrMZB4PBYDHZjFZL6UD1eVk+h4fHZRA87E6PdSC7viUvi99vegsedqfHOlhMNqPVbDdcLiwek8tmWEw2o9VsN1wuLB6Ty2ZYTDaj1Ww3XC4sHpPLZlhMNqPVbDdcLiwek8tmXUw2UyzLcneZDapWk0QdCHej1WbCGLEVjNlmrVnMGGwJZzNhC2YU0oTFG65oK+IUAAAAAAAAAA==')
+SYSCALL_UNTERMINATED_PACKED = SYSCALL_PACKED[:-7]
+
+
+class SyscallPanicData(unittest.TestCase):
+    def classify(self, raw):
+        return panic.classify_syscall(raw, USDT_NONCE, 123)
+
+    def test_marker_is_exact_and_bounded_for_native_pid(self):
+        self.assertEqual(panic.syscall_marker(USDT_NONCE, 123), SYSCALL_MARKER)
+        self.assertEqual(panic.syscall_marker('f' * 64, 2**31 - 1),
+                         'vz-reboot-panic:' + 'f' * 64 + ':2147483647')
+        self.assertLess(len(panic.syscall_marker('f' * 64, 2**31 - 1).encode('ascii')), 128)
+
+    def test_literal_raw_and_packa_have_exact_freshness_metadata(self):
+        for raw, encoding, terminated in ((SYSCALL_REPORT, 'raw', False),
+                                         (SYSCALL_REPORT + b'\0', 'raw', True),
+                                         (SYSCALL_PACKED, 'packA', True),
+                                         (SYSCALL_UNTERMINATED_PACKED, 'packA', False)):
+            with self.subTest(encoding=encoding, terminated=terminated):
+                self.assertEqual(self.classify(raw), {
+                    'status': 'fresh_fragment', 'encoding': encoding, 'freshness': 'verified',
+                    'completeness': 'unknown', 'terminator_present': terminated, 'packed_tail_bytes': 0})
+        self.assertEqual(panic.unpack_a(SYSCALL_PACKED).split(b'\0', 1)[0], SYSCALL_REPORT)
+        self.assertEqual(panic.unpack_a(SYSCALL_UNTERMINATED_PACKED), SYSCALL_REPORT)
+
+    def test_full_nonce_pid_kind_and_header_are_exact(self):
+        changes = ((b'abcdef:123', b'abcdee:123'), (b':123\n', b':124\n'),
+                   (b':123\n', b':0123\n'), (b'vz-reboot-panic:', b'vz-force-reset:'),
+                   (b'userspace panic: ', b'userspace panic:'),
+                   (b':123\n', b':123 suffix\n'), (b':123\n', b':123\x00\n'))
+        for before, after in changes:
+            with self.subTest(before=before, after=after):
+                self.assertEqual(self.classify(SYSCALL_REPORT.replace(before, after))['freshness'], 'unverified')
+        for nonce, pid in ((USDT_NONCE[:-1] + 'e', 123), (USDT_NONCE, 124)):
+            with self.subTest(nonce=nonce, pid=pid):
+                self.assertEqual(panic.classify_syscall(SYSCALL_REPORT, nonce, pid)['freshness'], 'unverified')
+
+    def test_old_classifiers_and_syscall_never_accept_the_other_kind(self):
+        for raw in (REPORT, USDT_REPORT, USDT_PACKED):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.classify(raw)['freshness'], 'unverified')
+        for raw in (SYSCALL_REPORT, SYSCALL_PACKED):
+            with self.subTest(raw=raw):
+                self.assertEqual(panic.classify(raw, USDT_NONCE)['freshness'], 'unverified')
+                self.assertEqual(panic.classify_usdt(raw, USDT_NONCE, 123)['freshness'], 'unverified')
+
+    def test_kernel_uuid_and_bounded_first_header_are_required(self):
+        cases = ((SYSCALL_HEADER, 'uuid_missing'),
+                 (SYSCALL_REPORT[:-1], 'uuid_missing'),
+                 (SYSCALL_REPORT.replace(UUID.encode(), b'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA'), 'uuid_mismatch'),
+                 (b'prefix\n' + SYSCALL_REPORT, 'unrecognized'),
+                 (b'\0' + SYSCALL_REPORT, 'unrecognized'),
+                 (SYSCALL_REPORT.replace(b'panic(cpu 1', b'panic(cpu -1'), 'truncated'),
+                 (b'panic(cpu 1): userspace panic: message copyin failed\nKernel UUID: ' + UUID.encode() + b'\n', 'truncated'))
+        for raw, status in cases:
+            with self.subTest(status=status, raw=raw):
+                self.assertEqual(self.classify(raw)['status'], status)
+                self.assertEqual(self.classify(raw)['freshness'], 'unverified')
+
+    def test_duplicate_or_partial_panic_and_uuid_are_ambiguous_even_after_nul(self):
+        for suffix in (b'Kernel UUID: broken\n', b'Kernel UUID:',
+                       b'Kernel UUID: ' + UUID.encode() + b'\n', SYSCALL_HEADER,
+                       b'panic(cpu 2): another panic\n'):
+            for separator in (b'', b'\0\n'):
+                with self.subTest(suffix=suffix, separator=separator):
+                    result = self.classify(SYSCALL_REPORT + separator + suffix)
+                    self.assertEqual((result['status'], result['freshness']), ('ambiguous', 'unverified'))
+
+    def test_marker_and_uuid_after_nul_or_in_ignored_packed_tail_do_not_complete_report(self):
+        for raw in (b'panic(cpu 1): old panic\0' + SYSCALL_REPORT,
+                    SYSCALL_HEADER + b'\0Kernel UUID: ' + UUID.encode() + b'\n',
+                    SYSCALL_HEADER[:-1] + b'\0\nKernel UUID: ' + UUID.encode() + b'\n',
+                    SYSCALL_PACKED[:-14] + b'ABCDEF'):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.classify(raw)['freshness'], 'unverified')
+        result = self.classify(SYSCALL_PACKED + b'ABCDEF')
+        self.assertEqual((result['freshness'], result['packed_tail_bytes']), ('verified', 6))
+
+    def test_raw_and_packa_limits_do_not_upgrade_completeness(self):
+        for raw in (SYSCALL_REPORT + b'x' * (panic.MAX_RAW - len(SYSCALL_REPORT)),
+                    SYSCALL_PACKED + b'\0' * (panic.MAX_RAW - len(SYSCALL_PACKED))):
+            with self.subTest(raw_size=len(raw)):
+                result = self.classify(raw)
+                self.assertEqual((result['status'], result['completeness']), ('fresh_fragment', 'unknown'))
+        for raw, status in ((b'', 'empty'), (b'x' * (panic.MAX_RAW + 1), 'oversized')):
+            self.assertEqual(self.classify(raw), {
+                'status': status, 'encoding': None, 'freshness': 'unverified', 'completeness': 'unknown',
+                'terminator_present': None, 'packed_tail_bytes': 0})
+        with self.assertRaises(ValueError): panic.unpack_a(b'\0' * (panic.MAX_RAW + 7))
+
+    def test_nonce_pid_and_raw_types_are_strict(self):
+        for nonce in ('bad', 'A' * 64, 'a' * 63, 'a' * 65, USDT_NONCE + '\n',
+                      USDT_NONCE + '\0', b'a' * 64, None, True):
+            for fn in (panic.syscall_marker, lambda nonce, pid: panic.classify_syscall(SYSCALL_REPORT, nonce, pid)):
+                with self.subTest(nonce=nonce), self.assertRaises(ValueError): fn(nonce, 123)
+        for pid in (True, 0, -1, 2**31, 1.0, '123', None):
+            for fn in (panic.syscall_marker, lambda nonce, pid: panic.classify_syscall(SYSCALL_REPORT, nonce, pid)):
+                with self.subTest(pid=pid), self.assertRaises(ValueError): fn(USDT_NONCE, pid)
+        for raw in ('not bytes', bytearray(SYSCALL_REPORT), None):
+            with self.subTest(raw=raw), self.assertRaises(TypeError): self.classify(raw)
+
+
 if __name__ == '__main__': unittest.main()
