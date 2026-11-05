@@ -10,6 +10,7 @@ import struct
 import subprocess
 
 import recovery_bootargs as boot
+from recovery_netdump_settings import DEBUG_MASK, NetdumpSettings
 
 UUID = '87453B1D-A163-31FA-B33B-0FB4BE78E6E8'
 DATA = Path('/Library/Preferences/SystemConfiguration/com.apple.Boot.plist')
@@ -47,8 +48,11 @@ def flags(raw, *, allow_debug=False):
     return data['Kernel Flags']
 
 
-def stage_content(raw, debug_mask=0x2000, *, nvram_paniclog=None):
-    if type(debug_mask) is not int or debug_mask not in (0x2000, 0x102000): raise ValueError('debug_mask_invalid')
+def stage_content(raw, debug_mask=0x2000, *, nvram_paniclog=None, netdump_settings=None):
+    if netdump_settings is not None and type(netdump_settings) is not NetdumpSettings:
+        raise ValueError('netdump_settings_invalid')
+    masks = (0x2000, 0x102000) if netdump_settings is None else (DEBUG_MASK,)
+    if type(debug_mask) is not int or debug_mask not in masks: raise ValueError('debug_mask_invalid')
     if nvram_paniclog is not None and (type(nvram_paniclog) is not int or nvram_paniclog != 0 or debug_mask != 0x102000):
         raise ValueError('nvram_paniclog_invalid')
     original = flags(raw)
@@ -56,6 +60,8 @@ def stage_content(raw, debug_mask=0x2000, *, nvram_paniclog=None):
         raise ValueError('existing_nvram_paniclog')
     data = plistlib.loads(raw)
     data['Kernel Flags'] = original + (' ' if original else '') + 'debug=0x' + format(debug_mask, 'x')
+    if netdump_settings is not None:
+        data['Kernel Flags'] += ' ' + ' '.join(netdump_settings.tokens())
     if nvram_paniclog == 0:
         data['Kernel Flags'] += ' nvram_paniclog=0'
     boot.text(data['Kernel Flags'])
@@ -286,14 +292,15 @@ def _record(directory, name, value, save, sync):
 def _load(directory, marker, data_path, preboot_path):
     validate_marker(marker)
     manifest = json.loads((directory / 'bootplist-manifest.json').read_text())
-    if (not isinstance(manifest, dict) or set(manifest) != {'marker', 'debug_mask', 'nvram_paniclog', 'paths', 'scope', 'files'} or
+    if (not isinstance(manifest, dict) or set(manifest) != {'marker', 'debug_mask', 'nvram_paniclog', 'netdump_settings', 'paths', 'scope', 'files'} or
             manifest.get('marker') != marker or
             manifest.get('paths') != {'data': str(data_path), 'preboot': str(preboot_path)} or
-            type(manifest.get('debug_mask')) is not int or manifest['debug_mask'] not in (0x2000, 0x102000) or
+            type(manifest.get('debug_mask')) is not int or
             (manifest['nvram_paniclog'] is not None and
              (type(manifest['nvram_paniclog']) is not int or manifest['nvram_paniclog'] != 0 or manifest['debug_mask'] != 0x102000)) or
             not isinstance(manifest['files'], dict) or set(manifest['files']) != {'data', 'preboot'}):
         raise ValueError('manifest_invalid')
+    settings = None if manifest['netdump_settings'] is None else NetdumpSettings.from_record(manifest['netdump_settings'])
     saved = {}
     for name in ('data', 'preboot'):
         item = manifest.get('files', {}).get(name)
@@ -302,9 +309,10 @@ def _load(directory, marker, data_path, preboot_path):
         staged = (directory / (name + '.staged')).read_bytes()
         if hashlib.sha256(original).hexdigest() != item.get('original_sha256') or hashlib.sha256(staged).hexdigest() != item.get('staged_sha256'):
             raise ValueError('backup_invalid')
-        if stage_content(original, manifest['debug_mask'], nvram_paniclog=manifest['nvram_paniclog']) != staged: raise ValueError('backup_invalid')
+        if stage_content(original, manifest['debug_mask'], nvram_paniclog=manifest['nvram_paniclog'], netdump_settings=settings) != staged:
+            raise ValueError('backup_invalid')
         saved[name] = {'original': original, 'staged': staged, 'meta': item['meta']}
-    return saved, manifest['debug_mask']
+    return saved, manifest['debug_mask'], settings
 
 
 def _pending(directory, prefix, marker, saved, *, require_done=False):
@@ -350,7 +358,7 @@ def _current_boot_uuid():
     return subprocess.check_output(['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'], timeout=10).decode('ascii').strip()
 
 
-def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner_uid=0, writer=write_if_expected, scope=None, boot_uuid=_current_boot_uuid, debug_mask=0x2000, nvram_paniclog=None):
+def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner_uid=0, writer=write_if_expected, scope=None, boot_uuid=_current_boot_uuid, debug_mask=0x2000, nvram_paniclog=None, netdump_settings=None):
     validate_marker(marker)
     directory = Path(directory); data_path = Path(data_path); preboot_path = Path(preboot_path)
     if (directory / 'bootplist-manifest.json').exists(): raise ValueError('already_staged')
@@ -363,8 +371,9 @@ def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner
         check = metadata_facts(path, originals[name])
         check['checks']['uid_root'] = originals[name]['uid'] == owner_uid
         if not metadata_allowed(check): raise ValueError('metadata_unsupported')
-    desired = {name: stage_content(item['raw'], debug_mask, nvram_paniclog=nvram_paniclog) for name, item in originals.items()}
+    desired = {name: stage_content(item['raw'], debug_mask, nvram_paniclog=nvram_paniclog, netdump_settings=netdump_settings) for name, item in originals.items()}
     manifest = {'marker': marker, 'debug_mask': debug_mask, 'nvram_paniclog': nvram_paniclog,
+                'netdump_settings': None if netdump_settings is None else netdump_settings.record(),
                 'paths': {name: str(path) for name, path in paths.items()}, 'scope': scope, 'files': {}}
     for name in paths:
         original = originals[name]
@@ -423,7 +432,7 @@ def rollback_files(directory, marker, data_path, preboot_path, save, sync, *, cu
             current_boot_uuid.upper() != marker['baseline'].upper()):
         raise ValueError('rollback_boot_mismatch')
     directory = Path(directory); data_path = Path(data_path); preboot_path = Path(preboot_path)
-    saved, _ = _load(directory, marker, data_path, preboot_path)
+    saved, _, _ = _load(directory, marker, data_path, preboot_path)
     _pending(directory, 'stage', marker, saved); _pending(directory, 'restore', marker, saved)
     paths = {'data': data_path, 'preboot': preboot_path}
     current = {name: snapshot(path) for name, path in paths.items()}
@@ -442,9 +451,9 @@ def finish_files(directory, marker, data_path, preboot_path, current_boot_uuid, 
     directory = Path(directory); data_path = Path(data_path); preboot_path = Path(preboot_path)
     if not isinstance(current_boot_uuid, str) or not UUID_RE.fullmatch(current_boot_uuid) or current_boot_uuid.upper() == marker['baseline'].upper():
         raise ValueError('boot_invalid')
-    if (active_status not in ('observed', 'unavailable') or (active_status == 'unavailable' and active_mask is not None) or
+    if (active_status not in ('observed', 'unavailable', 'invalid') or (active_status != 'observed' and active_mask is not None) or
             (active_mask is not None and (type(active_mask) is not int or not 0 <= active_mask <= 0xffffffff))): raise ValueError('active_invalid')
-    saved, expected_mask = _load(directory, marker, data_path, preboot_path)
+    saved, expected_mask, _ = _load(directory, marker, data_path, preboot_path)
     if active_status == 'observed':
         active_status = 'observed_debug' if active_mask == expected_mask else 'observed_no_debug'
     _pending(directory, 'stage', marker, saved, require_done=True); _pending(directory, 'restore', marker, saved)
@@ -492,10 +501,10 @@ def finish_files(directory, marker, data_path, preboot_path, current_boot_uuid, 
     return result
 
 
-def stage(directory, marker, save, sync, *, debug_mask=0x2000, nvram_paniclog=None):
+def stage(directory, marker, save, sync, *, debug_mask=0x2000, nvram_paniclog=None, netdump_settings=None):
     data, preboot, group, system = resolve_paths()
     result = stage_files(directory, marker, data, preboot, save, sync, scope={'group': group, 'system': system},
-                         debug_mask=debug_mask, nvram_paniclog=nvram_paniclog)
+                         debug_mask=debug_mask, nvram_paniclog=nvram_paniclog, netdump_settings=netdump_settings)
     return result
 
 
@@ -522,10 +531,15 @@ def rollback(directory, marker, save, sync, *, current_boot_uuid):
 
 def finish(directory, marker, save, sync, *, current_boot_uuid):
     data, preboot = _production_paths(directory, marker)
+    _, _, settings = _load(directory, marker, data, preboot)
     try:
-        active_mask = boot.debug_mask(boot.MacPlatform().active())
+        active = boot.MacPlatform().active()
+        active_mask = boot.debug_mask(settings.strip_owned(active) if settings is not None else active)
         active_status = 'observed'
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except ValueError:
+        active_mask = None
+        active_status = 'invalid' if settings is not None else 'unavailable'
+    except (OSError, subprocess.SubprocessError):
         active_mask = None
         active_status = 'unavailable'
     return finish_files(directory, marker, data, preboot, current_boot_uuid, active_mask, save, sync, active_status=active_status)
