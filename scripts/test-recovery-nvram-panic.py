@@ -8,6 +8,16 @@ UUID = '87453B1D-A163-31FA-B33B-0FB4BE78E6E8'
 HEADER = ('panic(cpu 1 caller 0xffffff8000012345): dtrace: panic action at probe '
           'pid123:sample:vz_nonce_' + NONCE + ':entry (ecb 0xffffff8000001234)\n')
 REPORT = (HEADER + 'Kernel UUID: ' + UUID + '\n').encode() + b'\0'
+USDT_NONCE = '0123456789abcdef' * 4
+USDT_HEADER = (b'panic(cpu 1 caller 0xffffff8000012345): dtrace: panic action at probe '
+               b'vzobs0123456789abcdefp123:helper:vz_nonce_'
+               b'0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+               b':observe (ecb 0xffffff8000001234)\n')
+USDT_REPORT = USDT_HEADER + b'Kernel UUID: 87453B1D-A163-31FA-B33B-0FB4BE78E6E8\n'
+USDT_PACKED = base64.b64decode(
+    '8LA7PUaN4XVQDDQOs9llOQiGN5vNZrMZB4PBYDHZjFZL6UBkujw8LutA8LA7PQaFx/T02w0K00Fw+VtcBtn1b/EcFpPNaDXbDZcLi8fkshkek8106DIbXpbr7Pqv++0el7+wmGxGq9luuFxYPCaXzbCYbEar2W64XFg8JpfNsJhsRqvZbrhcWDwml82wmGxGq9luuFxYPCaXzbq3eF6W28sgVHksBsHwZrPZbDbjYDAYDBaTzWgpxbIsd5fZoGo1SdSBcDdabSaMEVvBmG3WmsWMwZZwNhO2YEYhTVi84Yq2Ik4BAAAA')
+USDT_UNTERMINATED_PACKED = base64.b64decode(
+    '8LA7PUaN4XVQDDQOs9llOQiGN5vNZrMZB4PBYDHZjFZL6UBkujw8LutA8LA7PQaFx/T02w0K00Fw+VtcBtn1b/EcFpPNaDXbDZcLi8fkshkek8106DIbXpbr7Pqv++0el7+wmGxGq9luuFxYPCaXzbCYbEar2W64XFg8JpfNsJhsRqvZbrhcWDwml82wmGxGq9luuFxYPCaXzbq3eF6W28sgVHksBsHwZrPZbDbjYDAYDBaTzWgpxbIsd5fZoGo1SdSBcDdabSaMEVvBmG3WmsWMwZZwNhO2YEYhTVi84Yq2Ik6h1Wq1')
 
 
 class PanicData(unittest.TestCase):
@@ -76,6 +86,68 @@ class PanicData(unittest.TestCase):
     def test_multiple_valid_formats_are_ambiguous(self):
         candidates = [('raw', REPORT), ('packA', REPORT)]
         self.assertEqual(panic.classify_candidates(candidates, NONCE)['status'], 'ambiguous')
+
+
+class UsdtPanicData(unittest.TestCase):
+    def test_literal_raw_and_packa_have_the_same_freshness_metadata(self):
+        for raw, encoding, terminated in ((USDT_REPORT, 'raw', False),
+                                         (USDT_REPORT + b'\0', 'raw', True),
+                                         (USDT_PACKED, 'packA', True),
+                                         (USDT_UNTERMINATED_PACKED, 'packA', False)):
+            with self.subTest(encoding=encoding, terminated=terminated):
+                self.assertEqual(panic.classify_usdt(raw, USDT_NONCE, 123), {
+                    'status': 'fresh_fragment', 'encoding': encoding, 'freshness': 'verified',
+                    'completeness': 'unknown', 'terminator_present': terminated, 'packed_tail_bytes': 0})
+        self.assertEqual(panic.unpack_a(USDT_PACKED).split(b'\0', 1)[0], USDT_REPORT)
+
+    def test_selector_fields_and_actual_helper_pid_are_exact(self):
+        changes = ((b'p123:', b'p124:'), (b'vzobs0123456789abcdefp', b'vzobs1123456789abcdefp'),
+                   (b':helper:', b':other:'), (b':observe ', b':entry '),
+                   (b'abcdef:observe', b'abcdee:observe'))
+        for before, after in changes:
+            with self.subTest(before=before):
+                result = panic.classify_usdt(USDT_REPORT.replace(before, after), USDT_NONCE, 123)
+                self.assertEqual(result['freshness'], 'unverified')
+        self.assertEqual(panic.classify_usdt(USDT_REPORT, USDT_NONCE, 124)['freshness'], 'unverified')
+        self.assertEqual(panic.classify_usdt(USDT_REPORT, USDT_NONCE[:-1] + 'e', 123)['freshness'], 'unverified')
+
+    def test_pid_and_usdt_classifiers_never_accept_the_other_kind(self):
+        pid = (HEADER.replace(NONCE, USDT_NONCE) + 'Kernel UUID: ' + UUID + '\n').encode()
+        self.assertEqual(panic.classify_usdt(pid, USDT_NONCE, 123)['freshness'], 'unverified')
+        self.assertEqual(panic.classify(USDT_REPORT, USDT_NONCE)['freshness'], 'unverified')
+        self.assertEqual(panic.classify(USDT_PACKED, USDT_NONCE)['freshness'], 'unverified')
+        self.assertEqual(panic.classify(REPORT, NONCE)['freshness'], 'verified')
+
+    def test_uuid_header_and_line_termination_are_required(self):
+        for raw in (USDT_REPORT.replace(UUID.encode(), b'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA'),
+                    USDT_HEADER, USDT_REPORT[:-1], b'prefix\n' + USDT_REPORT,
+                    b'\0' + USDT_REPORT, USDT_REPORT.replace(b'panic(cpu ', b'panic(cpu -')):
+            with self.subTest(raw=raw):
+                self.assertEqual(panic.classify_usdt(raw, USDT_NONCE, 123)['freshness'], 'unverified')
+        for suffix in (b'Kernel UUID: broken\n', b'Kernel UUID:', USDT_HEADER,
+                       b'panic(cpu 2): another panic\n'):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(panic.classify_usdt(USDT_REPORT + suffix, USDT_NONCE, 123)['status'], 'ambiguous')
+
+    def test_nonce_or_uuid_after_nul_and_ignored_packed_tail_cannot_complete_a_fragment(self):
+        for raw in (b'panic(cpu 1): old panic\0' + USDT_REPORT,
+                    USDT_HEADER + b'\0Kernel UUID: ' + UUID.encode() + b'\n',
+                    USDT_PACKED[:-7] + b'ABCDEF'):
+            with self.subTest(raw=raw):
+                self.assertEqual(panic.classify_usdt(raw, USDT_NONCE, 123)['freshness'], 'unverified')
+        result = panic.classify_usdt(USDT_PACKED + b'ABC', USDT_NONCE, 123)
+        self.assertEqual((result['freshness'], result['packed_tail_bytes']), ('verified', 3))
+
+    def test_usdt_empty_oversized_and_invalid_inputs(self):
+        for raw, status in ((b'', 'empty'), (b'x' * (panic.MAX_RAW + 1), 'oversized')):
+            self.assertEqual(panic.classify_usdt(raw, USDT_NONCE, 123), {
+                'status': status, 'encoding': None, 'freshness': 'unverified', 'completeness': 'unknown',
+                'terminator_present': None, 'packed_tail_bytes': 0})
+        for nonce, pid in (('bad', 123), (USDT_NONCE, True), (USDT_NONCE, 0),
+                           (USDT_NONCE, -1), (USDT_NONCE, 2**31)):
+            with self.subTest(nonce=nonce, pid=pid), self.assertRaises(ValueError):
+                panic.classify_usdt(USDT_REPORT, nonce, pid)
+        with self.assertRaises(TypeError): panic.classify_usdt('not bytes', USDT_NONCE, 123)
 
 
 if __name__ == '__main__': unittest.main()

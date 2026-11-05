@@ -11,6 +11,133 @@ import recovery_panic_control as control
 
 
 class PanicControl(unittest.TestCase):
+    def test_closed_control_kind_is_rejected_before_file_io(self):
+        for function, args in ((control.build, ('/missing', 'a'*64, None, None)),
+                               (control.validate_built, ('/missing', 'a'*64)),
+                               (control.prepare, ('/missing', 'a'*64, None, None)),
+                               (control.validate_prepared, ('/missing', 'a'*64, {})),
+                               (control.fire, ('/missing', {}, {}, None, None, None, None))):
+            with self.assertRaisesRegex(ValueError, 'control_kind_invalid'): function(*args, control_kind='unknown')
+
+    def test_usdt_native_build_exact_receipts_and_cross_kind_tamper_rejection(self):
+        import json
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            def save(path, data):
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, 'wb') as stream: stream.write(data)
+            sync = lambda _: None
+            built = control.build(root, 'a'*64, save, sync, control_kind='usdt-v1')
+            self.assertEqual(set(built), {'control_sha256', 'preflight_sha256', 'getter_sha256', 'usdt_core_sha256',
+                'helper_source_sha256', 'helper_sha256', 'nonce_sha256', 'build_status', 'sign_status', 'signature_status',
+                'control_kind', 'provider_source_sha256', 'provider_header_sha256'})
+            self.assertEqual(control.validate_built(root, 'a'*64, control_kind='usdt-v1'), built)
+            with self.assertRaises(ValueError): control.validate_built(root, 'a'*64)
+            private = root/'panic-control'
+            phases = []
+            def observe(binary, nonce, directory, facts, *, env, on_timeout, control_kind, deadline):
+                phases.append(('observe', binary, control_kind, deadline))
+            def compile_only(binary, nonce, directory, *, env, on_timeout, control_kind, deadline):
+                phases.append(('compile', binary, control_kind, deadline)); return True
+            prepared = control.prepare(root, 'a'*64, save, sync, control_kind='usdt-v1',
+                                       observe=observe, compile_only=compile_only, deadline=time.monotonic()+55)
+            self.assertEqual(set(prepared), {'control_sha256', 'preflight_sha256', 'getter_sha256', 'usdt_core_sha256',
+                'helper_source_sha256', 'helper_sha256', 'nonce_sha256', 'observe_status', 'compile_status', 'control_kind',
+                'provider_source_sha256', 'provider_header_sha256'})
+            self.assertEqual([phase[0] for phase in phases], ['observe', 'compile'])
+            self.assertEqual(phases[0][1:], phases[1][1:])
+            self.assertEqual(prepared['helper_sha256'], built['helper_sha256'])
+            self.assertEqual(control.validate_prepared(root, 'a'*64, prepared, control_kind='usdt-v1'), private/'helper')
+            with self.assertRaises(ValueError): control.validate_prepared(root, 'a'*64, prepared)
+            for key in ('control_kind', 'usdt_core_sha256', 'provider_source_sha256', 'provider_header_sha256'):
+                changed = {**prepared, key: 'pid-v1' if key == 'control_kind' else '0'*64}
+                with self.assertRaises(ValueError): control.validate_prepared(root, 'a'*64, changed, control_kind='usdt-v1')
+            for name in ('provider.d', 'provider.h', 'helper.c', 'helper'):
+                path=private/name; original=path.read_bytes()
+                try:
+                    path.write_bytes(original+b'changed')
+                    with self.assertRaises(ValueError): control.validate_prepared(root, 'a'*64, prepared, control_kind='usdt-v1')
+                finally: path.write_bytes(original)
+            (private/'prepared.json').unlink()
+            def failed_compile(*args, **kwargs): return False
+            with self.assertRaisesRegex(ValueError, 'panic_compile_failed'):
+                control.prepare(root, 'a'*64, save, sync, control_kind='usdt-v1', observe=observe, compile_only=failed_compile)
+            self.assertFalse((private/'prepared.json').exists())
+
+    def test_startup_window_reserves_profiler_and_owned_child_reaping(self):
+        now=time.monotonic()
+        operation, outer=control.startup_window(now+30,40)
+        self.assertLessEqual(operation, now+13)
+        self.assertEqual(outer, now+30)
+        with self.assertRaises(TimeoutError): control.startup_window(now+16,40)
+        for value in (True, float('nan'), float('inf'), 'deadline'):
+            with self.assertRaises(ValueError): control.startup_window(value,40)
+
+    def test_usdt_fire_native_helpers_ack_deadline_and_once_ownership_without_dtrace(self):
+        import json, shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp)/'base'; base.mkdir()
+            def save(path,data):
+                fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                with os.fdopen(fd,'wb') as stream: stream.write(data)
+            sync=lambda _:None
+            built=control.build(base,'a'*64,save,sync,control_kind='usdt-v1')
+            private=base/'panic-control'; preflight=control.load_preflight()
+            preflight.command(['/usr/bin/xcrun','clang','-arch',os.uname().machine,'-O0',str(private/'helper.c'),'-o',str(private/'helper')],private,'native-build')
+            preflight.command(['/usr/bin/codesign','-s','-','-f',str(private/'helper')],private,'native-sign')
+            (private/'helper').chmod(0o700)
+            built['helper_sha256']=control.digest((private/'helper').read_bytes())
+            (private/'built.json').write_text(json.dumps(built))
+            prepared=control.prepare(base,'a'*64,save,sync,control_kind='usdt-v1',
+                observe=lambda *a,**k:True,compile_only=lambda *a,**k:True)
+            scope={'binding':'123/1/'+'a'*40,'nonce':'a'*64,'source_identity':'b'*64,
+                   'baseline':'11111111-1111-1111-1111-111111111111',
+                   'debug_boot_uuid':'22222222-2222-2222-2222-222222222222'}
+            for case in ('accepted','rejected','expired'):
+                with self.subTest(case=case):
+                    root=Path(tmp)/case; root.mkdir(); shutil.copytree(private,root/'panic-control')
+                    children=[]; events=[]
+                    class OwnedTracer(subprocess.Popen):
+                        def kill(self):
+                            if case=='accepted': raise AssertionError('after-G kill')
+                            return super().kill()
+                    def run_command(argv,directory,label,timeout,**kwargs):
+                        self.assertEqual(label,'fire-listing')
+                        spec=control.usdt.ProbeSpec('a'*64)
+                        helperpid=int(argv[-1].split(':')[0][len(spec.provider):])
+                        probe=spec.bind(helperpid)
+                        program='print('+repr('ID PROVIDER MODULE FUNCTION NAME\n1 '+' '.join(probe.fields)+'\n')+',end="")'
+                        return preflight.command([sys.executable,'-c',program],directory,label,timeout,**kwargs)
+                    def start_tracer(argv,**kwargs):
+                        self.assertNotIn('-p',argv); self.assertIn('{ panic(); }',argv[-1])
+                        child=OwnedTracer([sys.executable,'-c','import time; print("READY",flush=True); time.sleep('+('2' if case=='expired' else '.2')+')'],**kwargs)
+                        children.append(child); return child
+                    def on_ready(trigger):
+                        self.assertEqual(set(trigger),{'scope','helper_sha256','helper_pid','tracer_pid','ready'})
+                        events.append(trigger)
+                        if case=='expired': time.sleep(.55)
+                        return case!='rejected'
+                    result=control.fire(root,scope,prepared,save,sync,on_ready,lambda:scope['debug_boot_uuid'],
+                        control_kind='usdt-v1',deadline=time.monotonic()+(17.5 if case=='expired' else 25),
+                        run_command=run_command,start_tracer=start_tracer)
+                    self.assertEqual(len(events),1)
+                    self.assertEqual(result['release_status'],'released' if case=='accepted' else 'not_released')
+                    self.assertEqual((root/'panic-control'/'release-attempt.json').exists(),case=='accepted')
+                    self.assertEqual(len(children),1); self.assertIsNotNone(children[0].poll())
+                    if case=='accepted': self.assertEqual((result['helper_exit'],result['tracer_exit']),(0,0))
+
+    def test_usdt_input_closes_only_after_both_owned_exit_results(self):
+        helper=subprocess.Popen([sys.executable,'-c','import sys; sys.stdin.buffer.read(1)'],stdin=subprocess.PIPE)
+        try:
+            control.close_exited_usdt_input(helper,{'helper_exit':None,'tracer_exit':0})
+            self.assertFalse(helper.stdin.closed)
+            helper.stdin.write(b'X'); helper.stdin.flush(); self.assertEqual(helper.wait(timeout=2),0)
+            control.close_exited_usdt_input(helper,{'helper_exit':0,'tracer_exit':0})
+            self.assertTrue(helper.stdin.closed)
+        finally:
+            if not helper.stdin.closed: helper.stdin.close()
+            if helper.poll() is None: helper.kill(); helper.wait(timeout=2)
+
     def test_prepare_failure_records_timeout_stage_without_raw_data(self):
         import json
         with tempfile.TemporaryDirectory() as temp:

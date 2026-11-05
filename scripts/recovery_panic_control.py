@@ -1,7 +1,8 @@
-"""Prepare and fire one PID-probe panic under an external durable ACK."""
+"""Prepare and fire one nonce-bound probe under an external durable ACK."""
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -10,6 +11,8 @@ import select
 import subprocess
 import stat
 import time
+
+import nonce_usdt as usdt
 
 CHILD_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LC_ALL': 'C'}
 MAX_OUTPUT = 65536
@@ -31,11 +34,28 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def source_hashes():
+def validate_control_kind(control_kind):
+    if type(control_kind) is not str or control_kind not in ('pid-v1', 'usdt-v1'): raise ValueError('control_kind_invalid')
+
+
+def startup_window(deadline, seconds):
+    now = time.monotonic()
+    if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+        raise ValueError('deadline_invalid')
+    outer = min(deadline if deadline is not None else now + seconds + 17, now + seconds + 17)
+    operation = min(now + seconds, outer - 17)
+    if operation <= now: raise TimeoutError()
+    return operation, outer
+
+
+def source_hashes(*, control_kind='pid-v1'):
+    validate_control_kind(control_kind)
     directory = Path(__file__).resolve().parent
-    return {'control_sha256': digest(Path(__file__).read_bytes()),
-            'preflight_sha256': digest((directory / 'panic-source-preflight.py').read_bytes()),
-            'getter_sha256': digest((directory / 'recovery_nvram_panic.py').read_bytes())}
+    result = {'control_sha256': digest(Path(__file__).read_bytes()),
+              'preflight_sha256': digest((directory / 'panic-source-preflight.py').read_bytes()),
+              'getter_sha256': digest((directory / 'recovery_nvram_panic.py').read_bytes())}
+    if control_kind == 'usdt-v1': result['usdt_core_sha256'] = digest(Path(usdt.__file__).read_bytes())
+    return result
 
 
 def load_preflight():
@@ -61,7 +81,7 @@ def once_record(directory, name, data, sync):
 
 
 class PrepareProgress:
-    STAGES = frozenset(('setup', 'build', 'sign', 'verify_signature', 'verify_build', 'observe', 'compile_panic', 'receipt'))
+    STAGES = frozenset(('setup', 'header', 'build', 'sign', 'verify_signature', 'verify_build', 'observe', 'compile_panic', 'receipt'))
     ENUMS = {'list_status': frozenset(('unavailable', 'matched', 'ambiguous', 'missing')),
              'list_stderr': frozenset(('unavailable', 'empty', 'permission', 'attach_failed', 'no_probes', 'compile_failed', 'other')),
              'trace_stderr': frozenset(('unavailable', 'empty', 'permission', 'attach_failed', 'no_probes', 'compile_failed', 'other'))}
@@ -115,16 +135,36 @@ def read_private(path, mode, maximum):
         return data
 
 
-def build(directory, nonce, save, sync):
+def usdt_artifacts(directory, nonce):
+    spec = usdt.ProbeSpec(nonce)
+    provider = read_private(directory / 'provider.d', 0o600, 65536)
+    header = read_private(directory / 'provider.h', 0o600, 65536)
+    if provider != usdt.provider_source(spec): raise ValueError('provider_invalid')
+    usdt.validate_header(header, spec)
+    return {'control_kind': 'usdt-v1', 'provider_source_sha256': digest(provider), 'provider_header_sha256': digest(header)}
+
+
+def build(directory, nonce, save, sync, *, control_kind='pid-v1'):
+    validate_control_kind(control_kind)
     if not isinstance(nonce, str) or not HEX.fullmatch(nonce): raise ValueError('nonce_invalid')
     directory = Path(directory) / 'panic-control'
     os.mkdir(directory, 0o700)
     with PrepareProgress(directory, save, sync, {}, failure_file='build-failure.json') as progress:
         sync(directory.parent)
         p = load_preflight()
-        source = p.helper_source(nonce).encode()
+        source = p.helper_source(nonce, control_kind=control_kind).encode()
         save(directory / 'helper.c', source); sync(directory)
         binary = directory / 'helper'
+        extra = {}
+        if control_kind == 'usdt-v1':
+            progress.stage = 'header'
+            save(directory / 'provider.d', usdt.provider_source(usdt.ProbeSpec(nonce)))
+            save(directory / 'provider.h', b''); sync(directory)
+            code, _ = p.command(['/usr/sbin/dtrace', '-h', '-s', str(directory / 'provider.d'), '-o', str(directory / 'provider.h')], directory, 'header', env=CHILD_ENV)
+            if code: raise ValueError('header_failed')
+            extra = usdt_artifacts(directory, nonce)
+            with (directory / 'provider.h').open('rb') as stream: os.fsync(stream.fileno())
+            sync(directory)
         progress.stage = 'build'
         code, _ = p.command(['/usr/bin/xcrun', 'clang', '-arch', 'x86_64', '-O0', '-Wall', '-Wextra', '-Werror', str(directory / 'helper.c'), '-o', str(binary)], directory, 'build', env=CHILD_ENV)
         if code: raise ValueError('compile_failed')
@@ -138,20 +178,22 @@ def build(directory, nonce, save, sync):
         with binary.open('rb') as stream: os.fsync(stream.fileno())
         sync(directory)
         progress.stage = 'receipt'
-        built = {**source_hashes(), 'helper_source_sha256': digest(source), 'helper_sha256': digest(read_private(binary, 0o700, 16 * 1024 * 1024)),
+        built = {**source_hashes(control_kind=control_kind), **extra, 'helper_source_sha256': digest(source), 'helper_sha256': digest(read_private(binary, 0o700, 16 * 1024 * 1024)),
                  'nonce_sha256': digest(nonce.encode()), 'build_status': 'passed', 'sign_status': 'passed', 'signature_status': 'verified'}
         record(directory, 'built.json', built, save, sync)
         return built
 
 
-def validate_built(directory, nonce):
+def validate_built(directory, nonce, *, control_kind='pid-v1'):
+    validate_control_kind(control_kind)
     if not isinstance(nonce, str) or not HEX.fullmatch(nonce): raise ValueError('nonce_invalid')
     directory = Path(directory) / 'panic-control'
     p = load_preflight()
     source = read_private(directory / 'helper.c', 0o600, 1024 * 1024)
     binary = read_private(directory / 'helper', 0o700, 16 * 1024 * 1024)
     built = json.loads(read_private(directory / 'built.json', 0o600, 65536))
-    expected = {**source_hashes(), 'helper_source_sha256': digest(p.helper_source(nonce).encode()),
+    extra = usdt_artifacts(directory, nonce) if control_kind == 'usdt-v1' else {}
+    expected = {**source_hashes(control_kind=control_kind), **extra, 'helper_source_sha256': digest(p.helper_source(nonce, control_kind=control_kind).encode()),
                 'helper_sha256': digest(binary), 'nonce_sha256': digest(nonce.encode()),
                 'build_status': 'passed', 'sign_status': 'passed', 'signature_status': 'verified'}
     if built != expected or digest(source) != expected['helper_source_sha256']: raise ValueError('built_invalid')
@@ -228,7 +270,9 @@ def capture_timeout(target, directory, *, sync=_sync_directory):
                                                        'elapsed_ms': max(0, int((time.monotonic() - started) * 1000))}, sync)
 
 
-def prepare(directory, nonce, save, sync, *, observe=None, compile_only=None):
+def prepare(directory, nonce, save, sync, *, control_kind='pid-v1', deadline=None, observe=None, compile_only=None):
+    validate_control_kind(control_kind)
+    operation, outer = startup_window(deadline, 40) if control_kind == 'usdt-v1' else (None, None)
     private = Path(directory) / 'panic-control'
     facts = {'list_status': 'unavailable', 'list_exit': None, 'list_stderr': 'unavailable',
              'ready_count': 0, 'hit_count': 0, 'provider_exact': None, 'function_exact': None,
@@ -236,28 +280,35 @@ def prepare(directory, nonce, save, sync, *, observe=None, compile_only=None):
              'trace_stderr': 'unavailable'}
     with PrepareProgress(private, save, sync, facts) as progress:
         progress.stage = 'verify_build'
-        built = validate_built(directory, nonce)
+        built = validate_built(directory, nonce, control_kind=control_kind)
         p = load_preflight()
         observe = p.observe if observe is None else observe
         compile_only = p.compile_panic if compile_only is None else compile_only
         binary = private / 'helper'
         progress.stage = 'observe'
-        on_timeout = lambda child: capture_timeout(child, private, sync=sync)
-        observe(binary, nonce, private, facts, env=CHILD_ENV, on_timeout=on_timeout)
+        def on_timeout(child):
+            if outer is None or outer - time.monotonic() >= 13: capture_timeout(child, private, sync=sync)
+        extra = {'control_kind': control_kind, 'deadline': operation} if control_kind == 'usdt-v1' else {}
+        observe(binary, nonce, private, facts, env=CHILD_ENV, on_timeout=on_timeout, **extra)
         progress.stage = 'compile_panic'
-        if not compile_only(binary, nonce, private, env=CHILD_ENV, on_timeout=on_timeout): raise ValueError('panic_compile_failed')
+        if not compile_only(binary, nonce, private, env=CHILD_ENV, on_timeout=on_timeout, **extra): raise ValueError('panic_compile_failed')
         progress.stage = 'receipt'
         prepared = {key: built[key] for key in ('control_sha256', 'preflight_sha256', 'getter_sha256',
                                                  'helper_source_sha256', 'helper_sha256', 'nonce_sha256')}
+        if control_kind == 'usdt-v1':
+            prepared.update({key: built[key] for key in ('usdt_core_sha256', 'control_kind', 'provider_source_sha256', 'provider_header_sha256')})
         prepared.update(observe_status='passed', compile_status='passed')
         record(private, 'prepared.json', prepared, save, sync)
         return prepared
 
 
-def validate_prepared(directory, nonce, prepared):
+def validate_prepared(directory, nonce, prepared, *, control_kind='pid-v1'):
+    validate_control_kind(control_kind)
     if not isinstance(prepared, dict): raise ValueError('prepared_invalid')
+    if control_kind == 'usdt-v1': validate_built(directory, nonce, control_kind=control_kind)
     directory = Path(directory) / 'panic-control'
-    expected = {**source_hashes(), 'helper_source_sha256': digest(load_preflight().helper_source(nonce).encode()),
+    extra = usdt_artifacts(directory, nonce) if control_kind == 'usdt-v1' else {}
+    expected = {**source_hashes(control_kind=control_kind), **extra, 'helper_source_sha256': digest(load_preflight().helper_source(nonce, control_kind=control_kind).encode()),
                 'helper_sha256': digest((directory / 'helper').read_bytes()), 'nonce_sha256': digest(nonce.encode()),
                 'observe_status': 'passed', 'compile_status': 'passed'}
     if prepared != expected or json.loads((directory / 'prepared.json').read_text()) != prepared:
@@ -411,9 +462,16 @@ def wait_same_children(tracer, helper, directory, *, interval=30, initial_bytes=
             'output_overflow': overflow, 'ownership_faults': faults}
 
 
-def fire(directory, scope, prepared, save, sync, on_ready, current_boot_uuid):
+def close_exited_usdt_input(helper, result):
+    if result['helper_exit'] is not None and result['tracer_exit'] is not None:
+        helper.stdin.close()
+
+
+def fire(directory, scope, prepared, save, sync, on_ready, current_boot_uuid, *, control_kind='pid-v1', deadline=None, start_tracer=subprocess.Popen, run_command=None):
+    validate_control_kind(control_kind)
+    startup, outer = startup_window(deadline, 20) if control_kind == 'usdt-v1' else (None, None)
     validate_scope(scope)
-    binary = validate_prepared(directory, scope['nonce'], prepared)
+    binary = validate_prepared(directory, scope['nonce'], prepared, control_kind=control_kind)
     if current_boot_uuid().upper() != scope['debug_boot_uuid'].upper(): raise ValueError('boot_mismatch')
     private = Path(directory) / 'panic-control'
     once_record(private, 'intent.json', {'scope': scope, 'prepared': prepared}, sync)
@@ -424,15 +482,26 @@ def fire(directory, scope, prepared, save, sync, on_ready, current_boot_uuid):
         try: once_record(private, 'ownership-unknown.json', {'code': 1}, sync)
         except BaseException: pass
     try:
-        helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=CHILD_ENV)
-        probe = 'pid$target::vz_nonce_' + scope['nonce'] + ':entry'
-        program = 'dtrace:::BEGIN { printf("READY\\n"); } ' + probe + ' { panic(); }'
-        tracer = subprocess.Popen(['/usr/sbin/dtrace', '-w', '-q', '-x', 'switchrate=10hz', '-p', str(helper.pid), '-n', program],
+        helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE if control_kind == 'usdt-v1' else subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=CHILD_ENV)
+        if control_kind == 'usdt-v1':
+            p = load_preflight()
+            def on_timeout(child):
+                if outer - time.monotonic() >= 13: capture_timeout(child, private, sync=sync)
+            p.read_helper_ready(helper, startup, on_timeout=on_timeout)
+            probe = p.list_usdt_probe(helper, scope['nonce'], private, 'fire-listing', startup, env=CHILD_ENV, on_timeout=on_timeout,
+                                      run_command=p.command if run_command is None else run_command)
+            argv = p.usdt_command(probe, 'fire')
+            p.remaining(startup)
+        else:
+            probe = 'pid$target::vz_nonce_' + scope['nonce'] + ':entry'
+            program = 'dtrace:::BEGIN { printf("READY\\n"); } ' + probe + ' { panic(); }'
+            argv = ['/usr/sbin/dtrace', '-w', '-q', '-x', 'switchrate=10hz', '-p', str(helper.pid), '-n', program]
+        tracer = start_tracer(argv,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=CHILD_ENV)
         selector = selectors.DefaultSelector()
         selector.register(tracer.stdout, selectors.EVENT_READ, 'stdout')
         selector.register(tracer.stderr, selectors.EVENT_READ, 'stderr')
-        total = 0; data = bytearray(); deadline = time.monotonic() + 20
+        total = 0; data = bytearray(); deadline = startup if control_kind == 'usdt-v1' else time.monotonic() + 20
         try:
             with open_private(private / 'tracer.stdout') as out, open_private(private / 'tracer.stderr') as err:
                 while bytes(data) != b'READY\n':
@@ -459,20 +528,32 @@ def fire(directory, scope, prepared, save, sync, on_ready, current_boot_uuid):
             attempted = True
             once_record(private, 'release-attempt.json', facts, sync)
         def ready_ack(value):
-            return on_ready(value) is True and tracer.poll() is None and helper.poll() is None
-        released = release_after_ack(helper, ready_ack, facts, current_boot_uuid, scope['debug_boot_uuid'], before_write)
+            accepted = on_ready(value) is True and tracer.poll() is None and helper.poll() is None
+            return accepted and (startup is None or time.monotonic() < startup)
+        def fresh_boot():
+            current = current_boot_uuid()
+            return current if startup is None or time.monotonic() < startup else ''
+        released = release_after_ack(helper, ready_ack, facts, fresh_boot, scope['debug_boot_uuid'], before_write)
         if released == 'not_released': return {'phase': 'not_released', 'release_status': released}
         attempted = True
         if released == 'unknown': note_unknown(1)
         result = wait_same_children(tracer, helper, private, initial_bytes=total, on_fault=note_unknown)
+        if control_kind == 'usdt-v1': close_exited_usdt_input(helper, result)
         return {'phase': 'returned' if released == 'released' and not result['output_overflow'] and not result['ownership_faults'] else 'unknown',
                 'release_status': released, **result}
-    except BaseException:
-        if not attempted: raise
+    except BaseException as error:
+        if not attempted:
+            if control_kind == 'usdt-v1' and isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+                target = tracer if tracer is not None else helper
+                if target is not None:
+                    try: on_timeout(target)
+                    except BaseException: pass
+            raise
         note_unknown(1)
         while True:
             try:
                 result = wait_same_children(tracer, helper, private, initial_bytes=total, on_fault=note_unknown)
+                if control_kind == 'usdt-v1': close_exited_usdt_input(helper, result)
                 return {'phase': 'unknown', 'release_status': 'unknown', **result}
             except BaseException:
                 note_unknown(1)
@@ -483,3 +564,6 @@ def fire(directory, scope, prepared, save, sync, on_ready, current_boot_uuid):
                     child.kill()
                     try: child.wait(timeout=2)
                     except subprocess.TimeoutExpired: pass
+                if control_kind == 'usdt-v1' and child is not None:
+                    for stream in (child.stdin, child.stdout, child.stderr):
+                        if stream is not None: stream.close()

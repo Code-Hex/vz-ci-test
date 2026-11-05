@@ -45,7 +45,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
-              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "netdump-prime", "panic-nonce-netdump") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "netdump-prime", "panic-nonce-netdump") and
               (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
@@ -66,7 +66,11 @@ def panic_mode(ctx):
 
 
 def panic_followup(ctx):
-    return ctx.get("after_debug_boot", "none") in ("panic-nonce", "panic-nonce-nvram-off")
+    return ctx.get("after_debug_boot", "none") in ("panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt")
+
+
+def panic_control_kind(ctx):
+    return 'usdt-v1' if ctx.get('after_debug_boot') == 'panic-nonce-usdt' else 'pid-v1'
 
 
 def nvram_off_control(ctx):
@@ -654,7 +658,8 @@ def prepare_root(payload):
         plan = recovery_netdump.discover(netdump_context(ctx), token, cert, nonce, main_path=__file__,
                                          purpose=netdump_mode(ctx), baseline=baseline_fact)
     if panic_followup(ctx) or netdump_capture(ctx):
-        recovery_panic_control.build(directory, nonce, private_write, sync_directory)
+        recovery_panic_control.build(directory, nonce, private_write, sync_directory,
+                                     control_kind=panic_control_kind(ctx))
     if panic_followup(ctx):
         baseline_status, baseline_raw = recovery_nvram_panic.read_panic_info()
         marker = {"binding": binding(ctx), "nonce": nonce, "baseline": baseline, "source_identity": debug_source_identity()}
@@ -1809,7 +1814,8 @@ def runtime_watch(directory):
         if boot_uuid() != saved['scope']['debug_boot_uuid']:
             raise ValueError('runtime watch boot changed')
         prepared = json.loads(recovery_panic_control.read_private(directory / 'panic-control' / 'prepared.json', 0o600, 8192))
-        recovery_panic_control.validate_prepared(directory, config['nonce'], prepared)
+        recovery_panic_control.validate_prepared(directory, config['nonce'], prepared,
+                                                 control_kind=panic_control_kind(config['context']))
         identity = runtime_watch_identity(config, saved['scope'], prepared['helper_sha256'])
         launch = json.loads(recovery_panic_control.read_private(directory / 'runtime-watch-launch.json', 0o600, 4096))
         if launch != identity or runtime_watch_stage(directory, identity, observation) != observation:
@@ -1852,7 +1858,7 @@ def runtime_watch(directory):
         signal.signal(signal.SIGALRM, previous)
 
 
-def followup_start(directory, config, current, facts, token):
+def followup_start(directory, config, current, facts, token, *, deadline=None):
     require_root_writer(directory, config)
     if config["debug_source_identity"] != debug_source_identity():
         raise ValueError("followup source identity mismatch")
@@ -1864,10 +1870,14 @@ def followup_start(directory, config, current, facts, token):
     private_write(directory / "panic-followup-debug.json", json.dumps(saved).encode())
     sync_directory(directory)
     handoff_started, capture_intent = False, None
+    control_kind = panic_control_kind(config['context'])
+    if control_kind == 'usdt-v1' and deadline is None:
+        deadline = time.monotonic() + 180
     try:
         if nvram_off_control(config["context"]) and not nvram_off_control_proven(facts):
             raise ValueError("NVRAM logging control not proven")
-        prepared = recovery_panic_control.prepare(directory, config["nonce"], private_write, sync_directory)
+        prepared = recovery_panic_control.prepare(directory, config["nonce"], private_write, sync_directory,
+                                                  control_kind=control_kind, deadline=deadline)
         publish_followup(directory, config, token, followup_summary(config, "panic_prepared", current, saved, prepared=prepared),
                          "Nonce panic control prepared")
         watch = start_runtime_watch(directory, config, scope, prepared)
@@ -1904,13 +1914,18 @@ def followup_start(directory, config, current, facts, token):
             else:
                 publish_followup(directory, config, token, summary, 'Nonce panic intent durable')
             return boot_uuid() == current and runtime_watch_alive(watch, minimum=30)
-        returned = recovery_panic_control.fire(directory, scope, prepared, private_write, sync_directory, on_ready, boot_uuid)
+        fire_deadline = min(deadline, watch['deadline_monotonic'] - 30) if control_kind == 'usdt-v1' else None
+        returned = recovery_panic_control.fire(directory, scope, prepared, private_write, sync_directory, on_ready, boot_uuid,
+                                               control_kind=control_kind, deadline=fire_deadline)
         failure = {"status": "returned", "result": safe_fire_return(returned) if netdump_capture(config['context']) else returned}
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, urllib.error.URLError) as error:
         failure = {"status": "failed", "kind": type(error).__name__}
     private_write(directory / "panic-followup-returned.json", json.dumps({"scope": scope, **failure}).encode())
     sync_directory(directory)
-    names = tuple(label + "." + channel for label in ("build", "sign", "listing", "trace", "panic-compile", "tracer") for channel in ("stdout", "stderr")) + ("prepare-failure.json", "timeout-ps.stdout", "timeout-ps.stderr", "timeout-spindump.stdout", "timeout-spindump.stderr", "timeout-diagnostic.json", "watch-ready.json", "watch.stderr")
+    labels = ("build", "sign", "listing", "trace", "panic-compile", "tracer")
+    if control_kind == 'usdt-v1':
+        labels += ('header', 'compile-listing', 'fire-listing')
+    names = tuple(label + "." + channel for label in labels for channel in ("stdout", "stderr")) + ("prepare-failure.json", "timeout-ps.stdout", "timeout-ps.stderr", "timeout-spindump.stdout", "timeout-spindump.stderr", "timeout-diagnostic.json", "watch-ready.json", "watch.stderr")
     failure["files"] = {name: {"exists": (directory / "panic-control" / name).exists(),
                               "bytes": (directory / "panic-control" / name).stat().st_size if (directory / "panic-control" / name).exists() else None}
                         for name in names}
@@ -1950,6 +1965,14 @@ def followup_start(directory, config, current, facts, token):
     complete_recovery(directory, config, current, token, output, False, time.monotonic() + 60)
 
 
+def classify_followup(raw, config, trigger):
+    if raw is None:
+        return {"status": "unavailable", "freshness": "unverified", "completeness": "unknown", "encoding": None}
+    if panic_control_kind(config['context']) == 'usdt-v1':
+        return recovery_nvram_panic.classify_usdt(raw, config['nonce'], trigger['helper_pid'])
+    return recovery_nvram_panic.classify(raw, config['nonce'])
+
+
 def followup_finish(directory, config, current, saved, token):
     scope = saved["scope"]
     boots = [scope["baseline"], scope["debug_boot_uuid"], current]
@@ -1960,7 +1983,8 @@ def followup_finish(directory, config, current, saved, token):
     release = json.loads((directory / "panic-control" / "release-attempt.json").read_text())
     if trigger != release or trigger.get("scope") != scope or intent.get("scope") != scope:
         raise ValueError("followup release evidence invalid")
-    recovery_panic_control.validate_prepared(directory, config["nonce"], intent.get("prepared"))
+    recovery_panic_control.validate_prepared(directory, config["nonce"], intent.get("prepared"),
+                                             control_kind=panic_control_kind(config['context']))
     if trigger.get("helper_sha256") != intent["prepared"]["helper_sha256"]:
         raise ValueError("followup helper mismatch")
     observation = directory / "panic-followup-observation.json"
@@ -1979,13 +2003,15 @@ def followup_finish(directory, config, current, saved, token):
             private_write(directory / "panic-followup-raw", raw)
         private_write(observation, json.dumps(capture).encode())
         sync_directory(directory)
-    classification = recovery_nvram_panic.classify(raw, config["nonce"]) if raw is not None else {
-        "status": "unavailable", "freshness": "unverified", "completeness": "unknown", "encoding": None}
+    classification = classify_followup(raw, config, trigger)
     envelope = None
     if raw:
         metadata = {"binding": binding(config["context"]), "nonce": config["nonce"], "kernel_uuid": KERNEL_UUID,
                     "baseline_boot_uuid": config["baseline"], "debug_boot_uuid": scope["debug_boot_uuid"],
                     "current_boot_uuid": current, "source_identity": config["debug_source_identity"], "classification": classification}
+        if panic_control_kind(config['context']) == 'usdt-v1':
+            metadata.update(after_debug_boot='panic-nonce-usdt', control_kind='usdt-v1',
+                            helper_pid=trigger['helper_pid'], helper_sha256=trigger['helper_sha256'])
         envelope = recovery_reports.encrypt_bundle((directory / "report-cert.pem").read_bytes(), metadata, raw)
         if envelope["cert_fingerprint"] != config["cert_fingerprint"]:
             raise ValueError("followup certificate mismatch")
@@ -2106,7 +2132,7 @@ def collect(directory):
         except (OSError, ValueError, urllib.error.URLError):
             return
         if panic_followup(config["context"]):
-            followup_start(directory, config, current, debug_facts, token)
+            followup_start(directory, config, current, debug_facts, token, deadline=deadline)
             return
         if netdump_mode(config['context']):
             debug_facts['netdump_prime'] = run_netdump_prime_once(directory, config, current, debug_facts, token, deadline)

@@ -49,6 +49,7 @@ on:
           - none
           - panic-nonce
           - panic-nonce-nvram-off
+          - panic-nonce-usdt
           - netdump-prime
           - panic-nonce-netdump
         default: none

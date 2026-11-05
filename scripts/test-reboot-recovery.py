@@ -15,6 +15,37 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def test_usdt_followup_is_local_and_uses_a_closed_control_kind(self):
+        ctx = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
+               'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,
+               'trigger': 'reboot-quick', 'debug_boot': True, 'debug_source': 'bootplist', 'after_debug_boot': 'panic-nonce-usdt'}
+        self.assertTrue(r.valid_context(ctx, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        self.assertTrue(r.panic_followup(ctx))
+        self.assertTrue(r.report_required(ctx))
+        self.assertTrue(r.certificate_required(ctx))
+        self.assertIsNone(r.netdump_mode(ctx))
+        self.assertEqual(r.expected_debug_mask(ctx), 0x102000)
+        self.assertEqual(r.panic_control_kind(ctx), 'usdt-v1')
+        for mode in ('none', 'panic-nonce', 'panic-nonce-nvram-off', 'netdump-prime', 'panic-nonce-netdump'):
+            self.assertEqual(r.panic_control_kind({**ctx, 'after_debug_boot': mode}), 'pid-v1')
+        for change in ({'trigger': 'reboot'}, {'debug_boot': False}, {'debug_source': 'nvram'}):
+            self.assertFalse(r.valid_context({**ctx, **change}, 'Darwin', 'x86_64', r.KERNEL_UUID))
+
+    def test_followup_classifier_binds_usdt_to_the_actual_trigger_pid(self):
+        config = {'nonce': 'd' * 64, 'context': {'after_debug_boot': 'panic-nonce-usdt'}}
+        suffix = (' (ecb 0x1)\nKernel UUID: ' + r.KERNEL_UUID + '\n\0').encode()
+        usdt = ('panic(cpu 0 caller 0x1): dtrace: panic action at probe vzobsddddddddddddddddp123:helper:vz_nonce_' +
+                'd' * 64 + ':observe').encode() + suffix
+        pid = ('panic(cpu 0 caller 0x1): dtrace: panic action at probe pid123:helper:vz_nonce_' +
+               'd' * 64 + ':entry').encode() + suffix
+        trigger = {'helper_pid': 123}
+        self.assertEqual(r.classify_followup(usdt, config, trigger)['freshness'], 'verified')
+        self.assertEqual(r.classify_followup(usdt, config, {'helper_pid': 124})['freshness'], 'unverified')
+        self.assertEqual(r.classify_followup(pid, config, trigger)['freshness'], 'unverified')
+        config['context']['after_debug_boot'] = 'panic-nonce'
+        self.assertEqual(r.classify_followup(pid, config, trigger)['freshness'], 'verified')
+        self.assertEqual(r.classify_followup(usdt, config, trigger)['freshness'], 'unverified')
+
     def capture_fixture(self):
         config, saved, b3 = self.followup_fixture()
         ctx = config['context']
@@ -184,7 +215,7 @@ class Recovery(unittest.TestCase):
                 current = saved['scope']['debug_boot_uuid']
                 r.private_write(directory / 'report-cert.pem', b'public certificate fixture')
                 root_phases, fire_status, releases = [], {}, []
-                def prepare(*_args):
+                def prepare(*_args, **_kwargs):
                     (directory / 'panic-control').mkdir()
                     return prepared
                 def api(method, url, _token, payload=None, **_kwargs):
@@ -218,7 +249,7 @@ class Recovery(unittest.TestCase):
                         r.recovery_netdump.digest(intent), intent['panic_trigger'])
                     return r.recovery_netdump_capture.make_armed(scope, prime_proof_sha256=r.recovery_netdump.digest(proof),
                         offer_digest=r.recovery_netdump.digest(proof['offer']), peer=proof['host_plan']['intel_public_endpoint'], receiver_check_id=13)
-                def fire(_directory, scope, _prepared, _save, _sync, ready, _boot):
+                def fire(_directory, scope, _prepared, _save, _sync, ready, _boot, **_kwargs):
                     trigger = {'scope': scope, 'helper_sha256': prepared['helper_sha256'], 'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
                     if ready(trigger): releases.append('G')
                     return {'phase': 'returned', 'release_status': 'released', 'raw': 'private_return_must_not_leak'}
@@ -241,7 +272,7 @@ class Recovery(unittest.TestCase):
         config, saved, _intent, _check, _pending, _prepared = self.capture_fixture()
         with tempfile.TemporaryDirectory() as tmp:
             directory, events = Path(tmp), []
-            def fail(*_args): raise TimeoutError('prepare_failed')
+            def fail(*_args, **_kwargs): raise TimeoutError('prepare_failed')
             def complete(_directory, _config, _current, _token, output, successful, _deadline):
                 r.require_root_writer(directory, config)
                 self.assertFalse(successful)
@@ -547,7 +578,7 @@ class Recovery(unittest.TestCase):
             directory = Path(tmp)
             config, saved, _b3 = self.followup_fixture()
             events = []
-            def prepare(*_args):
+            def prepare(*_args, **_kwargs):
                 (directory / 'panic-control').mkdir()
                 return {'helper_sha256': 'f' * 64}
             def unavailable(*_args):
@@ -567,7 +598,7 @@ class Recovery(unittest.TestCase):
             directory = Path(tmp)
             config, saved, _b3 = self.followup_fixture()
             events = []
-            def prepare(*_args):
+            def prepare(*_args, **_kwargs):
                 (directory / 'panic-control').mkdir()
                 return {'helper_sha256': 'f' * 64}
             def publish(_d, _c, _t, summary, _title):
@@ -575,7 +606,7 @@ class Recovery(unittest.TestCase):
             def alive(_watch, minimum=60):
                 self.assertIn(minimum, (60, 30))
                 return 'panic_intent' not in events
-            def fire(_d, scope, prepared, _save, _sync, on_ready, _boot):
+            def fire(_d, scope, prepared, _save, _sync, on_ready, _boot, **_kwargs):
                 trigger = {'scope': scope, 'helper_sha256': prepared['helper_sha256'],
                            'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
                 self.assertFalse(on_ready(trigger))
@@ -644,7 +675,7 @@ class Recovery(unittest.TestCase):
                     patch.object(r, 'observe_boot_argument_profile', lambda: {'status': 'unavailable'}), \
                     patch.object(r.recovery_bootargs.MacPlatform, 'active', lambda _: 'alpha=1 nvram_paniclog=0 debug=0x102000'), \
                     patch.object(r, 'private_write', write), patch.object(r.recovery_bootplist, 'finish', finish), \
-                    patch.object(r, 'publish_debug_core', core), patch.object(r, 'followup_start', lambda *_: events.append('followup')):
+                    patch.object(r, 'publish_debug_core', core), patch.object(r, 'followup_start', lambda *_, **_kwargs: events.append('followup')):
                 r.collect(directory)
             self.assertEqual(events, ['restore', 'ack', 'followup'])
 
@@ -1203,7 +1234,7 @@ class Recovery(unittest.TestCase):
             config, saved, _b3 = self.followup_fixture()
             events = []
             r.private_write(directory / "report-cert.pem", b"public certificate boundary")
-            def prepare(*_args):
+            def prepare(*_args, **_kwargs):
                 self.assertEqual(r.read_followup_debug(directory, config), saved)
                 events.append("prepare")
                 (directory / "panic-control").mkdir()
@@ -1213,7 +1244,7 @@ class Recovery(unittest.TestCase):
                 events.append(summary["phase"])
                 if summary["phase"] == "panic_intent":
                     self.assertTrue((directory / "panic-followup-trigger.json").exists())
-            def fire(_directory, scope, prepared, _save, _sync, ready, _boot):
+            def fire(_directory, scope, prepared, _save, _sync, ready, _boot, **_kwargs):
                 trigger = {"scope": scope, "helper_sha256": prepared["helper_sha256"], "helper_pid": 123, "tracer_pid": 456, "ready": True}
                 self.assertTrue(ready(trigger))
                 events.append("release")
@@ -1288,11 +1319,11 @@ class Recovery(unittest.TestCase):
                     self.assertEqual(successful, matching)
                     self.assertNotIn("dtrace: panic action", r.json.dumps(output))
                     outputs.append(output)
-                with patch.object(r.recovery_panic_control, "validate_prepared", lambda *_: directory / "helper"), \
+                with patch.object(r.recovery_panic_control, "validate_prepared", lambda *_, **_kwargs: directory / "helper"), \
                         patch.object(r.recovery_nvram_panic, "read_panic_info", lambda: ("observed", raw)), \
                         patch.object(r.recovery_reports, "encrypt_bundle", encrypt), patch.object(r, "complete_recovery", complete):
                     r.followup_finish(directory, config, b3, saved, "token")
-                with patch.object(r.recovery_panic_control, "validate_prepared", lambda *_: directory / "helper"), \
+                with patch.object(r.recovery_panic_control, "validate_prepared", lambda *_, **_kwargs: directory / "helper"), \
                         patch.object(r.recovery_nvram_panic, "read_panic_info", lambda: self.fail("reread first observation")), \
                         patch.object(r.recovery_reports, "encrypt_bundle", encrypt), patch.object(r, "complete_recovery", complete):
                     r.followup_finish(directory, config, b3, saved, "token")

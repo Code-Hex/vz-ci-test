@@ -2,6 +2,8 @@
 import ctypes
 import re
 
+from nonce_usdt import ProbeSpec
+
 MAX_RAW = 16 * 768
 KERNEL_UUID = '87453B1D-A163-31FA-B33B-0FB4BE78E6E8'
 HEADER = re.compile(rb'^panic\(cpu [0-9]+(?: caller (?:0x)?[0-9a-fA-F]+)?\): dtrace: panic action at probe pid[1-9][0-9]*:[^:\r\n]+:vz_nonce_([0-9a-f]{64}):entry \(ecb (?:0x)?[0-9a-fA-F]+\)(?:\r?\n|$)')
@@ -23,9 +25,13 @@ def unpack_a(raw):
 def classify_candidates(candidates, nonce):
     if not isinstance(nonce, str) or not re.fullmatch(r'[0-9a-f]{64}', nonce):
         raise ValueError('invalid nonce')
+    return _classify_candidates(candidates, nonce, HEADER)
+
+
+def _classify_candidates(candidates, expected, header):
     recognized = []
     for encoding, data in candidates:
-        match = HEADER.match(data)
+        match = header.match(data)
         if not match:
             if data.startswith(b'panic(') and b'\0' not in data:
                 recognized.append({'status': 'truncated', 'encoding': encoding, 'terminator_present': False})
@@ -35,7 +41,7 @@ def classify_candidates(candidates, nonce):
         uuids = UUID.findall(text + (b'\n' if end >= 0 else b''))
         if len(PANIC_PREFIX.findall(data)) != 1 or len(UUID_PREFIX.findall(data)) > 1:
             status = 'ambiguous'
-        elif match.group(1).decode('ascii') != nonce:
+        elif match.group(1).decode('ascii') != expected:
             status = 'nonce_missing'
         elif not uuids:
             status = 'uuid_missing'
@@ -58,6 +64,18 @@ def classify_candidates(candidates, nonce):
 def classify(raw, nonce):
     if not isinstance(nonce, str) or not re.fullmatch(r'[0-9a-f]{64}', nonce):
         raise ValueError('invalid nonce')
+    return _classify(raw, nonce, HEADER)
+
+
+def classify_usdt(raw, nonce, helper_pid):
+    probe = ProbeSpec(nonce).bind(helper_pid)
+    selector = probe.selector.encode('ascii')
+    header = re.compile(rb'^panic\(cpu [0-9]+(?: caller (?:0x)?[0-9a-fA-F]+)?\): dtrace: panic action at probe (' +
+                        re.escape(selector) + rb') \(ecb (?:0x)?[0-9a-fA-F]+\)(?:\r?\n|$)')
+    return _classify(raw, probe.selector, header)
+
+
+def _classify(raw, expected, header):
     if not isinstance(raw, bytes):
         raise TypeError('raw must be bytes')
     if not raw or len(raw) > MAX_RAW:
@@ -68,7 +86,7 @@ def classify(raw, nonce):
     packed_length = len(raw) - len(raw) % 7
     if packed_length:
         candidates.append(('packA', unpack_a(raw[:packed_length])))
-    result = classify_candidates(candidates, nonce)
+    result = _classify_candidates(candidates, expected, header)
     if result['encoding'] == 'packA':
         result['packed_tail_bytes'] = len(raw) % 7
     return result

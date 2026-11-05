@@ -13,12 +13,26 @@ import sys
 import time
 
 import recovery_nvram_panic
+import nonce_usdt as usdt
 
 UUID = '87453B1D-A163-31FA-B33B-0FB4BE78E6E8'
 LIMIT = 65536
 
 
-def helper_source(nonce):
+def validate_control_kind(control_kind):
+    if type(control_kind) is not str or control_kind not in ('pid-v1', 'usdt-v1'): raise ValueError('control_kind_invalid')
+
+
+def helper_source(nonce, *, control_kind='pid-v1'):
+    validate_control_kind(control_kind)
+    if control_kind == 'usdt-v1':
+        spec = usdt.ProbeSpec(nonce)
+        return ('#include "provider.h"\n#include <unistd.h>\n#include <stdio.h>\n#include <errno.h>\n' +
+                usdt.function_source(spec).decode('ascii') +
+                'int main(void) { char c; ssize_t n; setvbuf(stdout, NULL, _IONBF, 0); '
+                'printf("HELPER_READY %ld\\n", (long)getpid()); '
+                'do { n = read(STDIN_FILENO, &c, 1); } while (n < 0 && errno == EINTR); '
+                "if (n != 1 || c != 'G') return 1; " + spec.function + '(); return 0; }\n')
     if not re.fullmatch(r'[0-9a-f]{64}', nonce): raise ValueError('invalid_nonce')
     return ('#include <unistd.h>\n'
             '__attribute__((noinline,used,visibility("default"))) void vz_nonce_' + nonce + '(void) { __asm__ volatile(""); }\n'
@@ -133,6 +147,144 @@ def command(argv, directory, label, timeout=15, *, env=None, on_timeout=None):
                 except subprocess.TimeoutExpired: pass
 
 
+def remaining(deadline):
+    left = deadline - time.monotonic()
+    if left <= 0: raise TimeoutError()
+    return left
+
+
+def read_helper_ready(helper, deadline, *, on_timeout=None):
+    expected = ('HELPER_READY ' + str(helper.pid) + '\n').encode()
+    data = bytearray()
+    selector = selectors.DefaultSelector()
+    selector.register(helper.stdout, selectors.EVENT_READ)
+    try:
+        while bytes(data) != expected:
+            events = selector.select(remaining(deadline))
+            if not events: raise TimeoutError()
+            part = os.read(helper.stdout.fileno(), len(expected) + 1 - len(data))
+            if not part: raise ValueError('helper_early_exit')
+            data.extend(part)
+            if not expected.startswith(bytes(data)): raise ValueError('helper_ready_invalid')
+        if helper.poll() is not None: raise ValueError('helper_early_exit')
+    except (TimeoutError, subprocess.TimeoutExpired):
+        notify_timeout(on_timeout, helper)
+        raise
+    finally: selector.close()
+
+
+def usdt_command(probe, phase):
+    if type(probe) is not usdt.ProbeIdentity or phase not in ('observe', 'compile', 'fire'):
+        raise ValueError('invalid_usdt_probe')
+    clause = probe.selector + probe.predicate
+    if phase == 'compile': return ['/usr/sbin/dtrace', '-w', '-e', '-n', clause + '{ panic(); }']
+    program = 'dtrace:::BEGIN { printf("READY\\n"); } ' + clause
+    if phase == 'fire':
+        return ['/usr/sbin/dtrace', '-w', '-q', '-x', 'switchrate=10hz', '-n', program + '{ panic(); }']
+    program += '{ printf("HIT %d %s %s %s %s %016llx\\n", pid, probeprov, probemod, probefunc, probename, arg0); exit(0); }'
+    return ['/usr/sbin/dtrace', '-q', '-x', 'switchrate=10hz', '-n', program]
+
+
+def list_usdt_probe(helper, nonce, directory, label, deadline, *, env=None, on_timeout=None, facts=None, run_command=command):
+    probe = usdt.ProbeSpec(nonce).bind(helper.pid)
+    code, raw = run_command(['/usr/sbin/dtrace', '-l', '-n', probe.selector], directory, label,
+                        remaining(deadline), env=env, on_timeout=on_timeout)
+    if facts is not None:
+        facts.update(list_exit=code, list_stderr=stderr_kind((directory / (label + '.stderr')).read_bytes()))
+    if code: raise ValueError('probe_unavailable')
+    usdt.parse_listing(raw, probe)
+    if helper.poll() is not None: raise ValueError('helper_early_exit')
+    if facts is not None: facts['list_status'] = 'matched'
+    return probe
+
+
+def _reap_usdt(child):
+    if child is None: return
+    try:
+        if child.poll() is None: child.kill()
+        child.wait(timeout=2)
+    finally:
+        for stream in (child.stdin, child.stdout, child.stderr):
+            if stream is not None: stream.close()
+
+
+def _observe_usdt(binary, nonce, directory, facts, *, env=None, on_timeout=None, deadline=None, run_command=command, start_tracer=subprocess.Popen):
+    deadline = min(deadline if deadline is not None else float('inf'), time.monotonic() + 20)
+    remaining(deadline)
+    helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+    tracer = None
+    data = bytearray(); err_data = bytearray(); released = False
+    try:
+        read_helper_ready(helper, deadline, on_timeout=on_timeout)
+        probe = list_usdt_probe(helper, nonce, directory, 'listing', deadline, env=env, on_timeout=on_timeout, facts=facts, run_command=run_command)
+        with open_private(directory / 'trace.stdout') as log, open_private(directory / 'trace.stderr') as errors:
+            remaining(deadline)
+            tracer = start_tracer(usdt_command(probe, 'observe'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            selector = selectors.DefaultSelector()
+            selector.register(tracer.stdout, selectors.EVENT_READ, log)
+            selector.register(tracer.stderr, selectors.EVENT_READ, errors)
+            total = 0
+            try:
+                while selector.get_map():
+                    events = selector.select(remaining(deadline))
+                    if not events: raise TimeoutError()
+                    for key, _ in events:
+                        part = os.read(key.fd, 4096)
+                        if not part:
+                            selector.unregister(key.fileobj); continue
+                        total += len(part)
+                        if total > LIMIT: raise ValueError('output_limit')
+                        key.data.write(part); key.data.flush()
+                        if key.fileobj is tracer.stdout: data.extend(part)
+                        else: err_data.extend(part)
+                        if not released and key.fileobj is tracer.stdout:
+                            if not b'READY\n'.startswith(bytes(data)): raise ValueError('ready_invalid')
+                            if bytes(data) == b'READY\n':
+                                if tracer.poll() is not None or helper.poll() is not None: raise ValueError('child_early_exit')
+                                if os.write(helper.stdin.fileno(), b'G') != 1: raise ValueError('release_invalid')
+                                released = True
+                                helper.stdin.close()
+                tracer_code = tracer.wait(timeout=remaining(deadline))
+                helper_code = helper.wait(timeout=remaining(deadline))
+                if not released or tracer_code != 0 or helper_code != 0: raise ValueError('probe_not_observed')
+                lines = bytes(data).splitlines(keepends=True)
+                if len(lines) != 3 or lines[0] != b'READY\n' or lines[2] != b'\n': raise ValueError('probe_not_observed')
+                usdt.parse_hit(lines[1], probe)
+                facts.update(provider_exact=True, function_exact=True, name_exact=True)
+            except (TimeoutError, subprocess.TimeoutExpired):
+                notify_timeout(on_timeout, tracer)
+                raise
+            finally: selector.close()
+        return True
+    finally:
+        facts.update(ready_count=bytes(data).splitlines().count(b'READY'),
+                     hit_count=sum(line.startswith(b'HIT ') for line in bytes(data).splitlines()), released=released,
+                     tracer_exit=tracer.poll() if tracer is not None else None, helper_exit=helper.poll(), trace_stderr=stderr_kind(bytes(err_data)))
+        failed = sys.exc_info()[0] is not None
+        cleanup_error = None
+        for child in (tracer, helper):
+            try: _reap_usdt(child)
+            except (OSError, subprocess.SubprocessError) as error: cleanup_error = error
+        if cleanup_error is not None and not failed: raise cleanup_error
+
+
+def _compile_usdt(binary, nonce, directory, *, env=None, on_timeout=None, deadline=None, run_command=command):
+    deadline = min(deadline if deadline is not None else float('inf'), time.monotonic() + 20)
+    remaining(deadline)
+    helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+    try:
+        read_helper_ready(helper, deadline, on_timeout=on_timeout)
+        probe = list_usdt_probe(helper, nonce, directory, 'compile-listing', deadline, env=env, on_timeout=on_timeout, run_command=run_command)
+        code, _ = run_command(usdt_command(probe, 'compile'), directory, 'panic-compile', remaining(deadline), env=env, on_timeout=on_timeout)
+        if helper.poll() is not None: raise ValueError('helper_early_exit')
+        return code == 0
+    finally:
+        failed = sys.exc_info()[0] is not None
+        try: _reap_usdt(helper)
+        except (OSError, subprocess.SubprocessError):
+            if not failed: raise
+
+
 def guard(directory):
     env = os.environ
     expected = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': 'Code-Hex/vz-ci-test',
@@ -151,7 +303,9 @@ def guard(directory):
     return True
 
 
-def observe(binary, nonce, directory, facts, *, env=None, on_timeout=None):
+def observe(binary, nonce, directory, facts, *, env=None, on_timeout=None, control_kind='pid-v1', deadline=None):
+    validate_control_kind(control_kind)
+    if control_kind == 'usdt-v1': return _observe_usdt(binary, nonce, directory, facts, env=env, on_timeout=on_timeout, deadline=deadline)
     name = 'vz_nonce_' + nonce
     helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     tracer = None
@@ -204,7 +358,9 @@ def observe(binary, nonce, directory, facts, *, env=None, on_timeout=None):
                 except subprocess.TimeoutExpired: pass
 
 
-def compile_panic(binary, nonce, directory, *, env=None, on_timeout=None):
+def compile_panic(binary, nonce, directory, *, env=None, on_timeout=None, control_kind='pid-v1', deadline=None):
+    validate_control_kind(control_kind)
+    if control_kind == 'usdt-v1': return _compile_usdt(binary, nonce, directory, env=env, on_timeout=on_timeout, deadline=deadline)
     helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     try:
         code, _ = command(['/usr/sbin/dtrace', '-w', '-e', '-p', str(helper.pid), '-n', probe_script(nonce, True)], directory, 'panic-compile', env=env, on_timeout=on_timeout)

@@ -3,6 +3,11 @@ from pathlib import Path
 import unittest
 import tempfile
 import sys
+import os
+import subprocess
+import time
+
+import nonce_usdt as usdt
 
 spec = importlib.util.spec_from_file_location('preflight', Path(__file__).with_name('panic-source-preflight.py'))
 p = importlib.util.module_from_spec(spec)
@@ -10,6 +15,96 @@ spec.loader.exec_module(p)
 
 
 class Preflight(unittest.TestCase):
+    def test_usdt_g_wrapper_uses_shared_fullnonce_and_prints_owned_ready(self):
+        spec = usdt.ProbeSpec('a' * 64)
+        source = p.helper_source(spec.nonce, control_kind='usdt-v1')
+        self.assertEqual(source.count(usdt.function_source(spec).decode()), 1)
+        self.assertIn('HELPER_READY %ld\\n', source)
+        self.assertIn("c != 'G'", source)
+        self.assertNotIn("c != 'O'", source)
+        with self.assertRaises(ValueError): p.helper_source(spec.nonce, control_kind='unknown')
+
+    def test_usdt_commands_bind_exact_owned_probe_without_attach(self):
+        probe = usdt.ProbeSpec('a' * 64).bind(123)
+        self.assertEqual(p.usdt_command(probe, 'compile'), ['/usr/sbin/dtrace', '-w', '-e', '-n', probe.selector + probe.predicate + '{ panic(); }'])
+        actual = p.usdt_command(probe, 'fire')
+        self.assertEqual(actual[:6], ['/usr/sbin/dtrace', '-w', '-q', '-x', 'switchrate=10hz', '-n'])
+        self.assertIn(probe.selector + probe.predicate + '{ panic(); }', actual[-1])
+        safe = p.usdt_command(probe, 'observe')
+        self.assertNotIn('-w', safe)
+        self.assertNotIn('panic()', safe[-1])
+        for command in (actual, safe, p.usdt_command(probe, 'compile')):
+            for flag in ('-p', '-c', '-W', '-Z', '-a'): self.assertNotIn(flag, command)
+        with self.assertRaises(ValueError): p.usdt_command(probe, 'arbitrary')
+
+    def test_native_owned_helper_ready_is_exact_and_bounded(self):
+        programs = ('import os,sys; print("HELPER_READY "+str(os.getpid()),flush=True); sys.stdin.read(1)',
+                    'import sys; print("HELPER_READY 1",flush=True); sys.stdin.read(1)',
+                    'import time; time.sleep(10)')
+        for index, program in enumerate(programs):
+            child = subprocess.Popen([sys.executable, '-c', program], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            try:
+                if index == 0: p.read_helper_ready(child, time.monotonic()+1)
+                else:
+                    with self.assertRaises(ValueError if index == 1 else TimeoutError):
+                        p.read_helper_ready(child, time.monotonic()+.05)
+                self.assertIsNone(child.poll())
+            finally:
+                child.kill(); child.wait(timeout=2); child.stdin.close(); child.stdout.close()
+
+    def test_usdt_compile_fixture_failure_never_sends_g_and_reaps_ready_helper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); helper=root/'helper'; pidfile=root/'pid'; received=root/'received'
+            helper.write_text('#!'+sys.executable+'\nimport os,sys\nfrom pathlib import Path\n'
+                'Path('+repr(str(pidfile))+').write_text(str(os.getpid()))\n'
+                'print("HELPER_READY "+str(os.getpid()),flush=True)\n'
+                'value=sys.stdin.buffer.read(1)\nPath('+repr(str(received))+').write_bytes(value)\n')
+            helper.chmod(0o700)
+            phases=[]
+            def run_command(argv, directory, label, timeout, **kwargs):
+                phases.append(label)
+                probe=usdt.ProbeSpec('a'*64).bind(int(pidfile.read_text()))
+                if label=='compile-listing':
+                    program='print('+repr('ID PROVIDER MODULE FUNCTION NAME\n1 '+' '.join(probe.fields)+'\n')+',end="")'
+                else:
+                    self.assertEqual(argv,p.usdt_command(probe,'compile')); program='import sys; sys.exit(7)'
+                return p.command([sys.executable,'-c',program],directory,label,timeout,**kwargs)
+            self.assertFalse(p._compile_usdt(helper,'a'*64,root,deadline=time.monotonic()+2,run_command=run_command))
+            self.assertEqual(phases,['compile-listing','panic-compile'])
+            self.assertFalse(received.exists())
+            with self.assertRaises(ProcessLookupError): os.kill(int(pidfile.read_text()),0)
+
+    def test_usdt_observation_fixture_uses_ready_then_one_g_and_exact_fullnonce_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); helper=root/'helper'; pidfile=root/'pid'; received=root/'received'
+            helper.write_text('#!'+sys.executable+'\nimport os,sys\nfrom pathlib import Path\n'
+                'Path('+repr(str(pidfile))+').write_text(str(os.getpid()))\n'
+                'print("HELPER_READY "+str(os.getpid()),flush=True)\n'
+                'value=sys.stdin.buffer.read(1)\nPath('+repr(str(received))+').write_bytes(value)\n')
+            helper.chmod(0o700)
+            def run_command(argv,directory,label,timeout,**kwargs):
+                probe=usdt.ProbeSpec('a'*64).bind(int(pidfile.read_text()))
+                self.assertEqual(argv[-1],probe.selector)
+                raw='ID PROVIDER MODULE FUNCTION NAME\n1 '+' '.join(probe.fields)+'\n'
+                return p.command([sys.executable,'-c','print('+repr(raw)+',end="")'],directory,label,timeout,**kwargs)
+            children=[]
+            def start_tracer(argv,**kwargs):
+                probe=usdt.ProbeSpec('a'*64).bind(int(pidfile.read_text()))
+                self.assertNotIn('-w',argv); self.assertNotIn('panic()',argv[-1])
+                line='HIT '+str(probe.pid)+' '+' '.join(probe.fields)+' '+probe.spec.argument
+                program=('import time\nfrom pathlib import Path\nprint("READY",flush=True)\n'
+                    'deadline=time.monotonic()+2\nwhile not Path('+repr(str(received))+').exists():\n'
+                    ' if time.monotonic()>deadline: raise TimeoutError()\n time.sleep(.01)\nprint('+repr(line)+')\nprint()')
+                child=subprocess.Popen([sys.executable,'-c',program],**kwargs); children.append(child); return child
+            facts={}
+            self.assertTrue(p._observe_usdt(helper,'a'*64,root,facts,deadline=time.monotonic()+3,
+                                           run_command=run_command,start_tracer=start_tracer))
+            self.assertEqual(received.read_bytes(),b'G')
+            self.assertEqual((facts['ready_count'],facts['hit_count'],facts['helper_exit'],facts['tracer_exit']),(1,1,0,0))
+            self.assertTrue(facts['provider_exact'] and facts['function_exact'] and facts['name_exact'])
+            self.assertEqual(children[0].poll(),0)
+            with self.assertRaises(ProcessLookupError): os.kill(int(pidfile.read_text()),0)
+
     def test_exact_probe_list(self):
         name = 'vz_nonce_' + 'a' * 64
         line = f'   ID PROVIDER MODULE FUNCTION NAME\n  123 pid456 helper {name} entry\n'
