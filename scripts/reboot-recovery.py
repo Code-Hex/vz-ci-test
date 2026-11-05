@@ -45,7 +45,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
-              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "kernel-state", "netdump-prime", "panic-nonce-netdump") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "kernel-state", "netdump-prime", "panic-nonce-netdump") and
               (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
@@ -66,11 +66,11 @@ def panic_mode(ctx):
 
 
 def panic_followup(ctx):
-    return ctx.get("after_debug_boot", "none") in ("panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt")
+    return ctx.get("after_debug_boot", "none") in ("panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off")
 
 
 def panic_control_kind(ctx):
-    return 'usdt-v1' if ctx.get('after_debug_boot') == 'panic-nonce-usdt' else 'pid-v1'
+    return 'usdt-v1' if ctx.get('after_debug_boot') in ('panic-nonce-usdt', 'panic-nonce-usdt-nvram-off') else 'pid-v1'
 
 
 def kernel_state_mode(ctx):
@@ -89,7 +89,7 @@ def kernel_state_proven(facts):
 
 
 def nvram_off_control(ctx):
-    return ctx.get("after_debug_boot") == "panic-nonce-nvram-off"
+    return ctx.get("after_debug_boot") in ("panic-nonce-nvram-off", "panic-nonce-usdt-nvram-off")
 
 
 def netdump_prime(ctx):
@@ -2042,7 +2042,7 @@ def followup_finish(directory, config, current, saved, token):
                     "baseline_boot_uuid": config["baseline"], "debug_boot_uuid": scope["debug_boot_uuid"],
                     "current_boot_uuid": current, "source_identity": config["debug_source_identity"], "classification": classification}
         if panic_control_kind(config['context']) == 'usdt-v1':
-            metadata.update(after_debug_boot='panic-nonce-usdt', control_kind='usdt-v1',
+            metadata.update(after_debug_boot=config['context']['after_debug_boot'], control_kind='usdt-v1',
                             helper_pid=trigger['helper_pid'], helper_sha256=trigger['helper_sha256'])
         envelope = recovery_reports.encrypt_bundle((directory / "report-cert.pem").read_bytes(), metadata, raw)
         if envelope["cert_fingerprint"] != config["cert_fingerprint"]:

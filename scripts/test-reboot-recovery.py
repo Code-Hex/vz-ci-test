@@ -137,6 +137,116 @@ class Recovery(unittest.TestCase):
                      patch.object(r.recovery_bootargs,'kernel_field_state',forbidden):
                     with self.assertRaises(ValueError): r.runtime_watch(directory)
 
+    def usdt_off_fixture(self):
+        config, saved, b3 = self.followup_fixture()
+        config['context']['after_debug_boot'] = 'panic-nonce-usdt-nvram-off'
+        control = r.parse_nvram_off_control('alpha=1 nvram_paniclog=0 debug=0x102000')
+        saved['facts'].update(optional_inventory_status='completed',
+            kernel_debug_state={'debug_boot_arg': {'status': 'observed', 'value': 0x102000}},
+            nvram_paniclog_control=control,
+            boot_argument_profiles={'initial': r.recovery_bootargs.boot_argument_profile('alpha=1'),
+                                    'postboot': control['full_profile']})
+        return config, saved, b3
+
+    def test_usdt_nvram_off_is_a_distinct_closed_mode(self):
+        config, _, _ = self.usdt_off_fixture()
+        ctx = {**config['context'], 'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main',
+               'event': 'workflow_dispatch', 'runner_environment': 'github-hosted'}
+        self.assertTrue(r.valid_context(ctx, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        self.assertTrue(r.panic_followup(ctx))
+        self.assertTrue(r.report_required(ctx))
+        self.assertTrue(r.certificate_required(ctx))
+        self.assertTrue(r.nvram_off_control(ctx))
+        self.assertTrue(r.mode_matches(ctx, {}, ctx))
+        self.assertIsNone(r.netdump_mode(ctx))
+        self.assertEqual(r.panic_control_kind(ctx), 'usdt-v1')
+        self.assertEqual(r.expected_debug_mask(ctx), 0x102000)
+        for change in ({'trigger': 'reboot'}, {'debug_boot': False}, {'debug_source': 'nvram'},
+                       {'after_debug_boot': 'panic-nonce-usdt-nvram-off-extra'}):
+            self.assertFalse(r.valid_context({**ctx, **change}, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        for mode, kind, off in (('panic-nonce-usdt', 'usdt-v1', False),
+                                ('panic-nonce-nvram-off', 'pid-v1', True), ('panic-nonce', 'pid-v1', False)):
+            other = {**ctx, 'after_debug_boot': mode}
+            self.assertEqual(r.panic_control_kind(other), kind)
+            self.assertEqual(r.nvram_off_control(other), off)
+            self.assertFalse(r.mode_matches({**ctx, 'after_debug_boot': mode}, {}, ctx))
+
+    def test_usdt_nvram_off_requires_both_saved_proofs_without_reread(self):
+        config, saved, b3 = self.usdt_off_fixture()
+        trigger = {'scope': saved['scope'], 'helper_sha256': 'f'*64, 'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
+        pending = {'nonce': config['nonce'], 'baseline_boot_uuid': config['baseline']}
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for missing in (None, 'nvram_paniclog_control', 'kernel_debug_state'):
+                facts = {k: v for k, v in saved['facts'].items() if k != missing}
+                record = {**saved, 'facts': facts}
+                (directory/'panic-followup-debug.json').unlink(missing_ok=True)
+                r.private_write(directory/'panic-followup-debug.json', r.json.dumps(record).encode())
+                data = r.followup_summary(config, 'boot_observed', b3, record, panic_trigger=trigger)
+                with patch.object(r.recovery_bootargs, 'kernel_field_state', lambda *_a, **_k: self.fail('B3 mask reread')):
+                    self.assertEqual(r.debug_lineage_matches(data, pending, config['context']), missing is None)
+                    if missing is None:
+                        self.assertEqual(r.read_followup_debug(directory, config), record)
+                    else:
+                        with self.assertRaises(ValueError): r.read_followup_debug(directory, config)
+
+    def test_usdt_nvram_off_both_gates_control_preparation(self):
+        for bad in ('mask', 'off', None):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp); config, saved, _ = self.usdt_off_fixture(); reports = []; prepared = []
+                if bad == 'off': del saved['facts']['nvram_paniclog_control']
+                def read(_argv, _limit, timeout, *, capture_stderr):
+                    return ('VZKSTATE v1 debug_boot_arg u32 '+str(0 if bad == 'mask' else 0x102000)+'\n\n').encode()
+                def forbidden(*_a, **_k): self.fail('negative control reached prepare/watch/fire')
+                def prepare(*_a, **kwargs):
+                    self.assertIsNone(bad)
+                    self.assertEqual(kwargs['control_kind'], 'usdt-v1')
+                    prepared.append(True)
+                    raise RuntimeError('stop at nonfaulting preparation boundary')
+                with patch.object(r.recovery_bootargs, 'capture', read), \
+                     patch.object(r.recovery_panic_control, 'prepare', prepare), \
+                     patch.object(r.recovery_panic_control, 'fire', forbidden), \
+                     patch.object(r, 'start_runtime_watch', forbidden), \
+                     patch.object(r, 'complete_recovery', lambda *_a: reports.append(_a[5])):
+                    r.followup_start(directory, config, saved['scope']['debug_boot_uuid'], saved['facts'], 'token')
+                self.assertEqual(reports, [False])
+                self.assertEqual(prepared, [True] if bad is None else [])
+                latched = r.json.loads((directory/'panic-followup-debug.json').read_text())
+                self.assertEqual(latched['facts']['kernel_debug_state']['debug_boot_arg']['value'], 0 if bad == 'mask' else 0x102000)
+
+    def test_usdt_nvram_off_cms_exact_mode_and_missing_body_is_not_success(self):
+        for has_raw in (True, False):
+            with self.subTest(has_raw=has_raw), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp); config, saved, b3 = self.usdt_off_fixture(); scope = saved['scope']
+                trigger = {'scope': scope, 'helper_sha256': 'f'*64, 'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
+                prepared = {'helper_sha256': 'f'*64}; (directory/'panic-control').mkdir()
+                for name, value in (('panic-followup-trigger.json', trigger), ('panic-control/release-attempt.json', trigger),
+                                    ('panic-control/intent.json', {'scope': scope, 'prepared': prepared})):
+                    r.private_write(directory/name, r.json.dumps(value).encode())
+                r.private_write(directory/'report-cert.pem', b'certificate boundary')
+                raw = ('panic(cpu 0 caller 0x1): dtrace: panic action at probe vzobsddddddddddddddddp123:helper:vz_nonce_'+
+                       config['nonce']+':observe (ecb 0x1)\nKernel UUID: '+r.KERNEL_UUID+'\n').encode() if has_raw else None
+                cipher = b'encrypted boundary'; metadata_seen = []; completed = []
+                envelope = {'ciphertext': r.base64.b64encode(cipher).decode(), 'cipher_sha256': r.hashlib.sha256(cipher).hexdigest(),
+                            'cert_fingerprint': config['cert_fingerprint']}
+                def encrypt(_cert, metadata, body):
+                    self.assertEqual(body, raw); metadata_seen.append(metadata)
+                    self.assertEqual(metadata['after_debug_boot'], 'panic-nonce-usdt-nvram-off')
+                    self.assertEqual(metadata['control_kind'], 'usdt-v1')
+                    self.assertEqual(metadata['helper_pid'], 123)
+                    return envelope
+                with patch.object(r.recovery_panic_control, 'validate_prepared', lambda *_a, **_k: directory/'helper'), \
+                     patch.object(r.recovery_nvram_panic, 'read_panic_info', lambda: ('observed' if has_raw else 'unavailable', raw)), \
+                     patch.object(r.recovery_reports, 'encrypt_bundle', encrypt), \
+                     patch.object(r, 'complete_recovery', lambda *_a: completed.append((_a[5], r.json.loads(_a[4]['summary'])))):
+                    r.followup_finish(directory, config, b3, saved, 'token')
+                self.assertEqual(len(metadata_seen), int(has_raw))
+                success, summary = completed[0]
+                self.assertEqual(success, has_raw)
+                self.assertEqual(summary['after_debug_boot'], 'panic-nonce-usdt-nvram-off')
+                self.assertEqual(summary['debug_boot_facts'], saved['facts'])
+                self.assertEqual(summary['capture_state'], 'fresh_fragment' if has_raw else 'unavailable')
+
     def test_usdt_followup_is_local_and_uses_a_closed_control_kind(self):
         ctx = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
                'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,
