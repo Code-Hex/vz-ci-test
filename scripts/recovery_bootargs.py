@@ -166,23 +166,58 @@ def ioreg_nodes(raw):
 
 
 KERNEL_FIELDS = {
-    "debug_boot_arg": ("(uint32_t)`debug_boot_arg", 0xffffffff),
-    "kdp_flag": ("(uint32_t)`kdp_flag", 0xffffffff),
-    "send_registered": ("`kdp_en_send_pkt != 0", 1),
-    "receive_registered": ("`kdp_en_recv_pkt != 0", 1),
+    "debug_boot_arg": ("(uint32_t)`debug_boot_arg", "u32"),
+    "kdp_flag": ("(uint32_t)`kdp_flag", "u32"),
+    "send_registered": ("`kdp_en_send_pkt != 0", "bool"),
+    "receive_registered": ("`kdp_en_recv_pkt != 0", "bool"),
+    "panicDebugging": ("(uint32_t)`panicDebugging", "u32"),
+    "dtrace_destructive_disallow": ("(int32_t)`dtrace_destructive_disallow", "i32"),
+    "coprocessor_paniclog_flush": ("(boolean_t)`coprocessor_paniclog_flush", "bool"),
+    "commit_paniclog_to_nvram": ("(uint32_t)`commit_paniclog_to_nvram", "u32"),
 }
 
 
-def kernel_debug_state():
+def kernel_field_program(name):
+    if type(name) is not str or name not in KERNEL_FIELDS: raise ValueError("kernel debug field invalid")
+    expression, kind = KERNEL_FIELDS[name]
+    cast, format = ("int64_t", "%lld") if kind == "i32" else ("uint64_t", "%llu")
+    return ('dtrace:::ERROR { exit(1); } dtrace:::BEGIN { printf("VZKSTATE v1 ' + name + ' ' + kind + ' ' +
+            format + '\\n", (' + cast + ')(' + expression + ')); exit(0); }')
+
+
+def kernel_field_value(name, value):
+    if type(name) is not str or name not in KERNEL_FIELDS:
+        raise ValueError("kernel debug value invalid")
+    kind = KERNEL_FIELDS[name][1]
+    if kind == 'bool':
+        if type(value) is not bool: raise ValueError("kernel debug value invalid")
+    else:
+        minimum, maximum = (-2147483648, 2147483647) if kind == 'i32' else (0, 0xffffffff)
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise ValueError("kernel debug value invalid")
+    return value
+
+
+def parse_kernel_field(name, raw):
+    if type(name) is not str or name not in KERNEL_FIELDS or type(raw) is not bytes:
+        raise ValueError("kernel debug value invalid")
+    kind = KERNEL_FIELDS[name][1]
+    prefix = ('VZKSTATE v1 ' + name + ' ' + kind + ' ').encode('ascii')
+    match = re.fullmatch(re.escape(prefix) + rb'(-?[0-9]{1,10})\n\n', raw)
+    if not match: raise ValueError("kernel debug value invalid")
+    value = int(match.group(1))
+    if match.group(1) != str(value).encode('ascii') or kind == 'bool' and value not in (0, 1):
+        raise ValueError("kernel debug value invalid")
+    return kernel_field_value(name, bool(value) if kind == 'bool' else value)
+
+
+def kernel_debug_state(*, read=None):
+    read = capture if read is None else read
     result = {}
-    for name, (expression, maximum) in KERNEL_FIELDS.items():
-        source = 'dtrace:::BEGIN { printf("%llu\\n", (uint64_t)(' + expression + ')); exit(0); }'
+    for name in KERNEL_FIELDS:
         try:
-            raw = capture(["/usr/sbin/dtrace", "-q", "-n", source], 4096, timeout=5)
-            if not re.fullmatch(rb"[0-9]{1,10}\n?", raw) or int(raw) > maximum:
-                raise ValueError("kernel debug value invalid")
-            value = bool(int(raw)) if maximum == 1 else int(raw)
-            result[name] = {"status": "observed", "value": value}
+            raw = read(["/usr/sbin/dtrace", "-q", "-n", kernel_field_program(name)], 4096, timeout=5)
+            result[name] = {"status": "observed", "value": parse_kernel_field(name, raw)}
         except (OSError, subprocess.SubprocessError):
             result[name] = {"status": "unavailable"}
         except ValueError:
@@ -406,16 +441,16 @@ def optional_summary(data):
     states = data.get("kernel_debug_state")
     if isinstance(states, dict):
         result["kernel_debug_state"] = {}
-        for name, (_expr, maximum) in KERNEL_FIELDS.items():
+        for name in KERNEL_FIELDS:
             value = states.get(name)
             if not isinstance(value, dict) or value.get("status") not in ("observed", "unavailable", "invalid"):
                 continue
             record = {"status": value["status"]}
             number = value.get("value")
             if record["status"] == "observed":
-                if maximum == 1 and type(number) is bool or maximum != 1 and type(number) is int and 0 <= number <= maximum:
-                    record["value"] = number
-                else:
+                try:
+                    record["value"] = kernel_field_value(name, number)
+                except ValueError:
                     record["status"] = "invalid"
             result["kernel_debug_state"][name] = record
     return result

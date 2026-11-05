@@ -50,6 +50,7 @@ on:
           - panic-nonce
           - panic-nonce-nvram-off
           - panic-nonce-usdt
+          - kernel-state
           - netdump-prime
           - panic-nonce-netdump
         default: none

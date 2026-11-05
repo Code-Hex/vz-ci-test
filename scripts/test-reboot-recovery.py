@@ -15,6 +15,40 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def test_kernel_state_mode_has_no_panic_or_certificate_path(self):
+        ctx = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
+               'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,
+               'trigger': 'reboot-quick', 'debug_boot': True, 'debug_source': 'bootplist', 'after_debug_boot': 'kernel-state'}
+        self.assertTrue(r.valid_context(ctx, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        self.assertTrue(r.kernel_state_mode(ctx))
+        self.assertFalse(r.panic_followup(ctx))
+        self.assertFalse(r.report_required(ctx))
+        self.assertFalse(r.certificate_required(ctx))
+        self.assertIsNone(r.netdump_mode(ctx))
+        self.assertEqual(r.expected_debug_mask(ctx), 0x102000)
+        for change in ({'trigger': 'reboot'}, {'debug_boot': False}, {'debug_source': 'nvram'}):
+            self.assertFalse(r.valid_context({**ctx, **change}, 'Darwin', 'x86_64', r.KERNEL_UUID))
+
+    def test_kernel_state_bootproof_requires_the_saved_runtime_mask(self):
+        config, saved, _b3 = self.followup_fixture()
+        ctx = {**config['context'], 'after_debug_boot': 'kernel-state'}
+        pending = {'nonce': config['nonce'], 'baseline_boot_uuid': config['baseline'], 'cert_fingerprint': ''}
+        facts = {**saved['facts'], 'optional_inventory_status': 'completed',
+                 'kernel_debug_state': {'debug_boot_arg': {'status': 'observed', 'value': 0x102000},
+                                        'coprocessor_paniclog_flush': {'status': 'unavailable'}}}
+        data = {'protocol': 'vz-recovery-v1', 'phase': 'boot_observed', 'binding': r.binding(ctx), **pending,
+                'current_boot_uuid': saved['scope']['debug_boot_uuid'], 'trigger': 'reboot-quick',
+                'debug_boot': True, 'debug_source': 'bootplist', 'after_debug_boot': 'kernel-state',
+                'debug_boot_facts': facts}
+        self.assertTrue(r.kernel_state_proven(facts))
+        self.assertTrue(r.boot_proof_matches(data, pending, ctx))
+        for state in ({'status': 'unavailable'}, {'status': 'invalid'}, {'status': 'observed', 'value': 0},
+                      {'status': 'observed', 'value': 1056768.0}, {'status': 'observed', 'value': '1056768'}):
+            bad = {**facts, 'kernel_debug_state': {'debug_boot_arg': state}}
+            self.assertFalse(r.kernel_state_proven(bad))
+            self.assertFalse(r.boot_proof_matches({**data, 'debug_boot_facts': bad}, pending, ctx))
+        self.assertFalse(r.kernel_state_proven({**facts, 'optional_inventory_status': 'uncertain'}))
+
     def test_usdt_followup_is_local_and_uses_a_closed_control_kind(self):
         ctx = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
                'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,

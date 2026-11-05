@@ -45,7 +45,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
-              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "netdump-prime", "panic-nonce-netdump") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "kernel-state", "netdump-prime", "panic-nonce-netdump") and
               (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
@@ -73,6 +73,21 @@ def panic_control_kind(ctx):
     return 'usdt-v1' if ctx.get('after_debug_boot') == 'panic-nonce-usdt' else 'pid-v1'
 
 
+def kernel_state_mode(ctx):
+    return ctx.get('after_debug_boot') == 'kernel-state'
+
+
+def kernel_state_proven(facts):
+    if type(facts) is not dict or facts.get('optional_inventory_status') != 'completed':
+        return False
+    states = facts.get('kernel_debug_state')
+    if type(states) is not dict:
+        return False
+    state = states.get('debug_boot_arg')
+    return (type(state) is dict and state.get('status') == 'observed' and
+            type(state.get('value')) is int and state['value'] == 0x102000)
+
+
 def nvram_off_control(ctx):
     return ctx.get("after_debug_boot") == "panic-nonce-nvram-off"
 
@@ -97,7 +112,7 @@ def require_root_writer(directory, config):
 def expected_debug_mask(ctx):
     if netdump_mode(ctx):
         return recovery_netdump_settings.DEBUG_MASK
-    return 0x102000 if panic_followup(ctx) else 0x2000
+    return 0x102000 if panic_followup(ctx) or kernel_state_mode(ctx) else 0x2000
 
 
 def report_required(ctx):
@@ -246,6 +261,8 @@ def sealed_matches(data, pending, ctx):
 def debug_lineage_matches(data, pending, ctx):
     facts = data.get("debug_boot_facts")
     if not debug_boot_proven(facts, ctx["debug_source"], expected_debug_mask(ctx)):
+        return False
+    if kernel_state_mode(ctx) and not kernel_state_proven(facts):
         return False
     if nvram_off_control(ctx) and not nvram_off_control_proven(facts):
         return False
@@ -2172,7 +2189,11 @@ def collect(directory):
         successful = successful and debug_boot_proven(debug_facts, config["context"]["debug_source"], expected_debug_mask(config["context"]))
     if netdump_mode(config['context']):
         successful = successful and debug_facts.get('netdump_prime', {}).get('status') == 'verified'
+    if kernel_state_mode(config['context']):
+        successful = successful and kernel_state_proven(debug_facts)
     output = {"title": "Recovery observed" if successful else "Panic report unavailable", "summary": summary}
+    if kernel_state_mode(config['context']):
+        output['title'] = 'Kernel runtime mask confirmed' if successful else 'Kernel runtime mask not confirmed'
     if envelope:
         output["text"] = envelope["ciphertext"]
     if len(json.dumps(output).encode()) > 58000:

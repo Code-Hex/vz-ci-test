@@ -443,19 +443,95 @@ class Bootargs(unittest.TestCase):
         self.assertEqual(facts["network_inventory_status"], "observed")
         self.assertTrue(all(value == {"status": "unavailable"} for value in facts["kernel_debug_state"].values()))
 
+    def test_optional_kernel_summary_preserves_exact_types_and_rejects_bad_ranges(self):
+        states={'debug_boot_arg':{'status':'observed','value':0x102000},
+                'dtrace_destructive_disallow':{'status':'observed','value':-1},
+                'coprocessor_paniclog_flush':{'status':'observed','value':False}}
+        self.assertEqual(b.optional_summary({'kernel_debug_state':states})['kernel_debug_state'],states)
+        for name, values in (('debug_boot_arg',(True,1.0,-1,4294967296)),
+                ('dtrace_destructive_disallow',(False,-2147483649,2147483648,'-1')),
+                ('coprocessor_paniclog_flush',(0,1,2,'false'))):
+            for value in values:
+                with self.subTest(name=name,value=value):
+                    observed={'kernel_debug_state':{name:{'status':'observed','value':value}}}
+                    self.assertEqual(b.optional_summary(observed)['kernel_debug_state'],{name:{'status':'invalid'}})
+
+    def test_optional_kernel_observation_roundtrips_actual_files_without_reexecution(self):
+        states={'debug_boot_arg':{'status':'observed','value':0x102000},
+                'dtrace_destructive_disallow':{'status':'observed','value':-1},
+                'coprocessor_paniclog_flush':{'status':'observed','value':False}}
+        class Inventory:
+            calls=0
+            def inventory(self):
+                self.calls+=1
+                if self.calls!=1: raise AssertionError('inventory rerun')
+                return {'kernel_debug_state':states}
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp); platform=Inventory()
+            first=b.observe_once(directory,MARKER,platform,self.save,lambda _:None,current_boot_uuid='new')
+            saved=json.loads((directory/'debug-boot-inventory-result.json').read_text())
+            again=b.observe_once(directory,MARKER,platform,self.save,lambda _:None,current_boot_uuid='new')
+            self.assertEqual(first,again)
+            self.assertEqual(saved['facts']['kernel_debug_state'],states)
+            self.assertEqual(again['kernel_debug_state'],states)
+            self.assertIs(again['kernel_debug_state']['coprocessor_paniclog_flush']['value'],False)
+            self.assertIs(type(again['kernel_debug_state']['dtrace_destructive_disallow']['value']),int)
+            self.assertEqual(platform.calls,1)
+
+    def test_kernel_field_parser_requires_exact_typed_marker_and_cli_one_lf(self):
+        self.assertEqual(b.parse_kernel_field('debug_boot_arg',b'VZKSTATE v1 debug_boot_arg u32 8192\n\n'),8192)
+        self.assertEqual(b.parse_kernel_field('dtrace_destructive_disallow',b'VZKSTATE v1 dtrace_destructive_disallow i32 -1\n\n'),-1)
+        self.assertIs(b.parse_kernel_field('coprocessor_paniclog_flush',b'VZKSTATE v1 coprocessor_paniclog_flush bool 1\n\n'),True)
+        for raw in (b'8192\n\n',b'VZKSTATE v1 debug_boot_arg u32 8192\n',b'VZKSTATE v1 debug_boot_arg u32 8192\n\n\n',
+                    b'VZKSTATE v1 other u32 8192\n\n',b'VZKSTATE v1 debug_boot_arg i32 8192\n\n',
+                    b'VZKSTATE v1 debug_boot_arg u32 08192\n\n',b'VZKSTATE v1 debug_boot_arg u32 4294967296\n\n',
+                    b'VZKSTATE v1 debug_boot_arg u32 -1\n\n',b'VZKSTATE v1 debug_boot_arg u32 8192\r\n\r\n'):
+            with self.assertRaises(ValueError): b.parse_kernel_field('debug_boot_arg',raw)
+        for name, kind, minimum, maximum in (('debug_boot_arg','u32',0,4294967295),
+                ('dtrace_destructive_disallow','i32',-2147483648,2147483647),
+                ('coprocessor_paniclog_flush','bool',0,1)):
+            for value in (minimum,maximum):
+                raw=('VZKSTATE v1 '+name+' '+kind+' '+str(value)+'\n\n').encode()
+                self.assertEqual(b.parse_kernel_field(name,raw),value)
+            for value in (minimum-1,maximum+1):
+                raw=('VZKSTATE v1 '+name+' '+kind+' '+str(value)+'\n\n').encode()
+                with self.assertRaises(ValueError): b.parse_kernel_field(name,raw)
+        for name in ('unknown',True,None):
+            with self.assertRaises(ValueError): b.kernel_field_program(name)
+        source=b.kernel_field_program('dtrace_destructive_disallow')
+        self.assertIn('dtrace:::ERROR { exit(1); }',source)
+        self.assertIn('(int32_t)`dtrace_destructive_disallow',source)
+        self.assertNotIn('*(',source)
+        self.assertNotIn('panic()',source)
+
+    def test_native_failed_reader_never_publishes_zero(self):
+        import subprocess
+        def read(argv,limit,timeout):
+            self.assertEqual(argv[:3],['/usr/sbin/dtrace','-q','-n'])
+            self.assertEqual((limit,timeout),(4096,5))
+            name=next(name for name in b.KERNEL_FIELDS if 'VZKSTATE v1 '+name+' ' in argv[-1])
+            kind=b.KERNEL_FIELDS[name][1]
+            raw='VZKSTATE v1 '+name+' '+kind+' 0\n\n'
+            return b.capture([sys.executable,'-c','import sys; sys.stdout.write('+repr(raw)+'); sys.exit(1)'],limit,timeout)
+        result=b.kernel_debug_state(read=read)
+        self.assertEqual(set(result),set(b.KERNEL_FIELDS))
+        self.assertTrue(all(value=={'status':'unavailable'} for value in result.values()))
+
     def test_kernel_debug_state_has_only_allowed_numeric_fields(self):
         def capture(argv, *_args, **_kwargs):
             source = argv[-1]
             if "`debug_boot_arg" in source:
-                return b"8192\n"
+                return b"VZKSTATE v1 debug_boot_arg u32 8192\n\n"
             if "`kdp_flag" in source:
-                return b"129\n"
+                return b"VZKSTATE v1 kdp_flag u32 129\n\n"
             raise OSError("static symbol unavailable")
         with patch.object(b, "capture", capture):
             facts = b.kernel_debug_state()
         self.assertEqual(facts, {"debug_boot_arg": {"status": "observed", "value": 8192},
                                  "kdp_flag": {"status": "observed", "value": 129},
-                                 "send_registered": {"status": "unavailable"}, "receive_registered": {"status": "unavailable"}})
+                                 "send_registered": {"status": "unavailable"}, "receive_registered": {"status": "unavailable"},
+                                 "panicDebugging": {"status": "unavailable"}, "dtrace_destructive_disallow": {"status": "unavailable"},
+                                 "coprocessor_paniclog_flush": {"status": "unavailable"}, "commit_paniclog_to_nvram": {"status": "unavailable"}})
         with patch.object(b, "capture", lambda *_args, **_kwargs: b"secret"):
             invalid = b.kernel_debug_state()
         self.assertTrue(all(value == {"status": "invalid"} for value in invalid.values()))
