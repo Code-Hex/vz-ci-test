@@ -1338,11 +1338,18 @@ def followup_start(directory, config, current, facts, token):
         failure = {"status": "failed", "kind": type(error).__name__}
     private_write(directory / "panic-followup-returned.json", json.dumps({"scope": scope, **failure}).encode())
     sync_directory(directory)
+    names = tuple(label + "." + channel for label in ("build", "sign", "listing", "trace", "panic-compile", "tracer") for channel in ("stdout", "stderr")) + ("prepare-failure.json",)
+    failure["files"] = {name: {"exists": (directory / "panic-control" / name).exists(),
+                              "bytes": (directory / "panic-control" / name).stat().st_size if (directory / "panic-control" / name).exists() else None}
+                        for name in names}
+    failure["prepared"] = (directory / "panic-control" / "prepared.json").exists()
+    failure["fire_intent"] = (directory / "panic-control" / "intent.json").exists()
+    failure["release_attempt"] = (directory / "panic-control" / "release-attempt.json").exists()
     summary = followup_summary(config, "panic_returned", current, saved, panic_control=failure)
     output = {"title": "Nonce panic control returned", "summary": json.dumps(summary)}
     fragments = {}
     budget = 32768
-    for name in ("build.stderr", "sign.stderr", "listing.stderr", "trace.stderr", "panic-compile.stderr", "tracer.stderr"):
+    for name in names:
         path = directory / "panic-control" / name
         if path.exists() and budget:
             with path.open("rb") as stream:

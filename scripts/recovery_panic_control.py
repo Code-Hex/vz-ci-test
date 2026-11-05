@@ -60,29 +60,78 @@ def once_record(directory, name, data, sync):
     sync(Path(directory))
 
 
+class PrepareProgress:
+    STAGES = frozenset(('setup', 'build', 'sign', 'observe', 'compile_panic', 'receipt'))
+    ENUMS = {'list_status': frozenset(('unavailable', 'matched', 'ambiguous', 'missing')),
+             'list_stderr': frozenset(('unavailable', 'empty', 'permission', 'attach_failed', 'no_probes', 'compile_failed', 'other')),
+             'trace_stderr': frozenset(('unavailable', 'empty', 'permission', 'attach_failed', 'no_probes', 'compile_failed', 'other'))}
+    BOOLS = frozenset(('provider_exact', 'function_exact', 'name_exact', 'released'))
+    COUNTS = frozenset(('ready_count', 'hit_count'))
+    EXITS = frozenset(('list_exit', 'tracer_exit', 'helper_exit'))
+
+    def __init__(self, directory, save, sync, facts):
+        self.directory, self.save, self.sync, self.facts = directory, save, sync, facts
+        self.stage = 'setup'
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None: return False
+        if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
+            kind = 'timeout'
+        elif isinstance(exc, OSError):
+            kind = 'os_error'
+        elif isinstance(exc, ValueError):
+            kind = 'rejected'
+        else:
+            kind = 'other'
+        observed = {}
+        for key, value in self.facts.items():
+            if key in self.ENUMS and isinstance(value, str) and value in self.ENUMS[key]: observed[key] = value
+            elif key in self.BOOLS and (type(value) is bool or value is None): observed[key] = value
+            elif key in self.COUNTS and type(value) is int and 0 <= value <= 65536: observed[key] = value
+            elif key in self.EXITS and (value is None or type(value) is int and -255 <= value <= 255): observed[key] = value
+        try:
+            record(self.directory, 'prepare-failure.json', {'stage': self.stage if self.stage in self.STAGES else 'setup',
+                                                           'kind': kind, 'observe': observed}, self.save, self.sync)
+        except BaseException:
+            pass
+        return False
+
+
 def prepare(directory, nonce, save, sync):
     if not isinstance(nonce, str) or not HEX.fullmatch(nonce): raise ValueError('nonce_invalid')
     directory = Path(directory) / 'panic-control'
     os.mkdir(directory, 0o700)
-    sync(directory.parent)
-    p = load_preflight()
-    source = p.helper_source(nonce).encode()
-    save(directory / 'helper.c', source); sync(directory)
-    binary = directory / 'helper'
-    code, _ = p.command(['/usr/bin/xcrun', 'clang', '-arch', 'x86_64', '-O0', '-Wall', '-Wextra', '-Werror', str(directory / 'helper.c'), '-o', str(binary)], directory, 'build', env=CHILD_ENV)
-    if code: raise ValueError('compile_failed')
-    code, _ = p.command(['/usr/bin/codesign', '-s', '-', '-f', str(binary)], directory, 'sign', env=CHILD_ENV)
-    if code: raise ValueError('sign_failed')
-    os.chmod(binary, 0o700)
-    with binary.open('rb') as stream: os.fsync(stream.fileno())
-    sync(directory)
-    facts = {}
-    p.observe(binary, nonce, directory, facts, env=CHILD_ENV)
-    if not p.compile_panic(binary, nonce, directory, env=CHILD_ENV): raise ValueError('panic_compile_failed')
-    prepared = {**source_hashes(), 'helper_source_sha256': digest(source), 'helper_sha256': digest(binary.read_bytes()),
-                'nonce_sha256': digest(nonce.encode()), 'observe_status': 'passed', 'compile_status': 'passed'}
-    record(directory, 'prepared.json', prepared, save, sync)
-    return prepared
+    facts = {'list_status': 'unavailable', 'list_exit': None, 'list_stderr': 'unavailable',
+             'ready_count': 0, 'hit_count': 0, 'provider_exact': None, 'function_exact': None,
+             'name_exact': None, 'released': False, 'tracer_exit': None, 'helper_exit': None,
+             'trace_stderr': 'unavailable'}
+    with PrepareProgress(directory, save, sync, facts) as progress:
+        sync(directory.parent)
+        p = load_preflight()
+        source = p.helper_source(nonce).encode()
+        save(directory / 'helper.c', source); sync(directory)
+        binary = directory / 'helper'
+        progress.stage = 'build'
+        code, _ = p.command(['/usr/bin/xcrun', 'clang', '-arch', 'x86_64', '-O0', '-Wall', '-Wextra', '-Werror', str(directory / 'helper.c'), '-o', str(binary)], directory, 'build', env=CHILD_ENV)
+        if code: raise ValueError('compile_failed')
+        progress.stage = 'sign'
+        code, _ = p.command(['/usr/bin/codesign', '-s', '-', '-f', str(binary)], directory, 'sign', env=CHILD_ENV)
+        if code: raise ValueError('sign_failed')
+        os.chmod(binary, 0o700)
+        with binary.open('rb') as stream: os.fsync(stream.fileno())
+        sync(directory)
+        progress.stage = 'observe'
+        p.observe(binary, nonce, directory, facts, env=CHILD_ENV)
+        progress.stage = 'compile_panic'
+        if not p.compile_panic(binary, nonce, directory, env=CHILD_ENV): raise ValueError('panic_compile_failed')
+        progress.stage = 'receipt'
+        prepared = {**source_hashes(), 'helper_source_sha256': digest(source), 'helper_sha256': digest(binary.read_bytes()),
+                    'nonce_sha256': digest(nonce.encode()), 'observe_status': 'passed', 'compile_status': 'passed'}
+        record(directory, 'prepared.json', prepared, save, sync)
+        return prepared
 
 
 def validate_prepared(directory, nonce, prepared):

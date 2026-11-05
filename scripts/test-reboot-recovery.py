@@ -452,9 +452,12 @@ class Recovery(unittest.TestCase):
             directory = Path(tmp)
             config, saved, _b3 = self.followup_fixture()
             events = []
+            r.private_write(directory / "report-cert.pem", b"public certificate boundary")
             def prepare(*_args):
                 self.assertEqual(r.read_followup_debug(directory, config), saved)
                 events.append("prepare")
+                (directory / "panic-control").mkdir()
+                r.private_write(directory / "panic-control" / "trace.stdout", b"private trace output")
                 return {"helper_sha256": "f" * 64}
             def publish(_directory, _config, _token, summary, _title):
                 events.append(summary["phase"])
@@ -465,13 +468,21 @@ class Recovery(unittest.TestCase):
                 self.assertTrue(ready(trigger))
                 events.append("release")
                 return {"phase": "returned"}
+            def encrypt(_certificate, metadata, report):
+                self.assertEqual(metadata["kind"], "panic_control_failure")
+                fragments = r.json.loads(report)
+                self.assertEqual(r.base64.b64decode(fragments["trace.stdout"]), b"private trace output")
+                return {"cert_fingerprint": config["cert_fingerprint"], "ciphertext": "encrypted-only", "cipher_sha256": "c" * 64}
             def complete(_directory, _config, _current, _token, output, successful, _deadline):
                 self.assertFalse(successful)
+                self.assertEqual(output.get("text"), "encrypted-only")
+                self.assertNotIn("private trace output", r.json.dumps(output))
                 self.assertEqual(r.json.loads(output["summary"])["phase"], "panic_returned")
                 events.append("returned")
             with patch.object(r.recovery_panic_control, "prepare", prepare), patch.object(r.recovery_panic_control, "fire", fire), \
                     patch.object(r.recovery_nvram_panic, "read_panic_info", lambda: ("unavailable", None)), \
                     patch.object(r, "publish_followup", publish), patch.object(r, "complete_recovery", complete), \
+                    patch.object(r.recovery_reports, "encrypt_bundle", encrypt), \
                     patch.object(r, "boot_uuid", lambda: saved["scope"]["debug_boot_uuid"]):
                 r.followup_start(directory, config, saved["scope"]["debug_boot_uuid"], saved["facts"], "token")
             self.assertEqual(events, ["prepare", "panic_prepared", "panic_intent", "release", "returned"])

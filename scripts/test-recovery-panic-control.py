@@ -10,6 +10,36 @@ import recovery_panic_control as control
 
 
 class PanicControl(unittest.TestCase):
+    def test_prepare_failure_records_timeout_stage_without_raw_data(self):
+        import json
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            def save(path, data):
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write(data); stream.flush(); os.fsync(stream.fileno())
+            facts = {'list_status': 'matched', 'ready_count': 1, 'hit_count': 0,
+                     'provider_exact': None, 'trace_stderr': 'other', 'private': 'secret-token'}
+            with self.assertRaises(subprocess.TimeoutExpired):
+                with control.PrepareProgress(root, save, lambda _: None, facts) as progress:
+                    progress.stage = 'observe'
+                    subprocess.run([sys.executable, '-c', 'import time; time.sleep(1)'], timeout=0.03)
+            value = json.loads((root / 'prepare-failure.json').read_text())
+            self.assertEqual((value['stage'], value['kind']), ('observe', 'timeout'))
+            self.assertEqual(value['observe']['list_status'], 'matched')
+            self.assertEqual(value['observe']['ready_count'], 1)
+            self.assertNotIn('secret-token', str(value))
+            self.assertFalse((root / 'prepared.json').exists())
+
+    def test_failure_record_error_does_not_replace_original_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def fail_save(path, data): raise OSError('private storage unavailable')
+            original = TimeoutError('private detail')
+            with self.assertRaises(TimeoutError) as captured:
+                with control.PrepareProgress(Path(temp), fail_save, lambda _: None, {}):
+                    raise original
+            self.assertIs(captured.exception, original)
+
     def test_scope_requires_distinct_valid_boots_and_exact_fields(self):
         scope = {'binding': '12/1/' + 'a' * 40, 'nonce': 'b' * 64,
                  'baseline': 'AAAAAAAA-1111-1111-1111-111111111111',
