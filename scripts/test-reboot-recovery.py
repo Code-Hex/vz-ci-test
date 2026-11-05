@@ -320,7 +320,7 @@ class Recovery(unittest.TestCase):
                 config, _platform, _original = self.owner_fixture(directory)
                 config["context"].update(debug_source="bootplist", trigger="reboot-quick")
                 events = []
-                def stage(*_args):
+                def stage(*_args, **_kwargs):
                     events.append("stage")
                     if uncertain:
                         raise r.recovery_bootplist.WriteUncertain()
@@ -391,6 +391,151 @@ class Recovery(unittest.TestCase):
                         patch.object(r, "api", api):
                     r.collect(directory)
                 self.assertEqual(events, ["restore", "ack", "inventory", "success"] if restored else ["restore", "ack", "failure"])
+
+    def test_panic_followup_context_is_restricted_to_debug_bootplist(self):
+        ctx = {"actions": "true", "repo": "Code-Hex/vz-ci-test", "ref": "refs/heads/main", "event": "workflow_dispatch",
+               "runner_environment": "github-hosted", "run_id": "123", "attempt": "1", "sha": "a" * 40,
+               "trigger": "reboot-quick", "debug_boot": True, "debug_source": "bootplist", "after_debug_boot": "panic-nonce"}
+        self.assertTrue(r.valid_context(ctx, "Darwin", "x86_64", r.KERNEL_UUID))
+        for changes in ({"debug_source": "nvram"}, {"debug_boot": False}, {"trigger": "reboot"}, {"after_debug_boot": "unknown"}):
+            self.assertFalse(r.valid_context({**ctx, **changes}, "Darwin", "x86_64", r.KERNEL_UUID))
+        data = {"trigger": "reboot-quick", "debug_boot": True, "debug_source": "bootplist", "after_debug_boot": "none"}
+        self.assertFalse(r.mode_matches(data, {}, ctx))
+        self.assertTrue(r.report_required(ctx))
+
+    def test_followup_proof_keeps_three_boots_distinct(self):
+        b1, b2, b3 = (letter * 8 + "-" + letter * 4 + "-" + letter * 4 + "-" + letter * 4 + "-" + letter * 12 for letter in ("A", "B", "C"))
+        ctx = {"debug_source": "bootplist", "after_debug_boot": "panic-nonce", "trigger": "reboot-quick", "debug_boot": True,
+               "run_id": "123", "attempt": "1", "sha": "a" * 40}
+        pending = {"nonce": "d" * 64, "baseline_boot_uuid": b1, "cert_fingerprint": "e" * 64}
+        scope = {"binding": r.binding(ctx), "nonce": pending["nonce"], "baseline": b1,
+                 "source_identity": r.debug_source_identity(), "debug_boot_uuid": b2}
+        facts = {"current_boot_uuid": b2, "active_debug_mask": 0x102000, "active_bootargs_status": "observed_debug",
+                 "bootplist_restored": True, "bootplist_file_states": {"data": "staged", "preboot": "staged"},
+                 "bootplist_restore": {name: {"bytes": True, "metadata": True, "timestamps": True} for name in ("data", "preboot")}}
+        trigger = {"scope": scope, "helper_sha256": "f" * 64, "helper_pid": 123, "tracer_pid": 456, "ready": True}
+        data = {"protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": r.binding(ctx), **pending,
+                "debug_source": "bootplist", "after_debug_boot": "panic-nonce", "trigger": "reboot-quick", "debug_boot": True,
+                "current_boot_uuid": b3, "debug_boot_uuid": b2, "debug_boot_facts": facts, "panic_trigger": trigger}
+        self.assertTrue(r.boot_proof_matches(data, pending, ctx))
+        for invalid in ({"current_boot_uuid": b2}, {"debug_boot_uuid": b1}, {"debug_boot_facts": {**facts, "current_boot_uuid": b3}},
+                        {"panic_trigger": {**trigger, "scope": {**scope, "debug_boot_uuid": b3}}},
+                        {"panic_trigger": {**trigger, "scope": {**scope, "source_identity": "0" * 64}}}):
+            self.assertFalse(r.boot_proof_matches({**data, **invalid}, pending, ctx))
+
+    def followup_fixture(self):
+        b1, b2, b3 = (letter * 8 + "-" + letter * 4 + "-" + letter * 4 + "-" + letter * 4 + "-" + letter * 12 for letter in ("A", "B", "C"))
+        ctx = {"debug_source": "bootplist", "after_debug_boot": "panic-nonce", "trigger": "reboot-quick", "debug_boot": True,
+               "run_id": "123", "attempt": "1", "sha": "a" * 40}
+        config = {"context": ctx, "baseline": b1, "nonce": "d" * 64, "check_id": 9,
+                  "cert_fingerprint": "e" * 64, "debug_source_identity": r.debug_source_identity()}
+        scope = {**r.debug_boot_marker(config), "debug_boot_uuid": b2}
+        facts = {"current_boot_uuid": b2, "active_debug_mask": 0x102000, "active_bootargs_status": "observed_debug",
+                 "bootplist_restored": True, "bootplist_file_states": {"data": "staged", "preboot": "staged"},
+                 "bootplist_restore": {name: {"bytes": True, "metadata": True, "timestamps": True} for name in ("data", "preboot")}}
+        return config, {"scope": scope, "facts": facts}, b3
+
+    def test_followup_source_mismatch_never_prepares_or_fires(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, _b3 = self.followup_fixture()
+            config['debug_source_identity'] = '0' * 64
+            def forbidden(*_args, **_kwargs):
+                self.fail('source mismatch reached native preparation or firing')
+            with patch.object(r.recovery_panic_control, 'prepare', forbidden), patch.object(r.recovery_panic_control, 'fire', forbidden):
+                with self.assertRaises(ValueError):
+                    r.followup_start(directory, config, saved['scope']['debug_boot_uuid'], saved['facts'], 'token')
+            self.assertFalse((directory / 'panic-followup-debug.json').exists())
+
+    def test_followup_start_persists_debug_proof_before_ready_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, _b3 = self.followup_fixture()
+            events = []
+            def prepare(*_args):
+                self.assertEqual(r.read_followup_debug(directory, config), saved)
+                events.append("prepare")
+                return {"helper_sha256": "f" * 64}
+            def publish(_directory, _config, _token, summary, _title):
+                events.append(summary["phase"])
+                if summary["phase"] == "panic_intent":
+                    self.assertTrue((directory / "panic-followup-trigger.json").exists())
+            def fire(_directory, scope, prepared, _save, _sync, ready, _boot):
+                trigger = {"scope": scope, "helper_sha256": prepared["helper_sha256"], "helper_pid": 123, "tracer_pid": 456, "ready": True}
+                self.assertTrue(ready(trigger))
+                events.append("release")
+                return {"phase": "returned"}
+            def complete(_directory, _config, _current, _token, output, successful, _deadline):
+                self.assertFalse(successful)
+                self.assertEqual(r.json.loads(output["summary"])["phase"], "panic_returned")
+                events.append("returned")
+            with patch.object(r.recovery_panic_control, "prepare", prepare), patch.object(r.recovery_panic_control, "fire", fire), \
+                    patch.object(r.recovery_nvram_panic, "read_panic_info", lambda: ("unavailable", None)), \
+                    patch.object(r, "publish_followup", publish), patch.object(r, "complete_recovery", complete), \
+                    patch.object(r, "boot_uuid", lambda: saved["scope"]["debug_boot_uuid"]):
+                r.followup_start(directory, config, saved["scope"]["debug_boot_uuid"], saved["facts"], "token")
+            self.assertEqual(events, ["prepare", "panic_prepared", "panic_intent", "release", "returned"])
+
+    def test_followup_third_boot_bypasses_second_boot_restoration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, b3 = self.followup_fixture()
+            r.private_write(directory / "panic-followup-debug.json", r.json.dumps(saved).encode())
+            r.private_write(directory / "token", b"synthetic-token")
+            calls = []
+            def forbidden(*_args, **_kwargs):
+                self.fail("third boot reran second-boot restoration or core publication")
+            with patch.object(r, "load_config", lambda _: config), patch.object(r, "boot_uuid", lambda: b3), \
+                    patch.object(r.recovery_bootplist, "finish", forbidden), patch.object(r, "publish_debug_core", forbidden), \
+                    patch.object(r, "followup_finish", lambda *_args: calls.append("capture")):
+                r.collect(directory)
+            self.assertEqual(calls, ["capture"])
+            with patch.object(r, "load_config", lambda _: config), patch.object(r, "boot_uuid", lambda: saved["scope"]["debug_boot_uuid"]), \
+                    patch.object(r, "followup_finish", forbidden), patch.object(r, "followup_start", forbidden):
+                r.collect(directory)
+
+    def test_followup_capture_is_bound_encrypted_and_immutable(self):
+        for matching in (True, False):
+            with self.subTest(matching=matching), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config, saved, b3 = self.followup_fixture()
+                scope = saved["scope"]
+                trigger = {"scope": scope, "helper_sha256": "f" * 64, "helper_pid": 123, "tracer_pid": 456, "ready": True}
+                prepared = {"helper_sha256": "f" * 64}
+                (directory / "panic-control").mkdir()
+                for name, value in (("panic-followup-trigger.json", trigger), ("panic-control/release-attempt.json", trigger),
+                                    ("panic-control/intent.json", {"scope": scope, "prepared": prepared})):
+                    r.private_write(directory / name, r.json.dumps(value).encode())
+                r.private_write(directory / "report-cert.pem", b"public certificate boundary")
+                nonce = config["nonce"] if matching else "0" * 64
+                raw = ("panic(cpu 1 caller 0xff): dtrace: panic action at probe pid123:helper:vz_nonce_" + nonce +
+                       ":entry (ecb 0xff)\nKernel UUID: " + r.KERNEL_UUID + "\n").encode()
+                cipher = b"encrypted boundary artifact"
+                envelope = {"ciphertext": r.base64.b64encode(cipher).decode(), "cipher_sha256": r.hashlib.sha256(cipher).hexdigest(),
+                            "cert_fingerprint": config["cert_fingerprint"]}
+                outputs = []
+                def encrypt(_cert, metadata, report):
+                    self.assertEqual(report, raw)
+                    self.assertEqual((metadata["baseline_boot_uuid"], metadata["debug_boot_uuid"], metadata["current_boot_uuid"]),
+                                     (config["baseline"], scope["debug_boot_uuid"], b3))
+                    return envelope
+                def complete(_directory, _config, _current, _token, output, successful, _deadline):
+                    self.assertEqual(successful, matching)
+                    self.assertNotIn("dtrace: panic action", r.json.dumps(output))
+                    outputs.append(output)
+                with patch.object(r.recovery_panic_control, "validate_prepared", lambda *_: directory / "helper"), \
+                        patch.object(r.recovery_nvram_panic, "read_panic_info", lambda: ("observed", raw)), \
+                        patch.object(r.recovery_reports, "encrypt_bundle", encrypt), patch.object(r, "complete_recovery", complete):
+                    r.followup_finish(directory, config, b3, saved, "token")
+                with patch.object(r.recovery_panic_control, "validate_prepared", lambda *_: directory / "helper"), \
+                        patch.object(r.recovery_nvram_panic, "read_panic_info", lambda: self.fail("reread first observation")), \
+                        patch.object(r.recovery_reports, "encrypt_bundle", encrypt), patch.object(r, "complete_recovery", complete):
+                    r.followup_finish(directory, config, b3, saved, "token")
+                self.assertEqual(outputs[0], outputs[1])
+                summary = r.json.loads(outputs[0]["summary"])
+                self.assertEqual(summary["debug_boot_facts"]["current_boot_uuid"], scope["debug_boot_uuid"])
+                self.assertEqual(summary["current_boot_uuid"], b3)
+                self.assertEqual(summary["capture_state"], "fresh_fragment" if matching else "encrypted_unvalidated")
 
     def owner_fixture(self, directory):
         config = {"debug_source": "nvram", "context": {"debug_source": "nvram", "run_id": "123", "attempt": "1", "sha": "a" * 40, "debug_boot": True, "trigger": "reboot"},

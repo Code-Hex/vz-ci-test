@@ -5,6 +5,8 @@ import hashlib
 import recovery_reports
 import recovery_bootargs
 import recovery_bootplist
+import recovery_nvram_panic
+import recovery_panic_control
 import recovery_arrival
 import json
 import os
@@ -37,6 +39,8 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce") and
+              (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
     return bool(common and machine == "x86_64" and
@@ -53,6 +57,18 @@ def force_marker(ctx, nonce):
 
 def panic_mode(ctx):
     return ctx.get("trigger", "reboot") in ("panic-control", "panic-force-reset")
+
+
+def panic_followup(ctx):
+    return ctx.get("after_debug_boot", "none") == "panic-nonce"
+
+
+def expected_debug_mask(ctx):
+    return 0x102000 if panic_followup(ctx) else 0x2000
+
+
+def report_required(ctx):
+    return panic_mode(ctx) or panic_followup(ctx)
 
 
 def binding(ctx):
@@ -112,6 +128,7 @@ def reboot_observed(before, after):
 
 def mode_matches(data, pending, ctx):
     return (data.get("debug_source") in ("nvram", "bootplist") and data.get("debug_source") == ctx.get("debug_source") and
+            data.get("after_debug_boot", "none") == ctx.get("after_debug_boot", "none") and
             data.get("trigger", "reboot") == ctx.get("trigger", "reboot") and
             type(data.get("debug_boot", False)) is bool and
             data.get("debug_boot", False) == ctx.get("debug_boot", False) and
@@ -131,14 +148,32 @@ def sealed_matches(data, pending, ctx):
             data.get("ciphertext") == pending["ciphertext"])
 
 
+def debug_lineage_matches(data, pending, ctx):
+    facts = data.get("debug_boot_facts")
+    if not debug_boot_proven(facts, ctx["debug_source"], expected_debug_mask(ctx)):
+        return False
+    if not panic_followup(ctx):
+        return facts.get("current_boot_uuid") == data.get("current_boot_uuid")
+    boots = [pending["baseline_boot_uuid"], data.get("debug_boot_uuid"), data.get("current_boot_uuid")]
+    if any(not isinstance(value, str) or not recovery_panic_control.UUID.fullmatch(value) for value in boots):
+        return False
+    if len({value.upper() for value in boots}) != 3 or facts.get("current_boot_uuid") != boots[1]:
+        return False
+    trigger = data.get("panic_trigger")
+    scope = {"binding": binding(ctx), "nonce": pending["nonce"], "baseline": boots[0],
+             "source_identity": debug_source_identity(), "debug_boot_uuid": boots[1]}
+    return (isinstance(trigger, dict) and set(trigger) == {"scope", "helper_sha256", "helper_pid", "tracer_pid", "ready"} and
+            trigger["scope"] == scope and trigger["ready"] is True and
+            isinstance(trigger["helper_sha256"], str) and bool(re.fullmatch(r"[0-9a-f]{64}", trigger["helper_sha256"])) and
+            all(type(trigger[name]) is int and 0 < trigger[name] < 2**31 for name in ("helper_pid", "tracer_pid")))
+
+
 def boot_proof_matches(data, pending, ctx):
     return (mode_matches(data, pending, ctx) and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx) and
             data.get("phase") == "boot_observed" and data.get("nonce") == pending["nonce"] and
             data.get("baseline_boot_uuid") == pending["baseline_boot_uuid"] and
             reboot_observed(pending["baseline_boot_uuid"], data.get("current_boot_uuid")) and
-            (not ctx.get("debug_boot", False) or
-             debug_boot_proven(data.get("debug_boot_facts"), ctx["debug_source"]) and
-             data["debug_boot_facts"].get("current_boot_uuid") == data.get("current_boot_uuid")))
+            (not ctx.get("debug_boot", False) or debug_lineage_matches(data, pending, ctx)))
 
 
 def debug_restored(facts, source):
@@ -152,14 +187,22 @@ def debug_restored(facts, source):
             all(value in ("original", "staged") for value in facts["bootplist_file_states"].values()))
 
 
-def debug_boot_proven(facts, source):
+def debug_boot_proven(facts, source, expected_mask=0x2000):
     return (isinstance(facts, dict) and type(facts.get("active_debug_mask")) is int and
-            facts["active_debug_mask"] == 0x2000 and facts.get("active_bootargs_status") == "observed_debug" and
+            facts["active_debug_mask"] == expected_mask and facts.get("active_bootargs_status") == "observed_debug" and
             debug_restored(facts, source))
 
 
 def panic_envelope_matches(data, ciphertext, pending, ctx):
-    if not boot_proof_matches(data, pending, ctx) or data.get("capture_state") != "captured":
+    if not boot_proof_matches(data, pending, ctx):
+        return False
+    if panic_followup(ctx):
+        capture = data.get("panic_capture")
+        if (data.get("capture_state") != "fresh_fragment" or not isinstance(capture, dict) or
+                capture.get("status") != "fresh_fragment" or capture.get("freshness") != "verified" or
+                capture.get("completeness") != "unknown" or capture.get("encoding") not in ("raw", "packA")):
+            return False
+    elif data.get("capture_state") != "captured":
         return False
     if not isinstance(ciphertext, str) or len(ciphertext.encode()) > 58000:
         return False
@@ -214,6 +257,7 @@ def context_from_env():
             "runner_environment": os.getenv("RUNNER_ENVIRONMENT", ""), "run_id": os.getenv("GITHUB_RUN_ID", ""),
             "attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""), "sha": os.getenv("GITHUB_SHA", ""),
             "trigger": trigger, "debug_source": os.getenv("RECOVERY_DEBUG_SOURCE", "nvram"),
+            "after_debug_boot": os.getenv("RECOVERY_AFTER_DEBUG_BOOT", "none"),
             "debug_boot": recovery_bootargs.requested(os.getenv("RECOVERY_DEBUG_BOOT", ""), trigger)}
 
 
@@ -329,7 +373,7 @@ def prepare_root(payload):
         raise ValueError("daemon Python executable unavailable")
     cert = payload.get("report_cert", "").encode()
     fingerprint = ""
-    if panic_mode(ctx):
+    if report_required(ctx):
         fingerprint = recovery_reports.encrypt_bundle(cert, {"preflight": True}, b"synthetic")["cert_fingerprint"]
     directory = root_dir(ctx)
     directory.mkdir(mode=0o700)
@@ -387,7 +431,7 @@ def prepare_root(payload):
         raise ValueError("empty boot session")
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "public_key", "binding": binding(ctx),
                           "nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public,
-                          "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "debug_source": ctx["debug_source"], "cert_fingerprint": fingerprint})
+                          "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "debug_source": ctx["debug_source"], "after_debug_boot": ctx.get("after_debug_boot", "none"), "cert_fingerprint": fingerprint})
     check = api("POST", CHECKS, token, {"name": "Runner recovery " + ctx["run_id"], "head_sha": ctx["sha"],
                 "external_id": binding(ctx), "status": "in_progress",
                 "output": {"title": "Awaiting controller", "summary": summary}})
@@ -403,6 +447,9 @@ def prepare_root(payload):
     private_write(directory / "recovery_reports.py", Path(recovery_reports.__file__).read_bytes())
     private_write(directory / "recovery_bootargs.py", Path(recovery_bootargs.__file__).read_bytes())
     private_write(directory / "recovery_bootplist.py", Path(recovery_bootplist.__file__).read_bytes())
+    private_write(directory / "recovery_nvram_panic.py", Path(recovery_nvram_panic.__file__).read_bytes())
+    private_write(directory / "recovery_panic_control.py", Path(recovery_panic_control.__file__).read_bytes())
+    private_write(directory / "panic-source-preflight.py", Path(__file__).with_name("panic-source-preflight.py").read_bytes())
     private_write(directory / "recovery_arrival.py", Path(recovery_arrival.__file__).read_bytes())
     private_write(directory / "arrival.sh", recovery_arrival.render(config, directory))
     sync_directory(directory)
@@ -491,7 +538,7 @@ def debug_boot_marker(config):
 
 
 def debug_source_identity():
-    return hashlib.sha256(Path(__file__).read_bytes() + b"\0" + Path(recovery_bootargs.__file__).read_bytes() + b"\0" + Path(recovery_bootplist.__file__).read_bytes()).hexdigest()
+    return hashlib.sha256(Path(__file__).read_bytes() + b"\0" + Path(recovery_bootargs.__file__).read_bytes() + b"\0" + Path(recovery_bootplist.__file__).read_bytes() + b"\0" + Path(recovery_nvram_panic.__file__).read_bytes() + b"\0" + Path(recovery_panic_control.__file__).read_bytes() + b"\0" + Path(__file__).with_name("panic-source-preflight.py").read_bytes()).hexdigest()
 
 
 DEBUG_EVENTS = ("request", "staged", "bootplist_inflight", "bootplist_staged", "native_inflight", "native_synced", "native_failed", "rollback_inflight", "rollback_cleanup", "intent", "returned", "uncertain", "aborted")
@@ -844,7 +891,7 @@ def debug_owner(directory, config, current):
             raise ValueError("kernel debugging not permitted")
         if source == "bootplist":
             debug_event(directory, config, "bootplist_inflight", current)
-            fact = recovery_bootplist.stage(directory, marker, private_write, sync_directory)
+            fact = recovery_bootplist.stage(directory, marker, private_write, sync_directory, debug_mask=expected_debug_mask(config["context"]))
             debug_event(directory, config, "bootplist_staged", current, bootplist_stage=fact)
         else:
             recovery_bootargs.stage(directory, marker, platform, private_write, sync_directory)
@@ -1208,7 +1255,7 @@ def publish_debug_core(directory, config, current, facts, token):
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "boot_core", "binding": binding(ctx),
                           "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
                           "trigger": ctx.get("trigger", "reboot"), "cert_fingerprint": config.get("cert_fingerprint", ""),
-                          "debug_boot": True, "debug_source": ctx["debug_source"], "debug_boot_facts": facts})
+                          "debug_boot": True, "debug_source": ctx["debug_source"], "after_debug_boot": ctx.get("after_debug_boot", "none"), "debug_boot_facts": facts})
     output = {"title": "Boot core recovered", "summary": summary, "text": ""}
     url = CHECKS + "/" + str(config["check_id"])
     api("PATCH", url, token, {"status": "in_progress", "output": output})
@@ -1221,11 +1268,190 @@ def publish_debug_core(directory, config, current, facts, token):
     return facts
 
 
+def followup_summary(config, phase, current, saved, **details):
+    ctx = config["context"]
+    return {"protocol": "vz-recovery-v1", "phase": phase, "binding": binding(ctx), "nonce": config["nonce"],
+            "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
+            "trigger": ctx["trigger"], "debug_boot": True, "debug_source": ctx["debug_source"],
+            "after_debug_boot": ctx["after_debug_boot"], "cert_fingerprint": config["cert_fingerprint"],
+            "debug_boot_uuid": saved["scope"]["debug_boot_uuid"], "debug_boot_facts": saved["facts"], **details}
+
+
+def publish_followup(directory, config, token, summary, title):
+    output = {"title": title, "summary": json.dumps(summary), "text": ""}
+    if len(json.dumps(output).encode()) > 58000:
+        raise ValueError("followup output oversized")
+    url = CHECKS + "/" + str(config["check_id"])
+    api("PATCH", url, token, {"status": "in_progress", "output": output})
+    check = api("GET", url, token)
+    verified_summary(check, config)
+    if check.get("status") != "in_progress" or check.get("conclusion") is not None or check.get("output") is None:
+        raise ValueError("followup acknowledgement state mismatch")
+    actual = check["output"]
+    if actual.get("title") != title or actual.get("summary") != output["summary"] or actual.get("text") not in (None, ""):
+        raise ValueError("followup acknowledgement content mismatch")
+
+
+def read_followup_debug(directory, config):
+    saved = json.loads((directory / "panic-followup-debug.json").read_text())
+    if not isinstance(saved, dict) or set(saved) != {"scope", "facts"}:
+        raise ValueError("followup record invalid")
+    scope = saved["scope"]
+    recovery_panic_control.validate_scope(scope)
+    expected = {**debug_boot_marker(config), "debug_boot_uuid": scope["debug_boot_uuid"]}
+    if (scope != expected or config["debug_source_identity"] != debug_source_identity() or
+            not debug_boot_proven(saved["facts"], "bootplist", expected_debug_mask(config["context"])) or saved["facts"].get("current_boot_uuid") != scope["debug_boot_uuid"]):
+        raise ValueError("followup debug proof invalid")
+    return saved
+
+
+def followup_start(directory, config, current, facts, token):
+    if config["debug_source_identity"] != debug_source_identity():
+        raise ValueError("followup source identity mismatch")
+    scope = {**debug_boot_marker(config), "debug_boot_uuid": current}
+    recovery_panic_control.validate_scope(scope)
+    if not debug_boot_proven(facts, "bootplist", expected_debug_mask(config["context"])) or facts.get("current_boot_uuid") != current:
+        raise ValueError("followup requires a restored debug boot")
+    saved = {"scope": scope, "facts": facts}
+    private_write(directory / "panic-followup-debug.json", json.dumps(saved).encode())
+    sync_directory(directory)
+    try:
+        baseline_status, baseline = recovery_nvram_panic.read_panic_info()
+        private_write(directory / "panic-followup-baseline.json", json.dumps({"scope": scope, "status": baseline_status,
+                      "sha256": hashlib.sha256(baseline).hexdigest() if baseline is not None else None}).encode())
+        sync_directory(directory)
+        prepared = recovery_panic_control.prepare(directory, config["nonce"], private_write, sync_directory)
+        publish_followup(directory, config, token, followup_summary(config, "panic_prepared", current, saved, prepared=prepared),
+                         "Nonce panic control prepared")
+        def on_ready(trigger):
+            if trigger.get("scope") != scope or trigger.get("helper_sha256") != prepared["helper_sha256"] or trigger.get("ready") is not True:
+                raise ValueError("panic trigger identity mismatch")
+            private_write(directory / "panic-followup-trigger.json", json.dumps(trigger).encode())
+            sync_directory(directory)
+            publish_followup(directory, config, token,
+                             followup_summary(config, "panic_intent", current, saved, panic_trigger=trigger, prepared=prepared),
+                             "Nonce panic intent durable")
+            return boot_uuid() == current
+        returned = recovery_panic_control.fire(directory, scope, prepared, private_write, sync_directory, on_ready, boot_uuid)
+        failure = {"status": "returned", "result": returned}
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, urllib.error.URLError) as error:
+        failure = {"status": "failed", "kind": type(error).__name__}
+    private_write(directory / "panic-followup-returned.json", json.dumps({"scope": scope, **failure}).encode())
+    sync_directory(directory)
+    summary = followup_summary(config, "panic_returned", current, saved, panic_control=failure)
+    output = {"title": "Nonce panic control returned", "summary": json.dumps(summary)}
+    fragments = {}
+    budget = 32768
+    for name in ("build.stderr", "sign.stderr", "listing.stderr", "trace.stderr", "panic-compile.stderr", "tracer.stderr"):
+        path = directory / "panic-control" / name
+        if path.exists() and budget:
+            with path.open("rb") as stream:
+                fragment = stream.read(budget)
+            budget -= len(fragment)
+            if fragment:
+                fragments[name] = base64.b64encode(fragment).decode()
+    if fragments:
+        try:
+            envelope = recovery_reports.encrypt_bundle((directory / "report-cert.pem").read_bytes(),
+                        {"kind": "panic_control_failure", "scope": scope}, json.dumps(fragments).encode())
+            if envelope["cert_fingerprint"] != config["cert_fingerprint"]:
+                raise ValueError("failure envelope certificate mismatch")
+            summary["failure_cipher_sha256"] = envelope["cipher_sha256"]
+            output.update(summary=json.dumps(summary), text=envelope["ciphertext"])
+        except (OSError, ValueError, subprocess.SubprocessError):
+            summary["failure_encryption"] = "unavailable"
+            output["summary"] = json.dumps(summary)
+    complete_recovery(directory, config, current, token, output, False, time.monotonic() + 60)
+
+
+def followup_finish(directory, config, current, saved, token):
+    scope = saved["scope"]
+    boots = [scope["baseline"], scope["debug_boot_uuid"], current]
+    if any(not recovery_panic_control.UUID.fullmatch(value) for value in boots) or len({value.upper() for value in boots}) != 3:
+        raise ValueError("followup capture boot invalid")
+    trigger = json.loads((directory / "panic-followup-trigger.json").read_text())
+    intent = json.loads((directory / "panic-control" / "intent.json").read_text())
+    release = json.loads((directory / "panic-control" / "release-attempt.json").read_text())
+    if trigger != release or trigger.get("scope") != scope or intent.get("scope") != scope:
+        raise ValueError("followup release evidence invalid")
+    recovery_panic_control.validate_prepared(directory, config["nonce"], intent.get("prepared"))
+    if trigger.get("helper_sha256") != intent["prepared"]["helper_sha256"]:
+        raise ValueError("followup helper mismatch")
+    observation = directory / "panic-followup-observation.json"
+    if observation.exists():
+        capture = json.loads(observation.read_text())
+        if capture.get("scope") != scope or capture.get("current_boot_uuid") != current:
+            raise ValueError("followup capture identity mismatch")
+        raw = (directory / "panic-followup-raw").read_bytes() if capture["has_raw"] else None
+        if raw is not None and hashlib.sha256(raw).hexdigest() != capture["sha256"]:
+            raise ValueError("followup raw digest mismatch")
+    else:
+        status, raw = recovery_nvram_panic.read_panic_info()
+        capture = {"scope": scope, "current_boot_uuid": current, "status": status,
+                   "sha256": hashlib.sha256(raw).hexdigest() if raw is not None else None, "has_raw": raw is not None}
+        if raw is not None:
+            private_write(directory / "panic-followup-raw", raw)
+        private_write(observation, json.dumps(capture).encode())
+        sync_directory(directory)
+    classification = recovery_nvram_panic.classify(raw, config["nonce"]) if raw is not None else {
+        "status": "unavailable", "freshness": "unverified", "completeness": "unknown", "encoding": None}
+    envelope = None
+    if raw:
+        metadata = {"binding": binding(config["context"]), "nonce": config["nonce"], "kernel_uuid": KERNEL_UUID,
+                    "baseline_boot_uuid": config["baseline"], "debug_boot_uuid": scope["debug_boot_uuid"],
+                    "current_boot_uuid": current, "source_identity": config["debug_source_identity"], "classification": classification}
+        envelope = recovery_reports.encrypt_bundle((directory / "report-cert.pem").read_bytes(), metadata, raw)
+        if envelope["cert_fingerprint"] != config["cert_fingerprint"]:
+            raise ValueError("followup certificate mismatch")
+    summary = followup_summary(config, "boot_observed", current, saved, panic_trigger=trigger,
+                              panic_capture=classification, panic_getter_status=capture["status"],
+                              capture_state="fresh_fragment" if envelope and classification["freshness"] == "verified" else "encrypted_unvalidated" if envelope else "unavailable",
+                              cipher_sha256=envelope["cipher_sha256"] if envelope else "")
+    pending = {"nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "cert_fingerprint": config["cert_fingerprint"]}
+    successful = bool(envelope and panic_envelope_matches(summary, envelope["ciphertext"], pending, config["context"]))
+    output = {"title": "Fresh nonce panic fragment recovered" if successful else "Nonce panic fragment unavailable",
+              "summary": json.dumps(summary), "text": envelope["ciphertext"] if envelope else ""}
+    complete_recovery(directory, config, current, token, output, successful, time.monotonic() + 180)
+
+
+def complete_recovery(directory, config, current, token, output, successful, deadline):
+    payload = {"status": "completed", "conclusion": "success" if successful else "failure", "output": output}
+    while time.monotonic() < deadline:
+        try:
+            api("PATCH", CHECKS + "/" + str(config["check_id"]), token, payload,
+                timeout=min(10, max(0.1, deadline - time.monotonic())))
+            private_write(directory / "completed.json", json.dumps({"boot_uuid": current}).encode())
+            (directory / "token").unlink()
+            (directory / "arrival.headers").unlink(missing_ok=True)
+            (directory / "key.pem").unlink()
+            ctx = config["context"]
+            plist = Path("/Library/LaunchDaemons") / ("com.vz.ci.recovery." + ctx["run_id"] + "." + ctx["attempt"] + ".plist")
+            plist.unlink(missing_ok=True)
+            sync_directory(directory)
+            sync_directory(plist.parent)
+            return
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403, 404):
+                private_write(directory / "failed.json", json.dumps({"event": "check_update_failed", "status": error.code}).encode())
+                return
+        except (OSError, ValueError):
+            pass
+        time.sleep(min(5, max(0, deadline - time.monotonic())))
+    private_write(directory / "failed.json", b'{"event":"check_update_timeout"}')
+
+
+
 def collect(directory):
     config = load_config(directory)
     if (directory / "completed.json").exists():
         return
     current = boot_uuid()
+    if panic_followup(config["context"]) and (directory / "panic-followup-debug.json").exists():
+        saved = read_followup_debug(directory, config)
+        if current == saved["scope"]["debug_boot_uuid"]:
+            return
+        followup_finish(directory, config, current, saved, (directory / "token").read_text())
+        return
     debug_facts = {}
     if reboot_observed(config["baseline"], current) and config.get("debug_boot", False):
         try:
@@ -1262,7 +1488,7 @@ def collect(directory):
             summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "armed", "binding": binding(config["context"]),
                                   "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"],
                                   "trigger": config["context"].get("trigger", "reboot"),
-                                  "debug_boot": config.get("debug_boot", False), "debug_source": config["context"]["debug_source"],
+                                  "debug_boot": config.get("debug_boot", False), "debug_source": config["context"]["debug_source"], "after_debug_boot": config["context"].get("after_debug_boot", "none"),
                                   "cert_fingerprint": config.get("cert_fingerprint", "")})
             api("PATCH", CHECKS + "/" + str(config["check_id"]), token,
                 {"output": {"title": "Recovery daemon ready", "summary": summary}})
@@ -1278,6 +1504,9 @@ def collect(directory):
         try:
             debug_facts = dict(publish_debug_core(directory, config, current, debug_facts, token))
         except (OSError, ValueError, urllib.error.URLError):
+            return
+        if panic_followup(config["context"]):
+            followup_start(directory, config, current, debug_facts, token)
             return
         if debug_restored(debug_facts, config["context"]["debug_source"]):
             try:
@@ -1301,13 +1530,13 @@ def collect(directory):
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "boot_observed", "binding": binding(config["context"]),
                           "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
                           "trigger": config["context"].get("trigger", "reboot"), "cert_fingerprint": config.get("cert_fingerprint", ""),
-                          "debug_boot": config.get("debug_boot", False), "debug_source": config["context"]["debug_source"], "debug_boot_facts": debug_facts,
+                          "debug_boot": config.get("debug_boot", False), "debug_source": config["context"]["debug_source"], "after_debug_boot": config["context"].get("after_debug_boot", "none"), "debug_boot_facts": debug_facts,
                           "capture_state": capture_state,
                           "cipher_sha256": envelope["cipher_sha256"] if envelope else "",
                           "note": "Boot UUID changed; no stopped-CPU GPR proof."})
     successful = config["context"].get("trigger", "reboot") in ("reboot", "reboot-quick") or capture_state == "captured"
     if config.get("debug_boot", False):
-        successful = successful and debug_boot_proven(debug_facts, config["context"]["debug_source"])
+        successful = successful and debug_boot_proven(debug_facts, config["context"]["debug_source"], expected_debug_mask(config["context"]))
     output = {"title": "Recovery observed" if successful else "Panic report unavailable", "summary": summary}
     if envelope:
         output["text"] = envelope["ciphertext"]
@@ -1317,31 +1546,9 @@ def collect(directory):
                   "phase": "boot_observed", "binding": binding(config["context"]), "nonce": config["nonce"],
                   "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
                   "trigger": config["context"].get("trigger", "reboot"), "cert_fingerprint": config.get("cert_fingerprint", ""),
-                  "debug_boot": config.get("debug_boot", False), "debug_source": config["context"]["debug_source"],
+                  "debug_boot": config.get("debug_boot", False), "debug_source": config["context"]["debug_source"], "after_debug_boot": config["context"].get("after_debug_boot", "none"),
                   "capture_state": "oversized"})}
-    payload = {"status": "completed", "conclusion": "success" if successful else "failure", "output": output}
-    while time.monotonic() < deadline:
-        try:
-            api("PATCH", CHECKS + "/" + str(config["check_id"]), token, payload,
-                timeout=min(10, max(0.1, deadline - time.monotonic())))
-            private_write(directory / "completed.json", json.dumps({"boot_uuid": current}).encode())
-            (directory / "token").unlink()
-            (directory / "arrival.headers").unlink(missing_ok=True)
-            (directory / "key.pem").unlink()
-            ctx = config["context"]
-            plist = Path("/Library/LaunchDaemons") / ("com.vz.ci.recovery." + ctx["run_id"] + "." + ctx["attempt"] + ".plist")
-            plist.unlink(missing_ok=True)
-            sync_directory(directory)
-            sync_directory(plist.parent)
-            return
-        except urllib.error.HTTPError as error:
-            if error.code in (401, 403, 404):
-                private_write(directory / "failed.json", json.dumps({"event": "check_update_failed", "status": error.code}).encode())
-                return
-        except (OSError, ValueError):
-            pass
-        time.sleep(min(5, max(0, deadline - time.monotonic())))
-    private_write(directory / "failed.json", b'{"event":"check_update_timeout"}')
+    complete_recovery(directory, config, current, token, output, successful, deadline)
 
 
 def root_error_kind(stderr):
@@ -1420,7 +1627,7 @@ def sudo_call(operation, payload, timeout=40):
 
 
 def controller(ctx, token):
-    deadline = time.monotonic() + 600
+    deadline = time.monotonic() + (1080 if panic_followup(ctx) else 600)
     check_id = None
     pending = None
     sealed = False
@@ -1441,21 +1648,21 @@ def controller(ctx, token):
                     data = json.loads(check.get("output", {}).get("summary", "{}"))
                     if check.get("status") == "completed":
                         matches = pending is not None and boot_proof_matches(data, pending, ctx)
-                        if matches and panic_mode(ctx):
+                        if matches and report_required(ctx):
                             matches = panic_envelope_matches(data, check.get("output", {}).get("text", ""), pending, ctx)
                         if matches and check.get("conclusion") == "success":
                             print(json.dumps({"event": "controller_boot_proof", "check_id": check_id}), flush=True)
                             proof = True
                             return
                         raise ValueError("check completed without boot proof")
-                    if data.get("phase") == "public_key" and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx) and data.get("trigger", "reboot") == ctx.get("trigger", "reboot") and type(data.get("debug_boot", False)) is bool and data.get("debug_boot", False) == ctx.get("debug_boot", False) and data.get("debug_source") == ctx["debug_source"]:
+                    if data.get("phase") == "public_key" and data.get("protocol") == "vz-recovery-v1" and data.get("binding") == binding(ctx) and data.get("trigger", "reboot") == ctx.get("trigger", "reboot") and type(data.get("debug_boot", False)) is bool and data.get("debug_boot", False) == ctx.get("debug_boot", False) and data.get("debug_source") == ctx["debug_source"] and data.get("after_debug_boot", "none") == ctx.get("after_debug_boot", "none"):
                         nonce, baseline, public = data.get("nonce", ""), data.get("baseline_boot_uuid", ""), data.get("public_key", "")
                         if not re.fullmatch(r"[0-9a-f]{64}", nonce) or not re.fullmatch(r"[0-9A-Fa-f-]{36}", baseline):
                             raise ValueError("nonce or baseline invalid")
                         fingerprint = data.get("cert_fingerprint", "")
-                        if panic_mode(ctx) and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+                        if report_required(ctx) and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
                             raise ValueError("certificate fingerprint invalid")
-                        if not panic_mode(ctx) and fingerprint:
+                        if not report_required(ctx) and fingerprint:
                             raise ValueError("unexpected certificate fingerprint")
                         if pending is None:
                             ciphertext = encrypt_token(public.encode(), token)
@@ -1465,7 +1672,7 @@ def controller(ctx, token):
                             raise ValueError("public key metadata changed")
                         sealed_summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "sealed_token", "binding": binding(ctx),
                                                      "nonce": nonce, "baseline_boot_uuid": baseline, "ciphertext": pending["ciphertext"],
-                                                     "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "debug_source": ctx["debug_source"],
+                                                     "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "debug_source": ctx["debug_source"], "after_debug_boot": ctx.get("after_debug_boot", "none"),
                                                      "cert_fingerprint": fingerprint})
                         api("PATCH", CHECKS + "/" + str(check_id), token,
                             {"output": {"title": "Controller credential sealed", "summary": sealed_summary}})

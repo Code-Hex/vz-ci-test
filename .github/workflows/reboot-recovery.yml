@@ -31,6 +31,14 @@ on:
           - nvram
           - bootplist
         default: nvram
+      after_debug_boot:
+        description: Follow-up after a verified debug boot
+        required: false
+        type: choice
+        options:
+          - none
+          - panic-nonce
+        default: none
       report_cert:
         description: Public recipient certificate for encrypted panic reports
         required: false
@@ -44,11 +52,12 @@ jobs:
   controller:
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: ${{ inputs.after_debug_boot == 'panic-nonce' && 20 || 12 }}
     env:
       RECOVERY_TRIGGER: ${{ inputs.trigger || 'reboot' }}
       RECOVERY_DEBUG_BOOT: ${{ inputs.debug_boot && '1' || '0' }}
       RECOVERY_DEBUG_SOURCE: ${{ inputs.debug_source }}
+      RECOVERY_AFTER_DEBUG_BOOT: ${{ inputs.after_debug_boot }}
     permissions:
       contents: read
       checks: write
@@ -66,11 +75,12 @@ jobs:
   verify:
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
     runs-on: macos-26-intel
-    timeout-minutes: 12
+    timeout-minutes: ${{ inputs.after_debug_boot == 'panic-nonce' && 20 || 12 }}
     env:
       RECOVERY_TRIGGER: ${{ inputs.trigger || 'reboot' }}
       RECOVERY_DEBUG_BOOT: ${{ inputs.debug_boot && '1' || '0' }}
       RECOVERY_DEBUG_SOURCE: ${{ inputs.debug_source }}
+      RECOVERY_AFTER_DEBUG_BOOT: ${{ inputs.after_debug_boot }}
     permissions:
       contents: read
       checks: write
