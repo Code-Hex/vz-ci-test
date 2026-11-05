@@ -1,5 +1,4 @@
 """Actions-only non-faulting USDT gate."""
-from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -13,13 +12,15 @@ import sys
 import tempfile
 import time
 
+import nonce_usdt as usdt
+
 ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LC_ALL': 'C'}
 KERNEL_UUID = '87453B1D-A163-31FA-B33B-0FB4BE78E6E8'
 STAGES = ('context', 'sources', 'kernel', 'header', 'compile', 'sign', 'verify', 'helper_ready', 'listing',
           'compile_panic', 'tracer_ready', 'once', 'hit', 'returned', 'quit', 'exits', 'completed')
 REASONS = ('invalid', 'command_exit', 'deadline', 'output_limit', 'child_eof', 'os_error', 'requires_root', 'cleanup_unverified', 'interrupted')
 COMMANDS = ('kernel_uuid', 'kernel_file', 'header', 'compile', 'sign', 'verify', 'listing', 'panic_compile', 'helper', 'tracer')
-HASHES = ('script', 'workflow', 'nonce', 'provider', 'argument', 'provider_source', 'header', 'helper_source', 'helper_binary', 'tracer_program', 'panic_program')
+HASHES = ('script', 'workflow', 'nonce', 'provider', 'argument', 'provider_source', 'header', 'helper_source', 'helper_binary', 'tracer_program', 'panic_program', 'usdt_core')
 
 
 class GateFailure(ValueError):
@@ -35,84 +36,19 @@ def require(condition):
 def digest(raw): return hashlib.sha256(raw).hexdigest()
 
 
-@dataclass(frozen=True)
-class ProbeSpec:
-    nonce: str
-
-    def __post_init__(self):
-        require(type(self.nonce) is str and re.fullmatch('[0-9a-f]{64}', self.nonce))
-
-    @property
-    def provider(self): return 'vzobs' + self.nonce[:16] + 'p'
-
-    @property
-    def argument(self): return self.nonce[16:32]
-
-    @property
-    def function(self): return 'vz_nonce_' + self.nonce
-
-    def bind(self, pid): return ProbeIdentity(self, pid)
-
-
-@dataclass(frozen=True)
-class ProbeIdentity:
-    spec: ProbeSpec
-    pid: int
-
-    def __post_init__(self):
-        require(type(self.spec) is ProbeSpec and type(self.pid) is int and 0 < self.pid < 2**31)
-
-    @property
-    def fields(self): return (self.spec.provider + str(self.pid), 'helper', self.spec.function, 'observe')
-
-    @property
-    def selector(self): return ':'.join(self.fields)
-
-    @property
-    def predicate(self): return ' /pid == ' + str(self.pid) + ' && arg0 == 0x' + self.spec.argument + '/ '
-
-
-def validate_header(raw, provider):
-    require(type(raw) is bytes and len(raw) <= 65536)
-    try: text = raw.decode('ascii')
-    except UnicodeError: raise GateFailure() from None
-    require(re.search(r'^#define\s+' + re.escape(provider.upper()) + r'_OBSERVE\s*\(', text, re.M))
-    return True
-
-
 def parse_ready(raw, pid):
     require(type(pid) is int and pid > 0 and raw == ('HELPER_READY ' + str(pid) + '\n').encode())
 
 
-def parse_listing(raw, probe):
-    require(type(raw) is bytes and len(raw) <= 65536 and type(probe) is ProbeIdentity)
-    try: lines = raw.decode('ascii').splitlines()
-    except UnicodeError: raise GateFailure() from None
-    require(lines and lines[0].split() == ['ID', 'PROVIDER', 'MODULE', 'FUNCTION', 'NAME'])
-    rows, identifiers = [line.split() for line in lines[1:] if line.strip()], set()
-    require(1 <= len(rows) <= 32)
-    for row in rows:
-        require(len(row) == 5 and re.fullmatch('[1-9][0-9]*', row[0]) and row[0] not in identifiers and
-                tuple(row[1:]) == probe.fields)
-        identifiers.add(row[0])
-    return len(rows)
-
-
-def parse_hit(raw, probe):
-    require(type(probe) is ProbeIdentity and type(raw) is bytes)
-    expected = 'HIT ' + str(probe.pid) + ' ' + ' '.join(probe.fields) + ' ' + probe.spec.argument + '\n'
-    require(raw == expected.encode())
-
-
 def tracer_command(probe):
-    require(type(probe) is ProbeIdentity)
+    require(type(probe) is usdt.ProbeIdentity)
     program = ('dtrace:::BEGIN { printf("TRACER_READY\\n"); } ' + probe.selector + probe.predicate +
                '{ printf("HIT %d %s %s %s %s %016llx\\n", pid, probeprov, probemod, probefunc, probename, arg0); exit(0); }')
     return ['/usr/sbin/dtrace', '-q', '-x', 'switchrate=10hz', '-n', program]
 
 
 def panic_compile_command(probe):
-    require(type(probe) is ProbeIdentity)
+    require(type(probe) is usdt.ProbeIdentity)
     return ['/usr/sbin/dtrace', '-w', '-e', '-n', probe.selector + probe.predicate + '{ panic(); }']
 
 
@@ -264,7 +200,7 @@ def write_private(path, raw):
 
 
 def helper_source(spec):
-    require(type(spec) is ProbeSpec)
+    require(type(spec) is usdt.ProbeSpec)
     return ('''#include "provider.h"
 #include <errno.h>
 #include <stdio.h>
@@ -274,10 +210,7 @@ static int command(char *value) {
     do { count = read(STDIN_FILENO, value, 1); } while (count < 0 && errno == EINTR);
     return count == 1;
 }
-__attribute__((noinline,used,visibility("default"))) void ''' + spec.function + '''(void) {
-    ''' + spec.provider.upper() + '_OBSERVE(0x' + spec.argument + '''ULL);
-}
-int main(void) {
+''' + usdt.function_source(spec).decode('ascii') + '''int main(void) {
     char value;
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("HELPER_READY %ld\\n", (long)getpid());
@@ -291,8 +224,8 @@ int main(void) {
 
 
 def build(directory, spec, architecture, state):
-    require(type(spec) is ProbeSpec and architecture in ('arm64', 'x86_64'))
-    provider_source = ('provider ' + spec.provider + ' { probe observe(unsigned long long); };\n').encode()
+    require(type(spec) is usdt.ProbeSpec and architecture in ('arm64', 'x86_64'))
+    provider_source = usdt.provider_source(spec)
     source = helper_source(spec)
     write_private(directory / 'provider.d', provider_source)
     write_private(directory / 'helper.c', source)
@@ -301,7 +234,7 @@ def build(directory, spec, architecture, state):
     command(['/usr/sbin/dtrace', '-h', '-s', str(directory / 'provider.d'), '-o', str(directory / 'provider.h')], 'header', state)
     require((directory / 'provider.h').stat().st_size <= 65536)
     header = (directory / 'provider.h').read_bytes()
-    validate_header(header, spec.provider)
+    usdt.validate_header(header, spec)
     state.report['hashes']['header'] = digest(header)
     state.stage('compile')
     command(['/usr/bin/xcrun', 'clang', '-arch', architecture, '-O0', '-g', '-Wall', '-Wextra', '-Werror', '-I', str(directory),
@@ -330,7 +263,7 @@ def execute(directory, spec, state, *, run_command=command):
         probe = spec.bind(helper.process.pid)
         state.stage('listing')
         listing = run_command(['/usr/sbin/dtrace', '-l', '-n', spec.provider + '*:::observe'], 'listing', state, 20)
-        state.report['listing_rows'] = parse_listing(listing, probe)
+        state.report['listing_rows'] = usdt.parse_listing(listing, probe)
         state.stage('compile_panic')
         compile_argv = panic_compile_command(probe)
         state.report['hashes']['panic_program'] = digest(compile_argv[-1].encode())
@@ -349,7 +282,7 @@ def execute(directory, spec, state, *, run_command=command):
         state.report['o_written'] = True
         state.stage('hit')
         hit = tracer.line(10)
-        parse_hit(hit, probe)
+        usdt.parse_hit(hit, probe)
         state.report['hit_count'] = 1
         state.stage('returned')
         require(helper.line(5) == b'HELPER_RETURNED\n')
@@ -407,14 +340,15 @@ def main():
         runner_temp = Path(os.environ['RUNNER_TEMP'])
         require(runner_temp.is_dir())
         state.stage('sources')
-        state.report['hashes'].update(script=digest(Path(__file__).read_bytes()), workflow=digest((Path(__file__).resolve().parents[1] / '.github/workflows/usdt-feasibility.yml').read_bytes()))
+        state.report['hashes'].update(script=digest(Path(__file__).read_bytes()), workflow=digest((Path(__file__).resolve().parents[1] / '.github/workflows/usdt-feasibility.yml').read_bytes()),
+                                      usdt_core=digest(Path(usdt.__file__).read_bytes()))
         state.stage('kernel')
         live = command(['/usr/sbin/sysctl', '-n', 'kern.uuid'], 'kernel_uuid', state).decode('ascii').strip().upper()
         file = command(['/usr/bin/xcrun', 'dwarfdump', '--uuid', '/System/Library/Kernels/kernel'], 'kernel_file', state, 20).decode('ascii')
         require(live == KERNEL_UUID and re.findall(r'UUID:\s*([0-9A-Fa-f-]+)\s*\(x86_64\)', file) == [KERNEL_UUID])
         state.report['kernel_matched'] = True
         nonce = secrets.token_hex(32)
-        spec = ProbeSpec(nonce)
+        spec = usdt.ProbeSpec(nonce)
         state.report['hashes'].update(nonce=digest(nonce.encode()), provider=digest(spec.provider.encode()), argument=digest(spec.argument.encode()))
         with tempfile.TemporaryDirectory(prefix='usdt-feasibility-', dir=runner_temp) as work:
             directory = Path(work)
