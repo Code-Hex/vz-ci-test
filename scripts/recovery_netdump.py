@@ -122,6 +122,44 @@ class BootBaseline:
         return cls.from_profile(value['baseline_boot_uuid'], value['boot_argument_profile'])
 
 
+def hello_observation(value):
+    exact(value, ('stage', 'expected_peer_port', 'hello_received', 'ack_received', 'sent',
+                  'valid_peer_port_mismatches', 'other_peer_ports'))
+    require(type(value['stage']) is str and value['stage'] in ('b1_intel', 'b1_receiver') and type(value['expected_peer_port']) is int and
+            1 <= value['expected_peer_port'] <= 65535 and type(value['hello_received']) is bool and type(value['ack_received']) is bool and
+            type(value['sent']) is int and 0 <= value['sent'] <= 280 and type(value['valid_peer_port_mismatches']) is int and
+            0 <= value['valid_peer_port_mismatches'] < 2 ** 31)
+    ports, count = value['other_peer_ports'], value['valid_peer_port_mismatches']
+    require(type(ports) is list and len(ports) <= 8 and all(type(port) is int and 1 <= port <= 65535 for port in ports))
+    require(ports == sorted(set(ports)) and value['expected_peer_port'] not in ports and len(ports) <= count and
+            (count == 0) == (ports == []) and
+            (value['sent'] > 0 or not (value['hello_received'] or value['ack_received'])))
+    return json.loads(canonical(value))
+
+
+def validate_hello_failure(value):
+    result = hello_observation(value)
+    require(not result['hello_received'] or not result['ack_received'] or result['valid_peer_port_mismatches'] != 0)
+    return result
+
+
+class HelloFailure(ValueError):
+    def __init__(self, fact):
+        super().__init__('hello_failed')
+        self._summary = canonical(validate_hello_failure(fact))
+
+    @property
+    def fact(self): return json.loads(self._summary)
+
+
+def hello_result(raw, stage, expected_peer_port):
+    exact(raw, ('hello_received', 'ack_received', 'sent', 'valid_peer_port_mismatches', 'other_peer_ports'))
+    fact = hello_observation({'stage': stage, 'expected_peer_port': expected_peer_port, **raw})
+    if not fact['hello_received'] or not fact['ack_received'] or fact['valid_peer_port_mismatches']:
+        raise HelloFailure(fact)
+    return HelloStats(fact['hello_received'], fact['ack_received'], fact['sent'])
+
+
 @dataclass(frozen=True)
 class ReceiverOffer:
     binding: str
@@ -571,6 +609,8 @@ def console_fact(value):
     if type(value.get('envelope')) is dict:
         for key in ('cipher_sha256', 'cert_fingerprint'):
             if hexadecimal(value['envelope'].get(key)): result[key] = value['envelope'][key]
+    if value.get('status') == 'failed' and 'hello_failure' in value:
+        result['hello_failure'] = validate_hello_failure(value['hello_failure'])
     return result
 
 
@@ -677,9 +717,11 @@ def peer(ctx, token, role, deadline, *, prime=False, boot_uuid=None):
 
 
 class DiscoveryFailure(ValueError):
-    def __init__(self, cleanup):
+    def __init__(self, cleanup, hello_failure=None):
         super().__init__('discovery_failed')
+        require(hello_failure is None or type(hello_failure) is HelloFailure)
         self.cleanup = cleanup
+        self.hello_failure = hello_failure.fact if hello_failure is not None else None
 
 
 def operation_deadline(hard_deadline, now):
@@ -717,10 +759,15 @@ class CheckOwner:
                 saved.get('output', {}).get('summary') == summary and saved.get('output', {}).get('title') == payload['output']['title'] and
                 saved.get('output', {}).get('text') in (None, ''))
 
-    def cleanup(self):
+    def cleanup(self, hello_failure=None):
+        extra = {}
+        if hello_failure is not None:
+            require(type(hello_failure) is HelloFailure and hello_failure.fact['stage'] == 'b1_' + self.role and
+                    not self.prime and self.synthetic_digest is None and self.capture_digest is None)
+            extra['hello_failure'] = hello_failure.fact
         if self.check_id is None: return 'not_acknowledged' if self.attempted else 'not_created'
         try:
-            self.publish({**self.latest, 'phase': 'failed', **({'receiver_check_id': self.check_id} if self.capture_digest else {})}, self.hard_deadline, complete=True)
+            self.publish({**self.latest, 'phase': 'failed', **({'receiver_check_id': self.check_id} if self.capture_digest else {}), **extra}, self.hard_deadline, complete=True)
             return 'acknowledged'
         except Exception:
             return 'not_acknowledged'
@@ -782,9 +829,11 @@ class ConnectedPeer:
         return self.sock.send(data)
 
 
-def hello(sock, endpoint, own_nonce, other_nonce, deadline):
+def hello(sock, endpoint, own_nonce, other_nonce, deadline, *, stage=None):
+    require(stage is None or stage in ('b1_intel', 'b1_receiver'))
     require(deadline - time.monotonic() >= 20)
     raw = udp.exchange(sock, (endpoint.ip, endpoint.port), bytes.fromhex(own_nonce[:32]), bytes.fromhex(other_nonce[:32]), 20)
+    if stage is not None: return hello_result(raw, stage, endpoint.port)
     require(raw['valid_peer_port_mismatches'] == 0 and raw['other_peer_ports'] == [])
     return HelloStats(raw['hello_received'], raw['ack_received'], raw['sent'])
 
@@ -831,7 +880,7 @@ def discover_open(ctx, token, cert, nonce64, main_path, purpose, baseline, hard_
         plan = DiscoveryPlan(offer, nonce64, endpoint, source, interface, settings, None, baseline)
         public = plan.public_fact()
         owner.publish(public, deadline)
-        stats = hello(ConnectedPeer(sock, address), offer.endpoint, nonce64, offer.nonce, deadline)
+        stats = hello(ConnectedPeer(sock, address), offer.endpoint, nonce64, offer.nonce, deadline, stage='b1_intel')
         plan = DiscoveryPlan(offer, nonce64, endpoint, source, interface, settings, stats, baseline)
         public = plan.public_fact()
         owner.publish(public, deadline)
@@ -839,9 +888,10 @@ def discover_open(ctx, token, cert, nonce64, main_path, purpose, baseline, hard_
         validate_ack(acknowledged, offer, public)
         owner.publish(public, deadline, complete=True)
         return plan, sock
-    except Exception:
+    except Exception as error:
         sock.close()
-        raise DiscoveryFailure(owner.cleanup()) from None
+        failure = error if type(error) is HelloFailure else None
+        raise DiscoveryFailure(owner.cleanup(failure), failure) from None
 
 
 def discover(ctx, token, cert, nonce64, *, main_path, purpose='discovery', baseline=None):
@@ -862,15 +912,16 @@ def serve_b1(ctx, token, fingerprint, core, network, sock, endpoint, deadline, h
         owner.publish(public, deadline)
         host_id, ready = wait_peer(ctx, token, 'intel', ('probe_ready',), deadline)
         validate_host_fact(ready, offer)
-        stats = hello(sock, Endpoint.from_record(ready['intel_public_endpoint']), offer.nonce, ready['nonce'], deadline)
+        stats = hello(sock, Endpoint.from_record(ready['intel_public_endpoint']), offer.nonce, ready['nonce'], deadline, stage='b1_receiver')
         _, plan = wait_peer(ctx, token, 'intel', ('plan',), deadline, host_id)
         validate_host_fact(plan, offer, expected_nonce=ready['nonce'])
         require(plan_base(ready) == plan_base(plan))
         public = ack_fact(offer, plan, stats)
         owner.publish(public, deadline, complete=True)
         return offer, plan, public
-    except Exception:
-        raise DiscoveryFailure(owner.cleanup()) from None
+    except Exception as error:
+        failure = error if type(error) is HelloFailure else None
+        raise DiscoveryFailure(owner.cleanup(failure), failure) from None
 
 
 def serve_discovery(ctx, token, cert, *, main_path):
@@ -1342,6 +1393,7 @@ def main():
         code = 0
     except DiscoveryFailure as error:
         result['cleanup'] = error.cleanup
+        if error.hello_failure is not None: result['hello_failure'] = error.hello_failure
     except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
         pass
     output = Path(os.environ['RUNNER_TEMP']) / 'debug'
