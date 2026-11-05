@@ -5,6 +5,7 @@ import tempfile
 import socket
 import struct
 import threading
+import time
 from pathlib import Path
 import unittest
 
@@ -14,6 +15,91 @@ spec.loader.exec_module(r)
 
 
 class Udp(unittest.TestCase):
+    def wire_state(self, role='receiver'):
+        import base64
+        import hashlib
+        return {'port_mode': 'crashdump-wire', 'role': role, 'result': 'established',
+                'wire_transfer': {'status': 'complete', 'scope': 'synthetic_crashdump_udp_only',
+                                  'bytes': 1200, 'sha256': 'a' * 64, 'filename_sha256': 'b' * 64},
+                'wire_cert_fingerprint': 'c' * 64,
+                'wire_sources': {key: 'd' * 64 for key in ('preflight_sha256', 'codec_sha256', 'reports_sha256')},
+                'wire_envelope': {'ciphertext': base64.b64encode(b'encrypted').decode(),
+                                  'cipher_sha256': hashlib.sha256(b'encrypted').hexdigest(),
+                                  'cert_fingerprint': 'c' * 64}}
+
+    def test_wire_artifact_fails_closed_and_filters_unpublished_fields(self):
+        state = self.wire_state()
+        state.update(raw_payload='private', token='secret')
+        self.assertEqual(r.sanitize_state(state)['result'], 'established')
+        self.assertNotIn('private', json.dumps(r.sanitize_state(state)))
+        self.assertNotIn('secret', json.dumps(r.sanitize_state(state)))
+        for key in ('wire_transfer', 'wire_cert_fingerprint', 'wire_sources', 'wire_envelope'):
+            with self.subTest(key=key):
+                invalid = {k: v for k, v in state.items() if k != key}
+                self.assertNotEqual(r.sanitize_state(invalid)['result'], 'established')
+
+    def test_wire_peer_requires_identical_sources_certificate_and_transfer(self):
+        state, peer = self.wire_state('intel'), self.wire_state()
+        self.assertTrue(r.wire_pair_matches(state, peer))
+        for key, value in [('wire_sources', {}), ('wire_cert_fingerprint', 'e' * 64),
+                           ('wire_transfer', {}), ('wire_envelope', {})]:
+            self.assertFalse(r.wire_pair_matches(state, dict(peer, **{key: value})))
+
+    def test_wire_commit_failure_withholds_eof_ack(self):
+        data = b'VZ_SYNTHETIC_NON_KERNEL\nvalue'
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as a, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as b:
+            a.bind(('127.0.0.1', 0)); b.bind(('127.0.0.1', 0))
+            failures = []
+            def receive():
+                try:
+                    r.wire_exchange(b, a.getsockname(), 'receiver', 'fixture', data, lambda value: False, seconds=1)
+                except ValueError as exc:
+                    failures.append(str(exc))
+            thread = threading.Thread(target=receive)
+            thread.start()
+            with self.assertRaises(TimeoutError):
+                r.wire_exchange(a, b.getsockname(), 'intel', 'fixture', data, None, seconds=1)
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, ['wire_commit_unconfirmed'])
+
+    def test_synthetic_wire_fixture_is_role_independent_and_never_a_kernel_panic(self):
+        a, b = b'a' * 16, b'b' * 16
+        sender = r.wire_fixture(self.context(mode='crashdump-wire'), a, b)
+        receiver = r.wire_fixture(self.context('receiver', 'crashdump-wire'), b, a)
+        self.assertEqual(sender, receiver)
+        self.assertTrue(sender[1].startswith(b'VZ_SYNTHETIC_NON_KERNEL\n'))
+        self.assertGreater(len(sender[1]), 1024)
+        self.assertLessEqual(len(sender[1]), 12288)
+        self.assertNotIn(b'panic(cpu', sender[1])
+        peer = self.ready(self.context(mode='crashdump-wire'), 'receiver')
+        self.assertEqual(r.bind_port(self.context(mode='crashdump-wire'), peer), 46272)
+        with self.assertRaises(ValueError):
+            r.bind_port(self.context(mode='crashdump-wire'), dict(peer, endpoint={'ip': '1.1.1.1', 'port': 41139}))
+
+    def test_synthetic_transfer_over_real_udp_commits_before_final_ack(self):
+        data = b'VZ_SYNTHETIC_NON_KERNEL\n' + b'x' * 1200
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as a, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as b:
+            a.bind(('127.0.0.1', 0)); b.bind(('127.0.0.1', 0))
+            result, committed = {}, []
+            def commit(value):
+                time.sleep(4.2)
+                committed.append(value)
+                return True
+            def receive():
+                result['receiver'] = r.wire_exchange(b, a.getsockname(), 'receiver', 'fixture', data,
+                    commit, seconds=8)
+            thread = threading.Thread(target=receive)
+            thread.start()
+            a.sendto(r.PACKET.pack(b'KDP1', 1, b'a' * 16, b'b' * 16, 1), b.getsockname())
+            result['sender'] = r.wire_exchange(a, b.getsockname(), 'intel', 'fixture', data, None, seconds=8)
+            thread.join(9)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(committed, [data])
+            self.assertEqual(result['receiver'], result['sender'])
+            self.assertEqual(result['sender']['status'], 'complete')
+            self.assertEqual(result['sender']['bytes'], len(data))
+
     def response(self, tx, port=43210, ip="1.1.1.1"):
         mapped = struct.pack("!BBHI", 0, 1, port ^ 0x2112, int.from_bytes(socket.inet_aton(ip), "big") ^ r.COOKIE)
         attr = struct.pack("!HH", 0x20, len(mapped)) + mapped

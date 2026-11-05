@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Same-run UDP/STUN path preflight; no KDP or kernel state is transmitted."""
+"""Same-run userspace UDP/STUN and synthetic crashdump checks; no kernel data."""
+import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -13,6 +15,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+import kdp_crashdump as wire
+import recovery_reports as reports
 
 COOKIE = 0x2112A442
 UUID = "87453B1D-A163-31FA-B33B-0FB4BE78E6E8"
@@ -153,7 +158,7 @@ def binding(ctx, role):
 
 
 def port_mode(value="symmetric"):
-    if value not in ("symmetric", "kernel-source"):
+    if value not in ("symmetric", "kernel-source", "crashdump-wire"):
         raise ValueError("port mode rejected")
     return value
 
@@ -175,14 +180,17 @@ def peer_endpoint(peer, own_nonce=None):
 
 
 def bind_port(ctx, peer=None):
-    if ctx["port_mode"] == "kernel-source" and ctx["role"] == "intel":
+    if ctx["port_mode"] in ("kernel-source", "crashdump-wire") and ctx["role"] == "intel":
         peer_metadata(peer, ctx, "receiver")
-        return peer_endpoint(peer)[0][1]
+        port = peer_endpoint(peer)[0][1]
+        if ctx["port_mode"] == "crashdump-wire" and port == 41139:
+            raise ValueError("interactive port excluded")
+        return port
     return 41139
 
 
 def port_pair_matches(state, peer):
-    if (state.get("port_mode") not in ("symmetric", "kernel-source") or
+    if (state.get("port_mode") not in ("symmetric", "kernel-source", "crashdump-wire") or
             peer.get("port_mode") != state["port_mode"] or
             {state.get("role"), peer.get("role")} != {"intel", "receiver"}):
         return False
@@ -198,7 +206,8 @@ def port_pair_matches(state, peer):
     if state["port_mode"] == "symmetric":
         return state["local_port"] == peer["local_port"] == 41139
     intel, receiver = (state, peer) if state["role"] == "intel" else (peer, state)
-    return receiver["local_port"] == 41139 and intel["local_port"] == receiver["endpoint"]["port"]
+    return (receiver["local_port"] == 41139 and intel["local_port"] == receiver["endpoint"]["port"] and
+            (state["port_mode"] != "crashdump-wire" or intel["local_port"] != 41139))
 
 
 def validate_context():
@@ -299,8 +308,124 @@ def window_outcome(stats, start_ns, end_ns, peer):
                              peer_stats["hello_received"] and peer_stats["ack_received"]) else "not_established"
 
 
+SYNTHETIC_PREFIX = b'VZ_SYNTHETIC_NON_KERNEL\n'
+
+
+def wire_fixture(ctx, own_nonce, peer_nonce):
+    intel, receiver = (own_nonce, peer_nonce) if ctx['role'] == 'intel' else (peer_nonce, own_nonce)
+    body = json.dumps({'binding': '/'.join((ctx['run'], ctx['attempt'], ctx['sha'])),
+                       'intel_nonce': intel.hex(), 'receiver_nonce': receiver.hex()}, separators=(',', ':')).encode()
+    return 'vz-synthetic-' + hashlib.sha256(body).hexdigest(), SYNTHETIC_PREFIX + body + b'\n' + b'0123456789abcdef' * 70
+
+
+def _wire_packet(sock, peer, packet, block, deadline):
+    for _ in range(240):
+        if time.monotonic() >= deadline:
+            break
+        sock.sendto(packet, peer)
+        until = min(deadline, time.monotonic() + .25)
+        for _ in range(256):
+            remaining = until - time.monotonic()
+            if remaining <= 0 or not select.select([sock], [], [], remaining)[0]:
+                break
+            data, address = sock.recvfrom(4096)
+            if address == peer and wire.decode_ack(data) == block:
+                return
+    raise TimeoutError('wire_ack_unconfirmed')
+
+
+def wire_exchange(sock, peer, role, filename, data, commit, *, seconds=60):
+    deadline = time.monotonic() + seconds
+    previous = sock.gettimeout()
+    sock.settimeout(.25)
+    try:
+        if role == 'intel':
+            _wire_packet(sock, peer, wire.encode_wrq(filename), 0, deadline)
+            block = 1
+            for offset in range(0, len(data), 512):
+                _wire_packet(sock, peer, wire.encode_data(block, data[offset:offset + 512]), block, deadline)
+                block += 1
+            _wire_packet(sock, peer, wire.encode_eof(block), block, deadline)
+        elif role == 'receiver' and callable(commit):
+            receiver = wire.Receiver(filename, SYNTHETIC_PREFIX)
+            committed = False
+            for _ in range(256):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if not select.select([sock], [], [], min(.25, remaining))[0]:
+                    continue
+                packet, address = sock.recvfrom(4096)
+                if address != peer or packet.startswith(b'KDP1'):
+                    continue
+                reply = receiver.receive(packet)
+                if receiver.state == 'failed':
+                    raise ValueError('wire_packet_rejected')
+                if receiver.state == 'complete' and not committed:
+                    if receiver.data != data or commit(receiver.data) is not True:
+                        raise ValueError('wire_commit_unconfirmed')
+                    committed = True
+                    deadline = min(deadline, time.monotonic() + 1)
+                if reply is not None:
+                    sock.sendto(reply, peer)
+            if not committed:
+                raise TimeoutError('wire_transfer_incomplete')
+        else:
+            raise ValueError('wire_role_invalid')
+        return {'status': 'complete', 'scope': 'synthetic_crashdump_udp_only', 'bytes': len(data),
+                'sha256': hashlib.sha256(data).hexdigest(), 'filename_sha256': hashlib.sha256(filename.encode()).hexdigest()}
+    finally:
+        sock.settimeout(previous)
+
+
+def wire_fact(value):
+    if (not isinstance(value, dict) or set(value) != {'status', 'scope', 'bytes', 'sha256', 'filename_sha256'} or
+            value['status'] != 'complete' or value['scope'] != 'synthetic_crashdump_udp_only' or
+            type(value['bytes']) is not int or not 0 < value['bytes'] <= 12288 or
+            any(not isinstance(value[key], str) or not re.fullmatch(r'[0-9a-f]{64}', value[key]) for key in ('sha256', 'filename_sha256'))):
+        raise ValueError('wire_fact_invalid')
+    return dict(value)
+
+
+def wire_envelope(value, fingerprint):
+    if (not isinstance(value, dict) or set(value) != {'ciphertext', 'cipher_sha256', 'cert_fingerprint'} or
+            value['cert_fingerprint'] != fingerprint or not isinstance(value['ciphertext'], str) or
+            not 0 < len(value['ciphertext']) <= 58000):
+        raise ValueError('wire_envelope_invalid')
+    encrypted = base64.b64decode(value['ciphertext'], validate=True)
+    if hashlib.sha256(encrypted).hexdigest() != value['cipher_sha256']:
+        raise ValueError('wire_envelope_invalid')
+    return dict(value)
+
+
+def wire_sources(value):
+    if (not isinstance(value, dict) or set(value) != {'preflight_sha256', 'codec_sha256', 'reports_sha256'} or
+            any(not isinstance(item, str) or not re.fullmatch(r'[0-9a-f]{64}', item) for item in value.values())):
+        raise ValueError('wire_source_invalid')
+    return dict(value)
+
+
+def wire_pair_matches(state, peer):
+    try:
+        if {state.get('role'), peer.get('role')} != {'intel', 'receiver'}:
+            return False
+        fingerprint = state.get('wire_cert_fingerprint')
+        if (not isinstance(fingerprint, str) or not re.fullmatch(r'[0-9a-f]{64}', fingerprint) or
+                peer.get('wire_cert_fingerprint') != fingerprint or
+                wire_sources(state.get('wire_sources')) != wire_sources(peer.get('wire_sources')) or
+                wire_fact(state.get('wire_transfer')) != wire_fact(peer.get('wire_transfer'))):
+            return False
+        receiver = state if state['role'] == 'receiver' else peer
+        wire_envelope(receiver.get('wire_envelope'), fingerprint)
+        return True
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
 def run(ctx, token):
     own, other = ctx["role"], "receiver" if ctx["role"] == "intel" else "intel"
+    cert = os.environ.pop("KDP_REPORT_CERT", "").encode()
+    fingerprint = reports.cert_fingerprint(cert) if ctx["port_mode"] == "crashdump-wire" else None
     check = api("POST", "/check-runs", token, {"name": "KDP UDP " + own + " " + ctx["run"],
                 "head_sha": ctx["sha"], "external_id": binding(ctx, own), "status": "in_progress",
                 "output": {"title": "UDP path preflight", "summary": json.dumps({"phase": "init", "role": own,
@@ -314,7 +439,7 @@ def run(ctx, token):
     try:
         nonce = os.urandom(16)
         peer = None
-        if ctx["port_mode"] == "kernel-source" and own == "intel":
+        if ctx["port_mode"] in ("kernel-source", "crashdump-wire") and own == "intel":
             peer = wait_peer(ctx, token, other, nonce.hex())
             if peer is None:
                 state.update({"result": "window_unconfirmed", "reason": "peer_not_ready"})
@@ -355,8 +480,34 @@ def run(ctx, token):
         start_ns = time.time_ns()
         stats = exchange(sock, address, nonce, peer_nonce, 30)
         end_ns = time.time_ns()
-        state.update({"phase": "result", "result": "pending", "start_ns": start_ns, "end_ns": end_ns,
+        state.update({"phase": "probing", "result": "pending", "start_ns": start_ns, "end_ns": end_ns,
                       "window_clock": "utc_clock_skew_unmeasured", "scope": "userspace_udp_only", "stats": stats})
+        if ctx['port_mode'] == 'crashdump-wire':
+            if not stats['hello_received'] or not stats['ack_received']:
+                raise ValueError('wire_path_unconfirmed')
+            filename, payload = wire_fixture(ctx, nonce, peer_nonce)
+            state['scope'] = 'synthetic_crashdump_udp_only'
+            state['wire_cert_fingerprint'] = fingerprint
+            state['wire_sources'] = {key: hashlib.sha256(Path(path).read_bytes()).hexdigest() for key, path in
+                (('preflight_sha256', __file__), ('codec_sha256', wire.__file__), ('reports_sha256', reports.__file__))}
+            def commit(value):
+                state['wire_transfer'] = wire_fact({'status': 'complete', 'scope': 'synthetic_crashdump_udp_only',
+                    'bytes': len(value), 'sha256': hashlib.sha256(value).hexdigest(),
+                    'filename_sha256': hashlib.sha256(filename.encode()).hexdigest()})
+                state['wire_envelope'] = reports.encrypt_bundle(cert, {'kind': 'synthetic_crashdump',
+                    'binding': binding(ctx, own), 'nonce': nonce.hex(), 'peer_nonce': peer_nonce.hex(),
+                    'sources': state['wire_sources'], 'payload_sha256': hashlib.sha256(value).hexdigest()}, value)
+                wire_envelope(state['wire_envelope'], fingerprint)
+                if len(json.dumps(state).encode()) > 60000:
+                    raise ValueError('wire_public_result_oversized')
+                update(check_id, token, state)
+                saved = api('GET', '/check-runs/' + str(check_id), token)
+                if (not check_identity(saved, ctx, own) or saved.get('status') != 'in_progress' or
+                        saved.get('output', {}).get('summary') != json.dumps(state, separators=(',', ':'))):
+                    raise ValueError('wire_public_commit_unconfirmed')
+                return True
+            state['wire_transfer'] = wire_exchange(sock, address, own, filename, payload, commit if own == 'receiver' else None)
+        state['phase'] = 'result'
         update(check_id, token, state)
         peer_last = None
         wait_until = time.monotonic() + 35
@@ -372,6 +523,8 @@ def run(ctx, token):
             state.update({"result": "window_unconfirmed", "reason": "port_pair_mismatch"})
         else:
             state["result"] = window_outcome(stats, start_ns, end_ns, peer_last)
+            if ctx['port_mode'] == 'crashdump-wire' and not wire_pair_matches(state, peer_last):
+                state['result'] = 'window_unconfirmed'
             state.pop("reason", None)
         return state
     finally:
@@ -389,19 +542,34 @@ def run(ctx, token):
                           "reason": state.get("reason"), "window_clock": state.get("window_clock"),
                           "port_mode": ctx["port_mode"], "local_port": state.get("local_port"),
                           "peer_public_port": state.get("peer_public_port"),
-                          "scope": "userspace_udp_only", "stats": state.get("stats")}), flush=True)
+                          "scope": state.get('scope', 'userspace_udp_only'), "stats": state.get("stats")}), flush=True)
 
 
 def sanitize_state(state):
     result = {"phase": "result", "scope": "userspace_udp_only"}
+    if state.get('port_mode') == 'crashdump-wire':
+        result['scope'] = 'synthetic_crashdump_udp_only'
+        try:
+            result['wire_transfer'] = wire_fact(state.get('wire_transfer'))
+            fingerprint = state.get('wire_cert_fingerprint')
+            if not isinstance(fingerprint, str) or not re.fullmatch(r'[0-9a-f]{64}', fingerprint):
+                raise ValueError('wire_certificate_invalid')
+            result['wire_cert_fingerprint'] = fingerprint
+            result['wire_sources'] = wire_sources(state.get('wire_sources'))
+            if state.get('role') == 'receiver':
+                result['wire_envelope'] = wire_envelope(state.get('wire_envelope'), fingerprint)
+        except (ValueError, TypeError):
+            result.pop('wire_transfer', None)
     if state.get("role") in ("intel", "receiver"):
         result["role"] = state["role"]
-    if state.get("port_mode") in ("symmetric", "kernel-source"):
+    if state.get("port_mode") in ("symmetric", "kernel-source", "crashdump-wire"):
         result["port_mode"] = state["port_mode"]
     for key in ("local_port", "peer_public_port"):
         if type(state.get(key)) is int and 0 < state[key] < 65536:
             result[key] = state[key]
     result["result"] = state.get("result") if state.get("result") in ("unsupported", "window_unconfirmed", "not_established", "established") else "unsupported"
+    if state.get('port_mode') == 'crashdump-wire' and 'wire_transfer' not in result:
+        result['result'] = 'window_unconfirmed'
     if state.get("reason") in ("preflight_failed", "stun_or_bind_unavailable", "peer_not_ready", "probe_incomplete", "peer_metadata_missing_or_changed", "port_pair_mismatch"):
         result["reason"] = state["reason"]
     nonce = state.get("nonce")

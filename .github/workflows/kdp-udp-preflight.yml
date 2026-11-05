@@ -10,7 +10,12 @@ on:
         options:
           - symmetric
           - kernel-source
+          - crashdump-wire
         default: symmetric
+      report_cert:
+        description: Public RSA-4096 recipient certificate for the synthetic transfer
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -29,12 +34,13 @@ jobs:
           - role: receiver
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 4
+    timeout-minutes: 6
     env:
       KDP_ROLE: ${{ matrix.role }}
       KDP_PORT_MODE: ${{ inputs.port_mode || 'symmetric' }}
       KDP_STUN_HOST: stun.cloudflare.com
       KDP_STUN_PORT: '3478'
+      KDP_REPORT_CERT: ${{ inputs.report_cert }}
     steps:
       - name: Check out trusted diagnostic scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
