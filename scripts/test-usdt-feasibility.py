@@ -46,6 +46,18 @@ class Feasibility(unittest.TestCase):
         self.assertFalse(any(flag in command for flag in ('-p', '-c', '-W', '-w', '-Z')))
         self.assertNotIn('panic(', command[-1])
 
+    def test_final_output_requires_exactly_one_cli_lf_and_unchanged_helper(self):
+        ready = b'HELPER_READY 123\n'
+        hit = b'HIT 123 vzobsaaaaaaaaaaaaaaaap123 helper main observe aaaaaaaaaaaaaaaa\n'
+        tracer = b'TRACER_READY\n' + hit
+        helper = ready + b'HELPER_RETURNED\n'
+        f.validate_final_output(tracer + b'\n', helper, ready, hit)
+        for extra in (b'', b'\n\n', b'x', hit + b'\n', b'\r\n'):
+            with self.subTest(extra=extra):
+                with self.assertRaises(f.GateFailure): f.validate_final_output(tracer + extra, helper, ready, hit)
+        for changed in (helper + b'\n', helper.replace(b'\n', b'\r\n')):
+            with self.assertRaises(f.GateFailure): f.validate_final_output(tracer + b'\n', changed, ready, hit)
+
     def test_public_report_rejects_raw_and_context_rejects_untrusted_inputs(self):
         report = f.initial_report()
         self.assertEqual(f.public_report(report), report)

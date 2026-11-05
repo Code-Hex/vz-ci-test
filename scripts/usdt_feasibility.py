@@ -269,6 +269,10 @@ int main(void) {
     state.report['hashes']['helper_binary'] = digest((directory / 'helper').read_bytes())
 
 
+def validate_final_output(tracer, helper, ready, hit):
+    require(tracer == b'TRACER_READY\n' + hit + b'\n' and helper == ready + b'HELPER_RETURNED\n')
+
+
 def execute(directory, provider, argument, state):
     helper = tracer = None
     try:
@@ -303,8 +307,7 @@ def execute(directory, provider, argument, state):
         state.report['q_written'] = True
         state.stage('exits')
         require(tracer.finish(5) == helper.finish(5) == 0)
-        require(bytes(tracer.data['stdout']) == b'TRACER_READY\n' + hit and
-                bytes(helper.data['stdout']) == ready + b'HELPER_RETURNED\n')
+        validate_final_output(bytes(tracer.data['stdout']), bytes(helper.data['stdout']), ready, hit)
     finally:
         for name, child in (('tracer', tracer), ('helper', helper)):
             if child is not None:
