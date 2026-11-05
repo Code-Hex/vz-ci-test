@@ -124,9 +124,11 @@ class PanicControl(unittest.TestCase):
             diagnostic = __import__('json').loads((root / 'timeout-diagnostic.json').read_text())
             self.assertIn(diagnostic['ps_status'], ('ok', 'failed', 'timeout', 'limit', 'unavailable'))
             self.assertEqual(diagnostic['profiler'], 'spindump')
+            self.assertEqual(diagnostic['profiler_deadline_seconds'], 10)
+            self.assertGreaterEqual(diagnostic['elapsed_ms'], 0)
             self.assertEqual(diagnostic['spindump_status'], 'limit')
             self.assertEqual(calls[1], (['/usr/sbin/spindump', str(callback_pids[0]), '1', '10', '-onlyTarget',
-                                        '-noSymbolicate', '-noBinary', '-noFile'], 'spindump', 25536, 3))
+                                        '-noSymbolicate', '-noBinary', '-noFile'], 'spindump', 25536, 10))
             self.assertEqual((calls[0][1], calls[0][2], calls[0][3]), ('ps', 65536, 2))
             self.assertEqual(calls[0][0], ['/bin/ps', '-p', str(callback_pids[0]), '-o',
                                           'pid=,state=,wchan=,comm=,etime=,time=,pcpu='])

@@ -214,15 +214,18 @@ def _sync_directory(path):
 def capture_timeout(target, directory, *, sync=_sync_directory):
     directory = Path(directory)
     budget = 65536
+    started = time.monotonic()
+    profiler_deadline = 10
     ps_status = spindump_status = 'unavailable'
     if target.poll() is None:
         ps_status, budget = _timeout_command(['/bin/ps', '-p', str(target.pid), '-o', 'pid=,state=,wchan=,comm=,etime=,time=,pcpu='],
                                              directory, 'ps', budget, 2)
     if target.poll() is None:
         spindump_status, budget = _timeout_command(['/usr/sbin/spindump', str(target.pid), '1', '10',
-            '-onlyTarget', '-noSymbolicate', '-noBinary', '-noFile'], directory, 'spindump', budget, 3)
+            '-onlyTarget', '-noSymbolicate', '-noBinary', '-noFile'], directory, 'spindump', budget, profiler_deadline)
     once_record(directory, 'timeout-diagnostic.json', {'ps_status': ps_status, 'profiler': 'spindump', 'spindump_status': spindump_status,
-                                                       'bytes_captured': 65536 - budget}, sync)
+                                                       'bytes_captured': 65536 - budget, 'profiler_deadline_seconds': profiler_deadline,
+                                                       'elapsed_ms': max(0, int((time.monotonic() - started) * 1000))}, sync)
 
 
 def prepare(directory, nonce, save, sync, *, observe=None, compile_only=None):
