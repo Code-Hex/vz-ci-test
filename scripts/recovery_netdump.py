@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.error import HTTPError
 
 import kdp_udp_preflight as udp
 import recovery_reports as reports
@@ -611,6 +612,8 @@ def console_fact(value):
             if hexadecimal(value['envelope'].get(key)): result[key] = value['envelope'][key]
     if value.get('status') == 'failed' and 'hello_failure' in value:
         result['hello_failure'] = validate_hello_failure(value['hello_failure'])
+    if value.get('status') == 'failed' and 'evidence' in value:
+        result['evidence'] = validate_evidence(value['evidence'])
     return result
 
 
@@ -680,9 +683,110 @@ def bounded_session(seconds=180, hard_deadline=None):
             signal.setitimer(signal.ITIMER_REAL, max(.001, previous_timer[0] - (time.monotonic() - started)), previous_timer[1])
 
 
+IDENTITY_FIELDS = ('id', 'name', 'head_sha', 'external_id', 'app_id', 'app_slug', 'details_url')
+READBACK_FIELDS = ('status', 'conclusion', 'summary', 'title', 'text')
+
+
+def validate_evidence(value):
+    require(type(value) is dict)
+    if value.get('kind') == 'http_error':
+        exact(value, ('kind', 'method', 'resource', 'status', 'rate_limit', 'retry_after'))
+        require(type(value['method']) is str and value['method'] in ('GET', 'POST', 'PATCH') and type(value['resource']) is str and value['resource'] in
+                ('check_collection', 'check_item', 'head_checks', 'attempt_jobs') and
+                type(value['status']) is int and 100 <= value['status'] <= 599)
+        exact(value['rate_limit'], ('limit', 'remaining', 'used', 'reset'))
+        require(all(item is None or type(item) is int and 0 <= item < 2 ** 63
+                    for item in (*value['rate_limit'].values(), value['retry_after'])))
+    else:
+        exact(value, ('kind', 'stage', 'matches'))
+        require(value['kind'] == 'check_mismatch' and type(value['stage']) is str and value['stage'] in ('post_identity', 'get_readback'))
+        exact(value['matches'], IDENTITY_FIELDS + (READBACK_FIELDS if value['stage'] == 'get_readback' else ()))
+        require(all(type(item) is bool for item in value['matches'].values()) and not all(value['matches'].values()))
+    return json.loads(canonical(value))
+
+
+class EvidenceFailure(ValueError):
+    def __init__(self, evidence):
+        evidence = validate_evidence(evidence)
+        require(evidence['kind'] == 'check_mismatch')
+        super().__init__('boundary_failed')
+        self._summary = canonical(evidence)
+
+    @property
+    def fact(self): return json.loads(self._summary)
+
+
+class HTTPFailure(HTTPError):
+    def __init__(self, evidence):
+        evidence = validate_evidence(evidence)
+        require(evidence['kind'] == 'http_error')
+        super().__init__('', evidence['status'], 'http_boundary_failed', None, None)
+        self.close()
+        self.fp = None
+        self._summary = canonical(evidence)
+
+    @property
+    def fact(self): return json.loads(self._summary)
+
+
+def error_evidence(error):
+    if type(error) in (EvidenceFailure, HTTPFailure): return error.fact
+    if type(error) is DiscoveryFailure: return error.evidence
+    return None
+
+
+def http_evidence(error, method, path):
+    resource = None
+    if path == '/check-runs': resource = 'check_collection'
+    elif re.fullmatch(r'/check-runs/[1-9][0-9]*', path): resource = 'check_item'
+    elif re.fullmatch(r'/commits/[0-9a-f]{40}/check-runs\?filter=all&per_page=100', path): resource = 'head_checks'
+    elif re.fullmatch(r'/actions/runs/[1-9][0-9]{0,19}/attempts/[1-9][0-9]{0,4}/jobs\?per_page=100', path): resource = 'attempt_jobs'
+    def number(name):
+        values = error.headers.get_all(name, []) if error.headers is not None else []
+        if len(values) != 1 or type(values[0]) is not str: return None
+        raw = values[0].strip()
+        if not re.fullmatch(r'[0-9]{1,19}', raw): return None
+        parsed = int(raw)
+        return parsed if parsed < 2 ** 63 else None
+    return validate_evidence({'kind': 'http_error', 'method': method, 'resource': resource, 'status': error.code,
+                             'rate_limit': {key: number('X-RateLimit-' + key) for key in ('limit', 'remaining', 'used', 'reset')},
+                             'retry_after': number('Retry-After')})
+
+
+def verify_check(check, ctx, role, stage, *, expected_id=None, payload=None, prime=False, boot_uuid=None,
+                 synthetic_digest=None, capture_digest=None):
+    require(stage in ('post_identity', 'get_readback'))
+    name, external = check_attributes(ctx, role, prime, boot_uuid, synthetic_digest, capture_digest)
+    item = check if type(check) is dict else {}
+    app = item.get('app') if type(item.get('app')) is dict else {}
+    number = item.get('id')
+    matches = {'id': type(number) is int and number > 0 and (expected_id is None or number == expected_id),
+               'name': item.get('name') == name, 'head_sha': item.get('head_sha') == ctx['sha'],
+               'external_id': item.get('external_id') == external, 'app_id': app.get('id') == 15368,
+               'app_slug': app.get('slug') == 'github-actions',
+               'details_url': item.get('details_url') == 'https://github.com/Code-Hex/vz-ci-test/runs/' + str(number)}
+    if stage == 'get_readback':
+        require(type(payload) is dict and type(payload.get('output')) is dict)
+        output = item.get('output')
+        matches.update(status=item.get('status') == payload['status'], conclusion=item.get('conclusion') == payload.get('conclusion'),
+                       summary=type(output) is dict and output.get('summary') == payload['output']['summary'],
+                       title=type(output) is dict and output.get('title') == payload['output']['title'],
+                       text=type(output) is dict and output.get('text') in (None, ''))
+    if not all(matches.values()):
+        raise EvidenceFailure({'kind': 'check_mismatch', 'stage': stage, 'matches': matches})
+
+
 def call(deadline, method, path, token, payload=None):
     if deadline - time.monotonic() < 8: raise TimeoutError('discovery_deadline')
-    return udp.api(method, path, token, payload)
+    try:
+        return udp.api(method, path, token, payload)
+    except HTTPError as error:
+        evidence = http_evidence(error, method, path)
+        try:
+            error.close()
+        except OSError:
+            pass
+    raise HTTPFailure(evidence) from None
 
 
 def check_payload(check, ctx, role, *, prime=False, boot_uuid=None):
@@ -717,10 +821,11 @@ def peer(ctx, token, role, deadline, *, prime=False, boot_uuid=None):
 
 
 class DiscoveryFailure(ValueError):
-    def __init__(self, cleanup, hello_failure=None):
+    def __init__(self, cleanup, hello_failure=None, *, evidence=None):
         super().__init__('discovery_failed')
         require(hello_failure is None or type(hello_failure) is HelloFailure)
         self.cleanup = cleanup
+        self.evidence = validate_evidence(evidence) if evidence is not None else None
         self.hello_failure = hello_failure.fact if hello_failure is not None else None
 
 
@@ -749,22 +854,24 @@ class CheckOwner:
             payload.update(name=name, head_sha=self.ctx['sha'], external_id=external)
             self.attempted = True
             created = call(deadline, 'POST', '/check-runs', self.token, payload)
-            require(check_identity(created, self.ctx, self.role, prime=self.prime, boot_uuid=self.boot_uuid, synthetic_digest=self.synthetic_digest, capture_digest=self.capture_digest))
+            verify_check(created, self.ctx, self.role, 'post_identity', prime=self.prime, boot_uuid=self.boot_uuid,
+                         synthetic_digest=self.synthetic_digest, capture_digest=self.capture_digest)
             self.check_id = created['id']
         else:
             call(deadline, 'PATCH', '/check-runs/' + str(self.check_id), self.token, payload)
         saved = call(deadline, 'GET', '/check-runs/' + str(self.check_id), self.token)
-        require(check_identity(saved, self.ctx, self.role, prime=self.prime, boot_uuid=self.boot_uuid, synthetic_digest=self.synthetic_digest, capture_digest=self.capture_digest) and saved['id'] == self.check_id and
-                saved.get('status') == payload['status'] and saved.get('conclusion') == payload.get('conclusion') and
-                saved.get('output', {}).get('summary') == summary and saved.get('output', {}).get('title') == payload['output']['title'] and
-                saved.get('output', {}).get('text') in (None, ''))
+        verify_check(saved, self.ctx, self.role, 'get_readback', expected_id=self.check_id, payload=payload,
+                     prime=self.prime, boot_uuid=self.boot_uuid, synthetic_digest=self.synthetic_digest, capture_digest=self.capture_digest)
 
-    def cleanup(self, hello_failure=None):
+    def cleanup(self, hello_failure=None, *, evidence=None):
         extra = {}
         if hello_failure is not None:
             require(type(hello_failure) is HelloFailure and hello_failure.fact['stage'] == ('b2_' if self.prime else 'b1_') + self.role and
                     self.synthetic_digest is None and self.capture_digest is None)
             extra['hello_failure'] = hello_failure.fact
+        if evidence is not None:
+            require(self.synthetic_digest is None and self.capture_digest is None)
+            extra['evidence'] = validate_evidence(evidence)
         if self.check_id is None: return 'not_acknowledged' if self.attempted else 'not_created'
         try:
             self.publish({**self.latest, 'phase': 'failed', **({'receiver_check_id': self.check_id} if self.capture_digest else {}), **extra}, self.hard_deadline, complete=True)
@@ -889,9 +996,10 @@ def discover_open(ctx, token, cert, nonce64, main_path, purpose, baseline, hard_
         owner.publish(public, deadline, complete=True)
         return plan, sock
     except Exception as error:
+        evidence = error_evidence(error)
         sock.close()
         failure = error if type(error) is HelloFailure else None
-        raise DiscoveryFailure(owner.cleanup(failure), failure) from None
+        raise DiscoveryFailure(owner.cleanup(failure, evidence=evidence), failure, evidence=evidence) from None
 
 
 def discover(ctx, token, cert, nonce64, *, main_path, purpose='discovery', baseline=None):
@@ -921,7 +1029,8 @@ def serve_b1(ctx, token, fingerprint, core, network, sock, endpoint, deadline, h
         return offer, plan, public
     except Exception as error:
         failure = error if type(error) is HelloFailure else None
-        raise DiscoveryFailure(owner.cleanup(failure), failure) from None
+        evidence = error_evidence(error)
+        raise DiscoveryFailure(owner.cleanup(failure, evidence=evidence), failure, evidence=evidence) from None
 
 
 def serve_discovery(ctx, token, cert, *, main_path):
@@ -977,7 +1086,8 @@ def prime(ctx, token, cert, plan, boot_uuid, recovery_check_id, *, main_path, ha
             return verify_prime_ack(ctx, token, proof, scope, snapshot['facts']['netdump_active_control'], deadline)
         except Exception as error:
             failure = error if type(error) is HelloFailure else None
-            raise DiscoveryFailure(owner.cleanup(failure), failure) from None
+            evidence = error_evidence(error)
+            raise DiscoveryFailure(owner.cleanup(failure, evidence=evidence), failure, evidence=evidence) from None
         finally:
             sock.close()
 
@@ -1018,13 +1128,15 @@ def serve_receiver(ctx, token, cert, *, main_path, purpose):
             if purpose == 'capture':
                 return capture_socket(ctx, token, cert, sock, proof, deadline, hard)
             return proof
-        except DiscoveryFailure:
+        except DiscoveryFailure as error:
             if completed or not owner.attempted: raise
-            raise DiscoveryFailure(owner.cleanup()) from None
+            evidence = error_evidence(error)
+            raise DiscoveryFailure(owner.cleanup(evidence=evidence), evidence=evidence) from None
         except Exception as error:
             if completed: raise
             failure = error if type(error) is HelloFailure else None
-            raise DiscoveryFailure(owner.cleanup(failure), failure) from None
+            evidence = error_evidence(error)
+            raise DiscoveryFailure(owner.cleanup(failure, evidence=evidence), failure, evidence=evidence) from None
         finally:
             sock.close()
 
@@ -1228,9 +1340,10 @@ def capture_socket(ctx, token, cert, sock, proof, deadline, hard):
             owner.publish(value, deadline, complete=True)
             last_confirmed = value
         return value
-    except Exception:
+    except Exception as error:
         if last_confirmed is not None: return last_confirmed
-        raise DiscoveryFailure(owner.cleanup()) from None
+        evidence = error_evidence(error)
+        raise DiscoveryFailure(owner.cleanup(), evidence=evidence) from None
 
 
 def receive_and_commit(sock, peer_address, filename, prefix, wire_deadline, deadline, commit, budget, *, retry_seconds=5):
@@ -1364,7 +1477,8 @@ def serve_synthetic_capture(ctx, token, cert, *, main_path):
             return value
         except Exception as error:
             if owner is None and isinstance(error, DiscoveryFailure): raise
-            raise DiscoveryFailure(owner.cleanup() if owner is not None else 'not_created') from None
+            evidence = error_evidence(error)
+            raise DiscoveryFailure(owner.cleanup() if owner is not None else 'not_created', evidence=evidence) from None
         finally:
             sock.close()
 
@@ -1396,6 +1510,9 @@ def main():
     except DiscoveryFailure as error:
         result['cleanup'] = error.cleanup
         if error.hello_failure is not None: result['hello_failure'] = error.hello_failure
+        if error.evidence is not None: result['evidence'] = error.evidence
+    except (EvidenceFailure, HTTPFailure) as error:
+        result['evidence'] = error.fact
     except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
         pass
     output = Path(os.environ['RUNNER_TEMP']) / 'debug'

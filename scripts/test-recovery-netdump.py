@@ -2,6 +2,7 @@ import copy
 import base64
 import dataclasses
 import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 from pathlib import Path
 import socket
@@ -9,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from urllib.error import HTTPError, URLError
 
 import recovery_netdump as n
 from recovery_netdump_settings import NetdumpSettings
@@ -677,6 +679,105 @@ class Discovery(unittest.TestCase):
             owner = n.CheckOwner(self.context('receiver'), 'unused', 'receiver', -1, **kwargs)
             with self.assertRaises(ValueError): owner.cleanup(failure('b2_receiver'))
             with self.assertRaises(ValueError): owner.cleanup(failure('b1_receiver'))
+
+    def test_native_http_error_preserves_only_fixed_numeric_evidence(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.endswith('/11'):
+                    self.send_response(200); self.end_headers(); self.wfile.write(b'not json')
+                    return
+                self.send_response(403)
+                if self.path.endswith('/10'):
+                    self.send_header('X-RateLimit-Limit', '1000')
+                    self.send_header('X-RateLimit-Limit', '2000')
+                    self.send_header('X-RateLimit-Remaining', 'private-header')
+                    self.send_header('Retry-After', 'Wed, 21 Oct 2015 07:28:00 GMT')
+                else:
+                    for key, value in (('Limit', '1000'), ('Remaining', '0'), ('Used', '1000'), ('Reset', '1234')):
+                        self.send_header('X-RateLimit-' + key, value)
+                    self.send_header('Retry-After', '2')
+                self.send_header('X-Private', 'private-header')
+                self.end_headers()
+                self.wfile.write(b'private-response-body')
+            def log_message(self, *args): pass
+        with HTTPServer(('127.0.0.1', 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            previous = n.udp.API
+            n.udp.API = 'http://127.0.0.1:' + str(server.server_port) + '/private-url'
+            try:
+                with self.assertRaises(HTTPError) as caught:
+                    n.call(time.monotonic() + 10, 'GET', '/check-runs/9', 'local-test-token')
+                error = caught.exception
+                self.assertIsInstance(error, n.HTTPFailure)
+                for base in (HTTPError, URLError, OSError): self.assertIsInstance(error, base)
+                self.assertNotIsInstance(error, ValueError)
+                self.assertEqual(error.url, '')
+                self.assertIsNone(error.headers)
+                self.assertIsNone(error.fp)
+                self.assertIsNone(error.__context__)
+                self.assertIsNone(error.__cause__)
+                self.assertNotIn('private', str(error))
+                evidence = error.fact
+                self.assertEqual(n.error_evidence(error), evidence)
+                self.assertEqual(evidence, {'kind': 'http_error', 'method': 'GET', 'resource': 'check_item', 'status': 403,
+                                 'rate_limit': {'limit': 1000, 'remaining': 0, 'used': 1000, 'reset': 1234}, 'retry_after': 2})
+                self.assertNotIn('private', n.canonical(evidence))
+                self.assertNotIn('local-test-token', str(caught.exception))
+                for change in ({'raw_headers': 'private'}, {'status': True}, {'resource': 'unknown'},
+                               {'retry_after': -1}, {'rate_limit': {**evidence['rate_limit'], 'remaining': True}}):
+                    with self.assertRaises(ValueError): n.validate_evidence({**evidence, **change})
+                owner = n.CheckOwner(self.context(), 'local-test-token', 'intel', time.monotonic() + 10)
+                owner.check_id = 9
+                owner.latest = self.plan().public_fact()
+                cleanup = owner.cleanup(evidence=evidence)
+                self.assertEqual(cleanup, 'not_acknowledged')
+                original = n.DiscoveryFailure(cleanup, evidence=evidence)
+                self.assertEqual(original.evidence, evidence)
+                self.assertEqual(n.console_fact({'status': 'failed', 'evidence': original.evidence})['evidence'], evidence)
+                for kwargs in ({'capture_digest': 'b' * 64}, {'synthetic_digest': 'b' * 64}):
+                    isolated = n.CheckOwner(self.context('receiver'), 'unused', 'receiver', -1, **kwargs)
+                    with self.assertRaises(ValueError): isolated.cleanup(evidence=evidence)
+                with self.assertRaises(n.HTTPFailure) as duplicate:
+                    n.call(time.monotonic() + 10, 'GET', '/check-runs/10', 'local-test-token')
+                self.assertIsNone(duplicate.exception.fact['rate_limit']['limit'])
+                self.assertIsNone(duplicate.exception.fact['rate_limit']['remaining'])
+                self.assertIsNone(duplicate.exception.fact['retry_after'])
+                with self.assertRaises(json.JSONDecodeError):
+                    n.call(time.monotonic() + 10, 'GET', '/check-runs/11', 'local-test-token')
+            finally:
+                n.udp.API = previous
+                server.shutdown()
+                thread.join(2)
+
+    def test_check_readback_evidence_is_fixed_booleans_without_payload(self):
+        ctx = self.context()
+        name, external = n.check_attributes(ctx, 'intel')
+        check = {'id': 9, 'name': name, 'head_sha': ctx['sha'], 'external_id': external,
+                 'app': {'id': 15368, 'slug': 'github-actions'},
+                 'details_url': 'https://github.com/Code-Hex/vz-ci-test/runs/9', 'status': 'in_progress', 'conclusion': None,
+                 'output': {'summary': 'private-summary', 'title': 'expected-title', 'text': ''}}
+        payload = {'status': 'in_progress', 'output': dict(check['output'])}
+        n.verify_check(check, ctx, 'intel', 'get_readback', expected_id=9, payload=payload)
+        changed = {**check, 'head_sha': 'b' * 40, 'output': {**check['output'], 'summary': 'private-changed'}}
+        with self.assertRaises(n.EvidenceFailure) as caught:
+            n.verify_check(changed, ctx, 'intel', 'get_readback', expected_id=9, payload=payload)
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertNotIsInstance(caught.exception, HTTPError)
+        fact = caught.exception.fact
+        self.assertEqual(fact, {'kind': 'check_mismatch', 'stage': 'get_readback', 'matches': {
+            'id': True, 'name': True, 'head_sha': False, 'external_id': True, 'app_id': True, 'app_slug': True,
+            'details_url': True, 'status': True, 'conclusion': True, 'summary': False, 'title': True, 'text': True}})
+        self.assertNotIn('private', n.canonical(fact))
+        with self.assertRaises(n.EvidenceFailure) as post:
+            n.verify_check({**check, 'external_id': 'private-foreign'}, ctx, 'intel', 'post_identity')
+        self.assertEqual(post.exception.fact['stage'], 'post_identity')
+        self.assertEqual(set(post.exception.fact['matches']), set(n.IDENTITY_FIELDS))
+        self.assertFalse(post.exception.fact['matches']['external_id'])
+        self.assertNotIn('private', n.canonical(post.exception.fact))
+        for change in ({'raw': 'private'}, {'stage': 'unknown'}, {'matches': {**fact['matches'], 'summary': 0}}):
+            with self.assertRaises(ValueError): n.validate_evidence({**fact, **change})
+        self.assertIsNone(n.error_evidence(ValueError('unclassified-private-message')))
 
     def test_hello_failure_public_boundary_rejects_raw_fields_and_invalid_types(self):
         fact = {'stage': 'b1_intel', 'expected_peer_port': 12345, 'hello_received': False, 'ack_received': False,
