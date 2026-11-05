@@ -1,4 +1,5 @@
 """Read four registered-service classes and one fixed Boolean property."""
+import copy
 import ctypes
 import platform
 import re
@@ -19,6 +20,48 @@ def decode_class(raw):
 def query_result(status, returncode, nodes):
     return {'status': status, 'returncode': returncode,
             'count': len(nodes) if status == 'observed' else None, 'nodes': nodes}
+
+
+def sanitize_snapshot(value):
+    def require(condition):
+        if not condition: raise ValueError('registry_snapshot_invalid')
+
+    def keys(item, expected):
+        require(type(item) is dict and set(item) == set(expected))
+
+    def code(item, nullable=False):
+        require((nullable and item is None) or (type(item) is int and -2**31 <= item < 2**31))
+
+    def classname(item, nullable=False):
+        require((nullable and item is None) or (type(item) is str and
+                re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.$:-]{0,126}', item) is not None))
+
+    keys(value, ('scope', 'queries'))
+    require(type(value['scope']) is str and value['scope'] == SCOPE)
+    keys(value['queries'], CLASSES)
+    for query in value['queries'].values():
+        keys(query, ('status', 'returncode', 'count', 'nodes'))
+        require(type(query['status']) is str and query['status'] in ('observed', 'truncated', 'invalid_iterator', 'error', 'unavailable'))
+        code(query['returncode'], nullable=True)
+        require(type(query['nodes']) is list and len(query['nodes']) <= 64)
+        if query['status'] == 'observed':
+            require(type(query['returncode']) is int and query['returncode'] == 0)
+            require(type(query['count']) is int and query['count'] == len(query['nodes']))
+        else:
+            require(query['count'] is None)
+        for node in query['nodes']:
+            keys(node, ('class', 'class_returncode', 'parents', 'parent_status', 'parent_returncode', 'controller_enabled'))
+            classname(node['class'], nullable=True)
+            code(node['class_returncode'])
+            require(type(node['parents']) is list and len(node['parents']) <= 8)
+            for parent in node['parents']: classname(parent)
+            require(type(node['parent_status']) is str and node['parent_status'] in ('stopped', 'error', 'noncanonical', 'bounded'))
+            code(node['parent_returncode'])
+            enabled = node['controller_enabled']
+            keys(enabled, ('status', 'value'))
+            require(type(enabled['status']) is str and enabled['status'] in ('observed', 'unavailable', 'noncanonical'))
+            require(type(enabled['value']) is bool if enabled['status'] == 'observed' else enabled['value'] is None)
+    return copy.deepcopy(value)
 
 
 def _load():

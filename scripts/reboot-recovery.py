@@ -8,6 +8,7 @@ import recovery_bootplist
 import recovery_nvram_panic
 import recovery_panic_control
 import recovery_arrival
+import kdp_registry
 import json
 import math
 import os
@@ -582,6 +583,7 @@ def prepare_root(payload):
     private_write(directory / "recovery_panic_control.py", Path(recovery_panic_control.__file__).read_bytes())
     private_write(directory / "panic-source-preflight.py", Path(__file__).with_name("panic-source-preflight.py").read_bytes())
     private_write(directory / "recovery_arrival.py", Path(recovery_arrival.__file__).read_bytes())
+    private_write(directory / "kdp_registry.py", Path(kdp_registry.__file__).read_bytes())
     private_write(directory / "arrival.sh", recovery_arrival.render(config, directory))
     sync_directory(directory)
     sync_directory(directory.parent)
@@ -669,7 +671,7 @@ def debug_boot_marker(config):
 
 
 def debug_source_identity():
-    return hashlib.sha256(Path(__file__).read_bytes() + b"\0" + Path(recovery_bootargs.__file__).read_bytes() + b"\0" + Path(recovery_bootplist.__file__).read_bytes() + b"\0" + Path(recovery_nvram_panic.__file__).read_bytes() + b"\0" + Path(recovery_panic_control.__file__).read_bytes() + b"\0" + Path(__file__).with_name("panic-source-preflight.py").read_bytes()).hexdigest()
+    return hashlib.sha256(Path(__file__).read_bytes() + b"\0" + Path(recovery_bootargs.__file__).read_bytes() + b"\0" + Path(recovery_bootplist.__file__).read_bytes() + b"\0" + Path(recovery_nvram_panic.__file__).read_bytes() + b"\0" + Path(recovery_panic_control.__file__).read_bytes() + b"\0" + Path(__file__).with_name("panic-source-preflight.py").read_bytes() + b"\0" + Path(kdp_registry.__file__).read_bytes()).hexdigest()
 
 
 DEBUG_EVENTS = ("request", "staged", "bootplist_inflight", "bootplist_staged", "native_inflight", "native_synced", "native_failed", "rollback_inflight", "rollback_cleanup", "intent", "returned", "uncertain", "aborted")

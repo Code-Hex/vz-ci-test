@@ -41,6 +41,14 @@ class Platform:
 
 
 class BootArgumentProfile(unittest.TestCase):
+    def test_optional_registry_summary_rejects_unknown_public_fields(self):
+        snapshot = {'scope': 'current_registered_services_not_polled_io_proof', 'queries': {
+            name: {'status': 'observed', 'returncode': 0, 'count': 0, 'nodes': []}
+            for name in ('IOPlatformExpertDevice', 'IOKernelDebugger', 'IOKDP', 'IONVRAMController')}}
+        self.assertEqual(b.optional_summary({'registered_services': snapshot})['registered_services'], snapshot)
+        invalid = {**snapshot, 'private_path': '/private/secret'}
+        self.assertNotIn('registered_services', b.optional_summary({'registered_services': invalid}))
+
     def test_canonical_spacing_and_exact_token_sequence(self):
         expected = {'status': 'observed', 'debug_mask': 8192, 'nondebug_token_count': 3,
                     'nondebug_sha256': '11a6f7c443706e6d2af0396c32aa8d5350a93892d43185cdacfe1430b82d9505'}

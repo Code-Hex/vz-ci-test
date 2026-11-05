@@ -1,5 +1,6 @@
 """A reversible debug boot-argument transaction for normal and quick reboot."""
 import ctypes
+import kdp_registry
 import hashlib
 import json
 import os
@@ -216,7 +217,8 @@ class MacPlatform:
 
     def inventory(self):
         result = {"debugger_count": None, "virtio_network_classes": [], "nic_inventory_status": "unsupported",
-                  "debugger_inventory_status": "unavailable", "network_inventory_status": "unavailable"}
+                  "debugger_inventory_status": "unavailable", "network_inventory_status": "unavailable",
+                  "registered_services": kdp_registry.snapshot()}
         try:
             debuggers = ioreg_nodes(capture(["/usr/sbin/ioreg", "-a", "-r", "-c", "IOKernelDebugger"]))
             result["debugger_count"] = len(debuggers)
@@ -387,6 +389,11 @@ def optional_summary(data):
     result = {}
     if not isinstance(data, dict):
         return result
+    if 'registered_services' in data:
+        try:
+            result['registered_services'] = kdp_registry.sanitize_snapshot(data['registered_services'])
+        except (ValueError, TypeError):
+            pass
     count = data.get("debugger_count")
     if count is None or type(count) is int and 0 <= count <= 4096:
         result["debugger_count"] = count
