@@ -2,6 +2,15 @@ name: Intel KDP UDP network preflight
 
 on:
   workflow_dispatch:
+    inputs:
+      port_mode:
+        description: UDP source port control
+        required: true
+        type: choice
+        options:
+          - symmetric
+          - kernel-source
+        default: symmetric
 
 permissions:
   contents: read
@@ -23,6 +32,7 @@ jobs:
     timeout-minutes: 4
     env:
       KDP_ROLE: ${{ matrix.role }}
+      KDP_PORT_MODE: ${{ inputs.port_mode || 'symmetric' }}
       KDP_STUN_HOST: stun.cloudflare.com
       KDP_STUN_PORT: '3478'
     steps:

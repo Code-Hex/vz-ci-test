@@ -19,6 +19,71 @@ class Udp(unittest.TestCase):
         attr = struct.pack("!HH", 0x20, len(mapped)) + mapped
         return struct.pack("!HHI12s", 0x0101, len(attr), r.COOKIE, tx) + attr
 
+    def context(self, role="intel", mode="kernel-source"):
+        return {"run": "123", "attempt": "1", "sha": "a" * 40, "role": role, "port_mode": mode}
+
+    def ready(self, ctx, role, port=46272):
+        return {"phase": "ready", "role": role, "binding": r.binding(ctx, role),
+                "port_mode": ctx["port_mode"], "nonce": "ab" * 16,
+                "endpoint": {"ip": "1.1.1.1", "port": port}}
+
+    def test_port_mode_defaults_and_rejects_unknown_values(self):
+        self.assertEqual(r.port_mode(), "symmetric")
+        self.assertEqual(r.port_mode("kernel-source"), "kernel-source")
+        for value in ("", "kernel", "SYMMETRIC", None, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                r.port_mode(value)
+
+    def test_kernel_source_bind_requires_valid_receiver_ready(self):
+        ctx = self.context()
+        peer = self.ready(ctx, "receiver")
+        self.assertEqual(r.bind_port(ctx, peer), 46272)
+        self.assertEqual(r.bind_port(self.context("receiver")), 41139)
+        self.assertEqual(r.bind_port(self.context(mode="symmetric")), 41139)
+        invalid = [None, dict(peer, port_mode="symmetric"), dict(peer, phase="init"),
+                   dict(peer, role="intel"), dict(peer, binding="other"), dict(peer, nonce="bad"),
+                   dict(peer, result="unsupported"), dict(peer, endpoint={"ip": "127.0.0.1", "port": 46272}),
+                   dict(peer, endpoint={"ip": "1.1.1.1", "port": True})]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                r.bind_port(ctx, value)
+
+    def test_peer_metadata_rejects_cross_mode_checks(self):
+        ctx = self.context()
+        peer = self.ready(ctx, "receiver")
+        self.assertEqual(r.peer_metadata(peer, ctx, "receiver"), peer)
+        for value in (dict(peer, port_mode="symmetric"), {k: v for k, v in peer.items() if k != "port_mode"}):
+            with self.assertRaises(ValueError):
+                r.peer_metadata(value, ctx, "receiver")
+
+    def test_kernel_source_mutual_port_pair(self):
+        intel = {"role": "intel", "port_mode": "kernel-source", "local_port": 46272,
+                 "peer_public_port": 46272, "endpoint": {"ip": "1.1.1.1", "port": 37650}}
+        receiver = {"role": "receiver", "port_mode": "kernel-source", "local_port": 41139,
+                    "peer_public_port": 37650, "endpoint": {"ip": "8.8.8.8", "port": 46272}}
+        self.assertTrue(r.port_pair_matches(intel, receiver))
+        self.assertTrue(r.port_pair_matches(receiver, intel))
+        for value in (dict(intel, local_port=41139), dict(intel, local_port=True),
+                      dict(intel, peer_public_port=41139), dict(intel, port_mode="symmetric"),
+                      dict(intel, role="receiver"), dict(intel, endpoint={"ip": "1.1.1.1", "port": 37651})):
+            self.assertFalse(r.port_pair_matches(value, receiver))
+            self.assertFalse(r.port_pair_matches(receiver, value))
+        self.assertFalse(r.port_pair_matches(intel, dict(receiver, local_port=46272)))
+        symmetric_intel = dict(intel, port_mode="symmetric", local_port=41139)
+        symmetric_receiver = dict(receiver, port_mode="symmetric")
+        self.assertTrue(r.port_pair_matches(symmetric_intel, symmetric_receiver))
+
+    def test_port_facts_are_bounded_in_artifact(self):
+        safe = r.sanitize_state({"port_mode": "kernel-source", "local_port": 46272, "peer_public_port": 46272})
+        self.assertEqual(safe["port_mode"], "kernel-source")
+        self.assertEqual(safe["local_port"], 46272)
+        self.assertEqual(safe["peer_public_port"], 46272)
+        for value in (True, 0, 65536, "46272"):
+            safe = r.sanitize_state({"port_mode": "other", "local_port": value, "peer_public_port": value})
+            self.assertNotIn("port_mode", safe)
+            self.assertNotIn("local_port", safe)
+            self.assertNotIn("peer_public_port", safe)
+
     def test_artifact_contains_only_sanitized_facts(self):
         state = {"role": "intel", "result": "not_established", "reason": "probe_incomplete",
                  "nonce": "ab" * 16, "endpoint": {"ip": "1.1.1.1", "port": 43210},

@@ -152,9 +152,59 @@ def binding(ctx, role):
     return "/".join((ctx["run"], ctx["attempt"], ctx["sha"], role))
 
 
+def port_mode(value="symmetric"):
+    if value not in ("symmetric", "kernel-source"):
+        raise ValueError("port mode rejected")
+    return value
+
+
+def peer_metadata(data, ctx, role):
+    if (not isinstance(data, dict) or data.get("binding") != binding(ctx, role) or
+            data.get("role") != role or data.get("port_mode") != ctx["port_mode"]):
+        raise ValueError("peer binding or port mode")
+    return data
+
+
+def peer_endpoint(peer, own_nonce=None):
+    remote, nonce = peer.get("endpoint"), peer.get("nonce")
+    if (peer.get("phase") not in ("ready", "probing", "result") or peer.get("result") == "unsupported" or
+            not isinstance(remote, dict) or not public_endpoint(remote.get("ip", ""), remote.get("port")) or
+            not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce) or nonce == own_nonce):
+        raise ValueError("peer metadata invalid")
+    return (remote["ip"], remote["port"]), bytes.fromhex(nonce)
+
+
+def bind_port(ctx, peer=None):
+    if ctx["port_mode"] == "kernel-source" and ctx["role"] == "intel":
+        peer_metadata(peer, ctx, "receiver")
+        return peer_endpoint(peer)[0][1]
+    return 41139
+
+
+def port_pair_matches(state, peer):
+    if (state.get("port_mode") not in ("symmetric", "kernel-source") or
+            peer.get("port_mode") != state["port_mode"] or
+            {state.get("role"), peer.get("role")} != {"intel", "receiver"}):
+        return False
+    for item in (state, peer):
+        endpoint = item.get("endpoint")
+        if (not isinstance(endpoint, dict) or not public_endpoint(endpoint.get("ip", ""), endpoint.get("port")) or
+                any(type(item.get(key)) is not int or not 0 < item[key] < 65536
+                    for key in ("local_port", "peer_public_port"))):
+            return False
+    if (state["peer_public_port"] != peer["endpoint"]["port"] or
+            peer["peer_public_port"] != state["endpoint"]["port"]):
+        return False
+    if state["port_mode"] == "symmetric":
+        return state["local_port"] == peer["local_port"] == 41139
+    intel, receiver = (state, peer) if state["role"] == "intel" else (peer, state)
+    return receiver["local_port"] == 41139 and intel["local_port"] == receiver["endpoint"]["port"]
+
+
 def validate_context():
     ctx = {"run": os.getenv("GITHUB_RUN_ID", ""), "attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""),
-           "sha": os.getenv("GITHUB_SHA", ""), "role": os.getenv("KDP_ROLE", "")}
+           "sha": os.getenv("GITHUB_SHA", ""), "role": os.getenv("KDP_ROLE", ""),
+           "port_mode": port_mode(os.getenv("KDP_PORT_MODE", "symmetric"))}
     if (os.getenv("GITHUB_ACTIONS") != "true" or os.getenv("GITHUB_EVENT_NAME") != "workflow_dispatch" or
             os.getenv("GITHUB_REPOSITORY") != "Code-Hex/vz-ci-test" or os.getenv("GITHUB_REF") != "refs/heads/main" or
             os.getenv("RUNNER_ENVIRONMENT") != "github-hosted" or not os.getenv("RUNNER_TEMP") or
@@ -213,9 +263,20 @@ def peer_check(ctx, token, role):
     if not matches:
         return None
     data = json.loads(matches[0].get("output", {}).get("summary", "{}"))
-    if data.get("binding") != binding(ctx, role) or data.get("role") != role:
-        raise ValueError("peer binding")
-    return data
+    return peer_metadata(data, ctx, role)
+
+
+def wait_peer(ctx, token, role, own_nonce):
+    deadline = time.monotonic() + 65
+    while time.monotonic() < deadline:
+        candidate = peer_check(ctx, token, role)
+        if candidate and candidate.get("phase") in ("ready", "probing", "result"):
+            if candidate.get("result") == "unsupported":
+                return None
+            peer_endpoint(candidate, own_nonce)
+            return candidate
+        time.sleep(1)
+    return None
 
 
 def update(check_id, token, data, conclusion=None):
@@ -242,16 +303,26 @@ def run(ctx, token):
     own, other = ctx["role"], "receiver" if ctx["role"] == "intel" else "intel"
     check = api("POST", "/check-runs", token, {"name": "KDP UDP " + own + " " + ctx["run"],
                 "head_sha": ctx["sha"], "external_id": binding(ctx, own), "status": "in_progress",
-                "output": {"title": "UDP path preflight", "summary": json.dumps({"phase": "init", "role": own, "binding": binding(ctx, own)})}})
+                "output": {"title": "UDP path preflight", "summary": json.dumps({"phase": "init", "role": own,
+                    "binding": binding(ctx, own), "port_mode": ctx["port_mode"]})}})
     if not check_identity(check, ctx, own):
         raise ValueError("own check identity")
     check_id = check["id"]
     sock = None
-    state = {"phase": "result", "role": own, "binding": binding(ctx, own), "result": "unsupported"}
+    state = {"phase": "result", "role": own, "binding": binding(ctx, own),
+             "port_mode": ctx["port_mode"], "result": "unsupported"}
     try:
+        nonce = os.urandom(16)
+        peer = None
+        if ctx["port_mode"] == "kernel-source" and own == "intel":
+            peer = wait_peer(ctx, token, other, nonce.hex())
+            if peer is None:
+                state.update({"result": "window_unconfirmed", "reason": "peer_not_ready"})
+                return state
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind(("0.0.0.0", 41139))
+            sock.bind(("0.0.0.0", bind_port(ctx, peer)))
+            state["local_port"] = sock.getsockname()[1]
             candidates = socket.getaddrinfo("stun.cloudflare.com", 3478, socket.AF_INET, socket.SOCK_DGRAM)
             servers = [(item[4][0], 3478) for item in candidates if public_endpoint(item[4][0], 3478)]
             if not servers:
@@ -263,29 +334,22 @@ def run(ctx, token):
         except (OSError, ValueError):
             state["reason"] = "stun_or_bind_unavailable"
             return state
-        nonce = os.urandom(16)
         state = {"phase": "ready", "role": own, "binding": binding(ctx, own), "nonce": nonce.hex(),
+                 "port_mode": ctx["port_mode"], "local_port": state["local_port"],
                  "endpoint": {"ip": endpoint[0], "port": endpoint[1]}, "mapping_samples": mappings}
+        if peer is not None:
+            state["peer_public_port"] = peer["endpoint"]["port"]
         update(check_id, token, state)
-        print(json.dumps({"event": "udp_ready", "role": own, "nonce": nonce.hex(), "endpoint": state["endpoint"]}), flush=True)
-        peer = None
-        deadline = time.monotonic() + 65
-        while time.monotonic() < deadline:
-            candidate = peer_check(ctx, token, other)
-            if candidate and candidate.get("phase") in ("ready", "probing", "result"):
-                peer = candidate
-                break
-            time.sleep(1)
-        if not peer or peer.get("result") == "unsupported":
+        print(json.dumps({"event": "udp_ready", "role": own, "nonce": nonce.hex(), "endpoint": state["endpoint"],
+                          "port_mode": ctx["port_mode"], "local_port": state["local_port"]}), flush=True)
+        if peer is None:
+            peer = wait_peer(ctx, token, other, nonce.hex())
+        if peer is None:
             state.update({"phase": "result", "result": "window_unconfirmed", "reason": "peer_not_ready"})
             return state
-        remote = peer.get("endpoint", {})
-        nonce_text = peer.get("nonce", "")
-        if (not isinstance(remote, dict) or not public_endpoint(remote.get("ip", ""), remote.get("port")) or
-                not isinstance(nonce_text, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce_text) or nonce_text == nonce.hex()):
-            raise ValueError("peer metadata invalid")
-        address = (remote["ip"], remote["port"])
-        peer_nonce = bytes.fromhex(nonce_text)
+        remote, nonce_text = peer["endpoint"], peer["nonce"]
+        address, peer_nonce = peer_endpoint(peer, nonce.hex())
+        state["peer_public_port"] = address[1]
         state.update({"phase": "probing", "result": "window_unconfirmed", "reason": "probe_incomplete"})
         update(check_id, token, state)
         start_ns = time.time_ns()
@@ -304,6 +368,8 @@ def run(ctx, token):
             time.sleep(1)
         if not peer_last or peer_last.get("nonce") != nonce_text or peer_last.get("endpoint") != remote:
             state.update({"result": "window_unconfirmed", "reason": "peer_metadata_missing_or_changed"})
+        elif not port_pair_matches(state, peer_last):
+            state.update({"result": "window_unconfirmed", "reason": "port_pair_mismatch"})
         else:
             state["result"] = window_outcome(stats, start_ns, end_ns, peer_last)
             state.pop("reason", None)
@@ -321,6 +387,8 @@ def run(ctx, token):
         persist_state(state)
         print(json.dumps({"event": "udp_result", "role": own, "result": state.get("result"),
                           "reason": state.get("reason"), "window_clock": state.get("window_clock"),
+                          "port_mode": ctx["port_mode"], "local_port": state.get("local_port"),
+                          "peer_public_port": state.get("peer_public_port"),
                           "scope": "userspace_udp_only", "stats": state.get("stats")}), flush=True)
 
 
@@ -328,8 +396,13 @@ def sanitize_state(state):
     result = {"phase": "result", "scope": "userspace_udp_only"}
     if state.get("role") in ("intel", "receiver"):
         result["role"] = state["role"]
+    if state.get("port_mode") in ("symmetric", "kernel-source"):
+        result["port_mode"] = state["port_mode"]
+    for key in ("local_port", "peer_public_port"):
+        if type(state.get(key)) is int and 0 < state[key] < 65536:
+            result[key] = state[key]
     result["result"] = state.get("result") if state.get("result") in ("unsupported", "window_unconfirmed", "not_established", "established") else "unsupported"
-    if state.get("reason") in ("preflight_failed", "stun_or_bind_unavailable", "peer_not_ready", "probe_incomplete", "peer_metadata_missing_or_changed"):
+    if state.get("reason") in ("preflight_failed", "stun_or_bind_unavailable", "peer_not_ready", "probe_incomplete", "peer_metadata_missing_or_changed", "port_pair_mismatch"):
         result["reason"] = state["reason"]
     nonce = state.get("nonce")
     if isinstance(nonce, str) and re.fullmatch(r"[0-9a-f]{32}", nonce):
@@ -394,6 +467,7 @@ def main():
     try:
         ctx = validate_context()
         state["role"] = ctx["role"]
+        state["port_mode"] = ctx["port_mode"]
         token = os.environ.pop("GITHUB_TOKEN", "")
         if not token:
             raise ValueError("token missing")
