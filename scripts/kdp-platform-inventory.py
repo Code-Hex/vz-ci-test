@@ -16,6 +16,68 @@ UUID = "87453B1D-A163-31FA-B33B-0FB4BE78E6E8"
 IDENTIFIER = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 
 
+def decode_coprocessor_version(raw):
+    if not isinstance(raw, bytes) or len(raw) != 4:
+        return {"status": "noncanonical", "value": None}
+    version = int.from_bytes(raw, "little")
+    value = "none" if version == 0 else "version1" if version == 0x10000 else \
+            "version2_or_later" if version >= 0x20000 else "other"
+    return {"status": "observed", "value": value}
+
+
+def read_coprocessor_version():
+    result = {"status": "unavailable", "value": None, "scope": "current_property_not_latched_flush_flag"}
+    try:
+        io = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        io.IORegistryEntryFromPath.argtypes = [ctypes.c_uint, ctypes.c_char_p]
+        io.IORegistryEntryFromPath.restype = ctypes.c_uint
+        io.IORegistryEntryCreateCFProperty.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        io.IORegistryEntryCreateCFProperty.restype = ctypes.c_void_p
+        io.IOObjectRelease.argtypes = [ctypes.c_uint]
+        io.IOObjectRelease.restype = ctypes.c_int
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+        cf.CFGetTypeID.restype = ctypes.c_ulong
+        cf.CFDataGetTypeID.argtypes = []
+        cf.CFDataGetTypeID.restype = ctypes.c_ulong
+        cf.CFDataGetLength.argtypes = [ctypes.c_void_p]
+        cf.CFDataGetLength.restype = ctypes.c_long
+        cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
+        cf.CFDataGetBytePtr.restype = ctypes.POINTER(ctypes.c_ubyte)
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.restype = None
+    except (OSError, AttributeError):
+        return result
+    entry = key = value = None
+    try:
+        entry = io.IORegistryEntryFromPath(0, b"IODeviceTree:/efi/platform")
+        if not entry:
+            return result
+        key = cf.CFStringCreateWithCString(None, b"apple-coprocessor-version", 0x08000100)
+        if not key:
+            return result
+        value = io.IORegistryEntryCreateCFProperty(entry, key, None, 0)
+        if not value:
+            return result
+        if cf.CFGetTypeID(value) != cf.CFDataGetTypeID() or cf.CFDataGetLength(value) != 4:
+            return {**result, "status": "noncanonical"}
+        pointer = cf.CFDataGetBytePtr(value)
+        if not pointer:
+            return result
+        return {**result, **decode_coprocessor_version(ctypes.string_at(pointer, 4))}
+    except (OSError, AttributeError, ValueError):
+        return result
+    finally:
+        if value:
+            cf.CFRelease(value)
+        if key:
+            cf.CFRelease(key)
+        if entry:
+            io.IOObjectRelease(entry)
+
+
 def parse_bootargs(text):
     masks = []
     panicd, router = False, False
@@ -188,7 +250,8 @@ def main():
         "panic_nvram": (["/usr/sbin/nvram", "-x", "aapl,panic-info"], 1_000_000, parse_panic_nvram),
     }
     result = {"event": "kdp_platform_inventory", "kernel_uuid": UUID,
-              "csr_allow_kernel_debugger_result": csr_result}
+              "csr_allow_kernel_debugger_result": csr_result,
+              "coprocessor_version": read_coprocessor_version()}
     for name, (argv, limit, parser) in commands.items():
         status, data = command(argv, limit)
         value = None

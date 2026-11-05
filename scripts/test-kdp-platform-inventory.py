@@ -9,6 +9,19 @@ spec.loader.exec_module(r)
 
 
 class Inventory(unittest.TestCase):
+    def test_coprocessor_version_uses_four_byte_intel_encoding(self):
+        for encoded, expected in (('00000000', 'none'), ('00000100', 'version1'),
+                                  ('00000200', 'version2_or_later'), ('01000200', 'version2_or_later'),
+                                  ('02000000', 'other'), ('ffffffff', 'version2_or_later')):
+            with self.subTest(encoded=encoded):
+                self.assertEqual(r.decode_coprocessor_version(bytes.fromhex(encoded)),
+                                 {'status': 'observed', 'value': expected})
+
+    def test_coprocessor_version_rejects_other_lengths_and_types(self):
+        for value in (None, 0, '00000200', bytearray(4), b'', bytes(3), bytes(5), bytes(8), bytes(9)):
+            with self.subTest(value=value):
+                self.assertEqual(r.decode_coprocessor_version(value), {'status': 'noncanonical', 'value': None})
+
     def test_bootargs_only_selected_information(self):
         self.assertEqual(r.parse_bootargs('secret=private debug=0x144 _panicd_ip=192.0.2.3 _router_ip=192.0.2.4'),
                          {"debug_masks": [324], "panicd_present": True, "router_present": True})
