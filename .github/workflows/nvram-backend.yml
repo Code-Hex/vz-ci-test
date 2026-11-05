@@ -12,6 +12,7 @@ on:
           - staged-sync
           - bootplist-propagation
           - panic-source-preflight
+          - cf-spawn-control
 
 permissions:
   contents: read
@@ -21,6 +22,10 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
     runs-on: macos-26-intel
     timeout-minutes: 7
+    strategy:
+      fail-fast: false
+      matrix:
+        cf_case: ${{ fromJSON(inputs.control == 'cf-spawn-control' && '["direct_off","direct_on","launchd_off","launchd_on"]' || '["single"]') }}
     steps:
       - name: Check out the diagnostic source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -61,6 +66,7 @@ jobs:
       - name: Run the reversible configuration control
         env:
           BOOT_CONTROL: ${{ inputs.control }}
+          CF_SPAWN_CASE: ${{ matrix.cf_case }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/debug"
@@ -68,6 +74,7 @@ jobs:
           case "$BOOT_CONTROL" in
             bootplist-propagation) control_script=scripts/bootplist-preflight.py ;;
             panic-source-preflight) control_script=scripts/panic-source-preflight.py ;;
+            cf-spawn-control) control_script=scripts/cf-spawn-control.py ;;
             staged-sync|'') control_script=scripts/nvram-staged-sync.py ;;
             *) exit 64 ;;
           esac
@@ -83,15 +90,17 @@ jobs:
             GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
             GITHUB_SHA="$GITHUB_SHA" \
             RUNNER_TEMP="$RUNNER_TEMP" \
+            CF_SPAWN_CASE="$CF_SPAWN_CASE" \
             "$native_python" "$control_script"
       - name: Preserve the direct IOKit results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: nvram-backend-${{ github.run_id }}-${{ github.run_attempt }}
+          name: nvram-backend-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.cf_case }}
           path: |
             ${{ runner.temp }}/debug/nvram-backend.jsonl
             ${{ runner.temp }}/debug/nvram-staged-sync.json
             ${{ runner.temp }}/debug/bootplist-preflight.json
             ${{ runner.temp }}/debug/panic-source-preflight.json
+            ${{ runner.temp }}/debug/cf-spawn-control.json
           if-no-files-found: error
