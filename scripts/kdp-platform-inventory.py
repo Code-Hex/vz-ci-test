@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read a filtered kernel-debugging platform inventory on the Intel runner."""
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ import subprocess
 import sys
 import time
 from xml.parsers.expat import ExpatError
+
+import kdp_registry
 
 UUID = "87453B1D-A163-31FA-B33B-0FB4BE78E6E8"
 IDENTIFIER = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
@@ -250,6 +253,11 @@ def main():
         "panic_nvram": (["/usr/sbin/nvram", "-x", "aapl,panic-info"], 1_000_000, parse_panic_nvram),
     }
     result = {"event": "kdp_platform_inventory", "kernel_uuid": UUID,
+              "context": {"run_id": os.environ['GITHUB_RUN_ID'], "attempt": os.environ['GITHUB_RUN_ATTEMPT'],
+                          "head_sha": os.environ['GITHUB_SHA']},
+              "sources": {"inventory_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                          "registry_sha256": hashlib.sha256(Path(kdp_registry.__file__).read_bytes()).hexdigest()},
+              "registered_services": kdp_registry.snapshot(),
               "csr_allow_kernel_debugger_result": csr_result,
               "coprocessor_version": read_coprocessor_version()}
     for name, (argv, limit, parser) in commands.items():
