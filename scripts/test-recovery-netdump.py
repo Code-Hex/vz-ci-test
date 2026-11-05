@@ -13,6 +13,7 @@ import unittest
 from urllib.error import HTTPError, URLError
 
 import recovery_netdump as n
+import udp_observer as o
 from recovery_netdump_settings import NetdumpSettings
 
 
@@ -621,20 +622,24 @@ class Discovery(unittest.TestCase):
         self.assertFalse(budget.accept(b'a'))
         self.assertFalse(n.WireBudget(byte_count=2 * 1024 * 1024).accept(b'a'))
 
+    def observed_exchange(self, sock, peer):
+        observer = o.Observer(sock, peer, b'a' * 16, b'b' * 16, packet=n.udp.PACKET)
+        return n.udp.exchange(observer, peer, b'a' * 16, b'b' * 16, .08), observer.fact()
+
     def test_native_hello_failure_distinguishes_quiet_peer_and_valid_wrong_port(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as host, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as other:
             for sock in (host, peer, other): sock.bind(('127.0.0.1', 0))
             address = peer.getsockname()
-            raw = n.udp.exchange(host, address, b'a' * 16, b'b' * 16, .08)
+            raw, counts = self.observed_exchange(host, address)
             with self.assertRaises(n.HelloFailure) as quiet:
-                n.hello_result(raw, 'b1_intel', address[1])
+                n.hello_result(raw, 'b1_intel', address[1], counts)
             self.assertEqual(quiet.exception.fact, {'stage': 'b1_intel', 'expected_peer_port': address[1],
                              'hello_received': False, 'ack_received': False, 'sent': 1,
-                             'valid_peer_port_mismatches': 0, 'other_peer_ports': []})
+                             'valid_peer_port_mismatches': 0, 'other_peer_ports': [], 'counters': counts})
             other.sendto(n.udp.PACKET.pack(b'KDP1', 1, b'b' * 16, b'a' * 16, 1), host.getsockname())
-            raw = n.udp.exchange(host, address, b'a' * 16, b'b' * 16, .08)
+            raw, counts = self.observed_exchange(host, address)
             with self.assertRaises(n.HelloFailure) as mismatch:
-                n.hello_result(raw, 'b1_receiver', address[1])
+                n.hello_result(raw, 'b1_receiver', address[1], counts)
             fact = mismatch.exception.fact
             self.assertEqual(fact['valid_peer_port_mismatches'], 1)
             self.assertEqual(fact['other_peer_ports'], [other.getsockname()[1]])
@@ -644,28 +649,28 @@ class Discovery(unittest.TestCase):
             fact['other_peer_ports'].append(1)
             self.assertEqual(mismatch.exception.fact['other_peer_ports'], [other.getsockname()[1]])
 
-    def test_native_b2_hello_failure_uses_same_seven_filtered_fields(self):
+    def test_native_b2_hello_failure_has_completed_exchange_counters(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as host, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as other:
             for sock in (host, peer, other): sock.bind(('127.0.0.1', 0))
             address = peer.getsockname()
-            raw = n.udp.exchange(host, address, b'a' * 16, b'b' * 16, .08)
+            raw, counts = self.observed_exchange(host, address)
             for stage in ('b2_intel', 'b2_receiver'):
                 with self.assertRaises(n.HelloFailure) as failure:
-                    n.hello_result(raw, stage, address[1])
+                    n.hello_result(raw, stage, address[1], counts)
                 self.assertEqual(failure.exception.fact, {'stage': stage, 'expected_peer_port': address[1],
                                  'hello_received': False, 'ack_received': False, 'sent': 1,
-                                 'valid_peer_port_mismatches': 0, 'other_peer_ports': []})
+                                 'valid_peer_port_mismatches': 0, 'other_peer_ports': [], 'counters': counts})
             other.sendto(n.udp.PACKET.pack(b'KDP1', 1, b'b' * 16, b'a' * 16, 1), host.getsockname())
-            raw = n.udp.exchange(host, address, b'a' * 16, b'b' * 16, .08)
+            raw, counts = self.observed_exchange(host, address)
             with self.assertRaises(n.HelloFailure) as failure:
-                n.hello_result(raw, 'b2_receiver', address[1])
+                n.hello_result(raw, 'b2_receiver', address[1], counts)
             self.assertEqual(failure.exception.fact['valid_peer_port_mismatches'], 1)
             self.assertEqual(failure.exception.fact['other_peer_ports'], [other.getsockname()[1]])
             self.assertNotIn('127.0.0.1', n.canonical(failure.exception.fact))
 
     def test_hello_cleanup_stage_matches_owner_role_and_b1_or_prime_namespace(self):
         raw = {'hello_received': False, 'ack_received': False, 'sent': 1, 'valid_peer_port_mismatches': 0, 'other_peer_ports': []}
-        def failure(stage): return n.HelloFailure({'stage': stage, 'expected_peer_port': 12345, **raw})
+        def failure(stage): return n.HelloFailure({'stage': stage, 'expected_peer_port': 12345, **raw, 'counters': o.empty_counts()})
         for role in ('intel', 'receiver'):
             owner = n.CheckOwner(self.context(role), 'unused', role, -1, prime=True)
             self.assertEqual(owner.cleanup(failure('b2_' + role)), 'not_created')
@@ -781,7 +786,7 @@ class Discovery(unittest.TestCase):
 
     def test_hello_failure_public_boundary_rejects_raw_fields_and_invalid_types(self):
         fact = {'stage': 'b1_intel', 'expected_peer_port': 12345, 'hello_received': False, 'ack_received': False,
-                'sent': 1, 'valid_peer_port_mismatches': 0, 'other_peer_ports': []}
+                'sent': 1, 'valid_peer_port_mismatches': 0, 'other_peer_ports': [], 'counters': o.empty_counts()}
         self.assertEqual(n.validate_hello_failure(fact), fact)
         for change in ({'raw': b'private'}, {'stage': 'capture'}, {'stage': None}, {'expected_peer_port': True}, {'sent': True},
                        {'sent': 281}, {'hello_received': 0}, {'other_peer_ports': [2]},
@@ -790,16 +795,32 @@ class Discovery(unittest.TestCase):
                        {'valid_peer_port_mismatches': 2, 'other_peer_ports': [2, 2]},
                        {'valid_peer_port_mismatches': 1, 'other_peer_ports': [12345]},
                        {'valid_peer_port_mismatches': 9, 'other_peer_ports': list(range(1, 10))},
-                       {'sent': 0, 'ack_received': True}):
+                       {'sent': 0, 'ack_received': True}, {'counters': None},
+                       {'counters': {**o.empty_counts(), 'total': True}},
+                       {'counters': {**o.empty_counts(), 'raw': 'private'}},
+                       {'counters': {**o.empty_counts(), 'total': 1, 'length_invalid': 1, 'received_bytes': 1025}},
+                       {'counters': {**o.empty_counts(), 'total': 1, 'exact_peer': 1, 'received_bytes': 41}}):
             with self.subTest(change=change), self.assertRaises(ValueError): n.validate_hello_failure({**fact, **change})
         failure = n.DiscoveryFailure('acknowledged', n.HelloFailure(fact))
         self.assertEqual(failure.hello_failure, fact)
         self.assertEqual(n.console_fact({'status': 'failed', 'hello_failure': failure.hello_failure})['hello_failure'], fact)
         success = {'hello_received': True, 'ack_received': True, 'sent': 2, 'valid_peer_port_mismatches': 0, 'other_peer_ports': []}
         for stage in ('b1_intel', 'b1_receiver', 'b2_intel', 'b2_receiver'):
-            self.assertEqual(n.hello_result(success, stage, 12345).record(), {'hello_received': True, 'ack_received': True, 'sent': 2})
+            self.assertEqual(n.hello_result(success, stage, 12345, {**o.empty_counts(), 'total': 2, 'received_bytes': 82, 'exact_peer': 2}).record(), {'hello_received': True, 'ack_received': True, 'sent': 2})
         with self.assertRaises(ValueError): n.HelloFailure({**fact, **success})
-        with self.assertRaises(ValueError): n.hello_result({**success, 'raw': 'private'}, 'b1_intel', 12345)
+        with self.assertRaises(ValueError): n.hello_result({**success, 'raw': 'private'}, 'b1_intel', 12345, o.empty_counts())
+
+    def test_hello_failure_has_no_control_quota_and_io_errors_are_preserved(self):
+        raw = {'hello_received': False, 'ack_received': False, 'sent': 40, 'valid_peer_port_mismatches': 0, 'other_peer_ports': []}
+        counts = {**o.empty_counts(), 'total': 4100, 'received_bytes': 4100, 'length_invalid': 4100}
+        with self.assertRaises(n.HelloFailure) as failed:
+            n.hello_result(raw, 'b2_intel', 12345, counts)
+        self.assertEqual(failed.exception.fact['counters'], counts)
+        for stage in (None, 'b2_intel'):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.close()
+            with self.assertRaises(OSError):
+                n.hello(sock, n.Endpoint('8.8.8.8', 12345), 'a' * 64, 'b' * 64, time.monotonic() + 30, stage=stage)
 
     def test_connected_adapter_runs_existing_hello_ack_on_real_udp(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as a, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as b:

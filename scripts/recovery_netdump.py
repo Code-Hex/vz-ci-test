@@ -22,6 +22,7 @@ from urllib.error import HTTPError
 import kdp_udp_preflight as udp
 import recovery_reports as reports
 import recovery_sources as sources
+import udp_observer as o
 import recovery_netdump_capture as capture
 from recovery_netdump_settings import NetdumpSettings
 
@@ -139,9 +140,16 @@ def hello_observation(value):
 
 
 def validate_hello_failure(value):
-    result = hello_observation(value)
+    keys = ('stage', 'expected_peer_port', 'hello_received', 'ack_received', 'sent',
+            'valid_peer_port_mismatches', 'other_peer_ports')
+    exact(value, keys + ('counters',))
+    result = hello_observation({key: value[key] for key in keys})
     require(not result['hello_received'] or not result['ack_received'] or result['valid_peer_port_mismatches'] != 0)
-    return result
+    counts = o.validate_counts(value['counters'])
+    require(counts['received_bytes'] <= counts['total'] * 1024 and
+            result['valid_peer_port_mismatches'] == counts['valid_nonce_same_ip_other_port'] and
+            (result['hello_received'] or result['ack_received']) == (counts['exact_peer'] > 0))
+    return {**result, 'counters': counts}
 
 
 class HelloFailure(ValueError):
@@ -153,11 +161,11 @@ class HelloFailure(ValueError):
     def fact(self): return json.loads(self._summary)
 
 
-def hello_result(raw, stage, expected_peer_port):
+def hello_result(raw, stage, expected_peer_port, counters):
     exact(raw, ('hello_received', 'ack_received', 'sent', 'valid_peer_port_mismatches', 'other_peer_ports'))
     fact = hello_observation({'stage': stage, 'expected_peer_port': expected_peer_port, **raw})
     if not fact['hello_received'] or not fact['ack_received'] or fact['valid_peer_port_mismatches']:
-        raise HelloFailure(fact)
+        raise HelloFailure({**fact, 'counters': counters})
     return HelloStats(fact['hello_received'], fact['ack_received'], fact['sent'])
 
 
@@ -939,8 +947,13 @@ class ConnectedPeer:
 def hello(sock, endpoint, own_nonce, other_nonce, deadline, *, stage=None):
     require(stage is None or stage in ('b1_intel', 'b1_receiver', 'b2_intel', 'b2_receiver'))
     require(deadline - time.monotonic() >= 20)
-    raw = udp.exchange(sock, (endpoint.ip, endpoint.port), bytes.fromhex(own_nonce[:32]), bytes.fromhex(other_nonce[:32]), 20)
-    if stage is not None: return hello_result(raw, stage, endpoint.port)
+    peer = (endpoint.ip, endpoint.port)
+    own, other = bytes.fromhex(own_nonce[:32]), bytes.fromhex(other_nonce[:32])
+    if stage is not None:
+        observer = o.Observer(sock, peer, own, other, packet=udp.PACKET)
+        raw = udp.exchange(observer, peer, own, other, 20)
+        return hello_result(raw, stage, endpoint.port, observer.fact())
+    raw = udp.exchange(sock, peer, own, other, 20)
     require(raw['valid_peer_port_mismatches'] == 0 and raw['other_peer_ports'] == [])
     return HelloStats(raw['hello_received'], raw['ack_received'], raw['sent'])
 

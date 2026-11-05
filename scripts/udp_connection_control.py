@@ -13,17 +13,16 @@ import time
 
 import kdp_udp_preflight as u
 import recovery_netdump as n
+import udp_observer as o
 
 PROTOCOL = 'udp-connection-control-v1'
 MODES = ('unconnected', 'connected', 'unconnected')
-SOURCE_KEYS = n.NETWORK_KEYS + ('control_sha256', 'workflow_sha256')
-CATEGORIES = ('length_invalid', 'magic_invalid', 'nonce_mismatch', 'kind_invalid', 'sequence_invalid',
-              'valid_nonce_other_ip', 'valid_nonce_same_ip_other_port', 'exact_peer')
+SOURCE_KEYS = n.NETWORK_KEYS + ('observer_sha256', 'control_sha256', 'workflow_sha256')
 require, exact = n.require, n.exact
 
 
 def sources():
-    paths = (n.__file__, u.__file__, u.wire.__file__, u.reports.__file__, __file__,
+    paths = (n.__file__, u.__file__, u.wire.__file__, u.reports.__file__, o.__file__, __file__,
              Path(__file__).resolve().parents[1] / '.github/workflows/udp-connection-control.yml')
     return {key: hashlib.sha256(Path(path).read_bytes()).hexdigest() for key, path in zip(SOURCE_KEYS, paths)}
 
@@ -71,56 +70,6 @@ def packet_nonce(scope, role):
     return bytes.fromhex(n.digest({'scope': scope, 'role': role})[:32])
 
 
-def empty_counts(): return {'total': 0, 'received_bytes': 0, **{key: 0 for key in CATEGORIES}}
-
-
-def validate_counts(value):
-    exact(value, ('total', 'received_bytes') + CATEGORIES)
-    require(all(type(item) is int and item >= 0 for item in value.values()) and value['total'] <= 4096 and
-            value['received_bytes'] <= value['total'] * 1024 and sum(value[key] for key in CATEGORIES) == value['total'])
-    return dict(value)
-
-
-class Observer:
-    """Count recvfrom results after socket filtering, without changing acceptance."""
-    def __init__(self, sock, peer, own_nonce, peer_nonce, *, connected):
-        require(type(connected) is bool and len(own_nonce) == len(peer_nonce) == 16 and own_nonce != peer_nonce)
-        self.sock, self.peer, self.own_nonce, self.peer_nonce = sock, peer, own_nonce, peer_nonce
-        self.connected, self.counts, self.sent_sequences = connected, empty_counts(), set()
-
-    def fileno(self): return self.sock.fileno()
-
-    def sendto(self, packet, address):
-        require(address == self.peer)
-        sent = self.sock.send(packet) if self.connected else self.sock.sendto(packet, address)
-        if sent == len(packet) and len(packet) == u.PACKET.size:
-            magic, kind, sender, receiver, sequence = u.PACKET.unpack(packet)
-            if magic == b'KDP1' and kind == 1 and sender == self.own_nonce and receiver == self.peer_nonce and sequence != 0:
-                require(len(self.sent_sequences) < 280 or sequence in self.sent_sequences)
-                self.sent_sequences.add(sequence)
-        return sent
-
-    def recvfrom(self, size):
-        require(self.counts['total'] < 4096 and 0 < size <= 1024)
-        packet, address = self.sock.recvfrom(size)
-        self.counts['total'] += 1
-        self.counts['received_bytes'] += len(packet)
-        if len(packet) != u.PACKET.size: category = 'length_invalid'
-        else:
-            magic, kind, sender, receiver, sequence = u.PACKET.unpack(packet)
-            if magic != b'KDP1': category = 'magic_invalid'
-            elif sender != self.peer_nonce or receiver != self.own_nonce: category = 'nonce_mismatch'
-            elif kind not in (1, 2): category = 'kind_invalid'
-            elif sequence == 0 or (kind == 2 and sequence not in self.sent_sequences): category = 'sequence_invalid'
-            elif address[0] != self.peer[0]: category = 'valid_nonce_other_ip'
-            elif address != self.peer: category = 'valid_nonce_same_ip_other_port'
-            else: category = 'exact_peer'
-        self.counts[category] += 1
-        return packet, address
-
-    def fact(self): return validate_counts(self.counts)
-
-
 def disconnect_owned_udp(sock):
     require(sys.platform == 'darwin' and type(sock) is socket.socket and sock.family == socket.AF_INET and sock.type == socket.SOCK_DGRAM)
     fd, port = sock.fileno(), sock.getsockname()[1]
@@ -164,7 +113,9 @@ def validate_result(value, role, index):
         exact(timing, ('monotonic_start', 'monotonic_end', 'unix_start', 'unix_end'))
         require(all(type(item) in (int, float) and 0 < item < 2 ** 53 and math.isfinite(item) for item in timing.values()) and
                 0 <= timing['monotonic_end'] - timing['monotonic_start'] <= 360)
-        counts = validate_counts(value['counters'])
+        counts = o.validate_counts(value['counters'])
+        require(counts['total'] <= 4096 and counts['received_bytes'] <= 4 * 1024 * 1024 and
+                counts['received_bytes'] <= counts['total'] * 1024)
         require(stats['valid_peer_port_mismatches'] == counts['valid_nonce_same_ip_other_port'] and
                 stats['other_peer_port_count'] <= stats['valid_peer_port_mismatches'] and
                 (stats['other_peer_port_count'] == 0) == (stats['valid_peer_port_mismatches'] == 0) and
@@ -347,7 +298,8 @@ class Peer:
 
 def run_round(sock, peer, scope, role, connected):
     own_nonce, peer_nonce = packet_nonce(scope, role), packet_nonce(scope, 'receiver' if role == 'intel' else 'intel')
-    observer = Observer(sock, peer, own_nonce, peer_nonce, connected=connected)
+    transport = n.ConnectedPeer(sock, peer) if connected else sock
+    observer = o.Observer(transport, peer, own_nonce, peer_nonce, packet=u.PACKET, max_packets=4096)
     monotonic_start, unix_start = time.monotonic(), time.time()
     raw = u.exchange(observer, peer, own_nonce, peer_nonce, 20)
     unix_end, monotonic_end = time.time(), time.monotonic()

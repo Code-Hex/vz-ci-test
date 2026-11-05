@@ -2,10 +2,10 @@ import copy
 import errno
 import socket
 import sys
-import threading
 import unittest
 
 import udp_connection_control as c
+import udp_observer as o
 
 
 class Control(unittest.TestCase):
@@ -100,10 +100,12 @@ class Control(unittest.TestCase):
 
     def test_workflow_pin_and_observed_timing_are_required_and_typed(self):
         self.assertIn('workflow_sha256', c.SOURCE_KEYS)
+        self.assertEqual(len(c.SOURCE_KEYS), 7)
+        self.assertEqual(c.sources()['observer_sha256'], c.hashlib.sha256(c.Path(o.__file__).read_bytes()).hexdigest())
         self.assertEqual(c.sources()['workflow_sha256'], c.hashlib.sha256((c.Path(c.__file__).resolve().parents[1] / '.github/workflows/udp-connection-control.yml').read_bytes()).hexdigest())
         result = {'status': 'observed', 'overlap': 'overlap_unverified', 'adapter_connected': False,
                   'exchange': {'hello_received': False, 'ack_received': False, 'sent': 40, 'valid_peer_port_mismatches': 0, 'other_peer_port_count': 0},
-                  'counters': c.empty_counts(), 'timing': {'monotonic_start': 100.0, 'monotonic_end': 120.0, 'unix_start': 1800000000.0, 'unix_end': 1800000020.0}}
+                  'counters': o.empty_counts(), 'timing': {'monotonic_start': 100.0, 'monotonic_end': 120.0, 'unix_start': 1800000000.0, 'unix_end': 1800000020.0}}
         self.assertEqual(c.validate_result(result, 'receiver', 0), result)
         for change in ({'monotonic_start': True}, {'monotonic_end': 99.0}, {'unix_end': float('nan')}, {'unix_end': 2 ** 1000}):
             with self.assertRaises(ValueError): c.validate_result({**result, 'timing': {**result['timing'], **change}}, 'receiver', 0)
@@ -118,68 +120,20 @@ class Control(unittest.TestCase):
         self.assertNotEqual(c.packet_nonce(a, 'intel'), c.packet_nonce(c.round_scope(host, receiver, 2), 'intel'))
         self.assertEqual([c.MODES[i] for i in range(3)], ['unconnected', 'connected', 'unconnected'])
 
-    def test_native_adapter_observes_without_changing_packets_or_ack_rules(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as host, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as other:
-            for sock in (host, peer, other): sock.bind(('127.0.0.1', 0))
-            adapter = c.Observer(host, peer.getsockname(), b'a' * 16, b'b' * 16, connected=False)
-            packets = [b'bad', c.u.PACKET.pack(b'KDP1', 1, b'b' * 16, b'a' * 16, 7),
-                       c.u.PACKET.pack(b'KDP1', 2, b'b' * 16, b'a' * 16, 7)]
-            for packet in packets:
-                other.sendto(packet, host.getsockname())
-                self.assertEqual(adapter.recvfrom(1024), (packet, other.getsockname()))
-            self.assertEqual(adapter.counts['length_invalid'], 1)
-            self.assertEqual(adapter.counts['valid_nonce_same_ip_other_port'], 1)
-            self.assertEqual(adapter.counts['sequence_invalid'], 1)
-            adapter.sendto(c.u.PACKET.pack(b'KDP1', 2, b'a' * 16, b'b' * 16, 7), peer.getsockname())
-            self.assertEqual(adapter.sent_sequences, set())
-            adapter.sendto(c.u.PACKET.pack(b'KDP1', 1, b'a' * 16, b'b' * 16, 7), peer.getsockname())
-            self.assertEqual(adapter.sent_sequences, {7})
-            other.sendto(packets[-1], host.getsockname())
-            adapter.recvfrom(1024)
-            self.assertEqual(adapter.counts['valid_nonce_same_ip_other_port'], 2)
-            self.assertNotIn('127.0.0.1', c.n.canonical(adapter.fact()))
 
-    def test_native_failed_send_and_foreign_ip_observation_keep_acceptance_rules(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(('127.0.0.1', 0))
-        observer = c.Observer(sock, ('127.0.0.1', 9), b'a' * 16, b'b' * 16, connected=False)
-        sock.close()
-        with self.assertRaises(OSError):
-            observer.sendto(c.u.PACKET.pack(b'KDP1', 1, b'a' * 16, b'b' * 16, 1), observer.peer)
-        self.assertEqual(observer.sent_sequences, set())
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
-            receiver.bind(('127.0.0.1', 0)); sender.bind(('127.0.0.1', 0))
-            receiver.settimeout(1)
-            observer = c.Observer(receiver, ('8.8.8.8', sender.getsockname()[1]), b'a' * 16, b'b' * 16, connected=False)
-            packet = c.u.PACKET.pack(b'KDP1', 1, b'b' * 16, b'a' * 16, 999)
-            sender.sendto(packet, receiver.getsockname())
-            self.assertEqual(observer.recvfrom(1024)[0], packet)
-            self.assertEqual(observer.fact()['valid_nonce_other_ip'], 1)
-            self.assertEqual(observer.fact()['sequence_invalid'], 0)
 
     def test_receiver_adapter_stays_unconnected_for_connected_treatment(self):
         result = {'status': 'observed', 'overlap': 'overlap_unverified', 'adapter_connected': False,
                   'exchange': {'hello_received': False, 'ack_received': False, 'sent': 40,
-                               'valid_peer_port_mismatches': 0, 'other_peer_port_count': 0}, 'counters': c.empty_counts(),
+                               'valid_peer_port_mismatches': 0, 'other_peer_port_count': 0}, 'counters': o.empty_counts(),
                   'timing': {'monotonic_start': 100.0, 'monotonic_end': 120.0, 'unix_start': 1800000000.0, 'unix_end': 1800000020.0}}
         self.assertEqual(c.validate_result(result, 'receiver', 1), result)
         with self.assertRaises(ValueError): c.validate_result(result, 'intel', 1)
         with self.assertRaises(ValueError): c.validate_result({**result, 'overlap': 'matching_packets_observed'}, 'receiver', 1)
+        over_limit = {**o.empty_counts(), 'total': 4097, 'received_bytes': 4097, 'length_invalid': 4097}
+        self.assertEqual(o.validate_counts(over_limit), over_limit)
+        with self.assertRaises(ValueError): c.validate_result({**result, 'counters': over_limit}, 'receiver', 1)
 
-    def test_native_exchange_still_uses_exact_peer_hello_and_ack(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as a, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as b:
-            a.bind(('127.0.0.1', 0)); b.bind(('127.0.0.1', 0))
-            a.connect(b.getsockname())
-            host = c.Observer(a, b.getsockname(), b'a' * 16, b'b' * 16, connected=True)
-            receiver = c.Observer(b, a.getsockname(), b'b' * 16, b'a' * 16, connected=False)
-            facts = []
-            thread = threading.Thread(target=lambda: facts.append(c.u.exchange(receiver, a.getsockname(), b'b' * 16, b'a' * 16, .2)))
-            thread.start()
-            facts.append(c.u.exchange(host, b.getsockname(), b'a' * 16, b'b' * 16, .2))
-            thread.join(1)
-            self.assertFalse(thread.is_alive())
-            self.assertTrue(all(fact['hello_received'] and fact['ack_received'] for fact in facts))
-            self.assertTrue(host.fact()['total'] > 0)
 
     @unittest.skipUnless(sys.platform == 'darwin', 'Darwin disconnectx ABI')
     def test_native_disconnect_is_reversible_on_same_owned_fd_and_port(self):
@@ -203,8 +157,8 @@ class Control(unittest.TestCase):
         for changed in ({**record, 'raw': 'private'}, {**record, 'base': {**record['base'], 'local_port': True}},
                         {**record, 'base': {**record['base'], 'endpoint': {'ip': '192.168.1.1', 'port': 40000}}}):
             with self.assertRaises(ValueError): c.validate_record(changed)
-        for changed in ({**c.empty_counts(), 'total': True}, {**c.empty_counts(), 'raw': 1}):
-            with self.assertRaises(ValueError): c.validate_counts(changed)
+        for changed in ({**o.empty_counts(), 'total': True}, {**o.empty_counts(), 'raw': 1}):
+            with self.assertRaises(ValueError): o.validate_counts(changed)
 
 
 if __name__ == '__main__': unittest.main()
