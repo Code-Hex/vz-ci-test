@@ -441,7 +441,7 @@ class Bootargs(unittest.TestCase):
         self.assertEqual(facts["debugger_count"], 0)
         self.assertEqual(facts["debugger_inventory_status"], "observed")
         self.assertEqual(facts["network_inventory_status"], "observed")
-        self.assertTrue(all(value == {"status": "unavailable"} for value in facts["kernel_debug_state"].values()))
+        self.assertTrue(all(value["status"] == "unavailable" and value["error"]["reason"] == "os_error" for value in facts["kernel_debug_state"].values()))
 
     def test_optional_kernel_summary_preserves_exact_types_and_rejects_bad_ranges(self):
         states={'debug_boot_arg':{'status':'observed','value':0x102000},
@@ -478,6 +478,76 @@ class Bootargs(unittest.TestCase):
             self.assertIs(type(again['kernel_debug_state']['dtrace_destructive_disallow']['value']),int)
             self.assertEqual(platform.calls,1)
 
+    def test_capture_stderr_preserves_success_stdout_and_bounded_failed_evidence(self):
+        import subprocess
+        marker=b'VZKSTATE v1 debug_boot_arg u32 0\n\n'
+        program='import sys; sys.stdout.buffer.write('+repr(marker)+'); sys.stderr.write("private warning 0xffffabcd\\n")'
+        self.assertEqual(b.capture([sys.executable,'-c',program],4096,timeout=1,capture_stderr=True),marker)
+        self.assertEqual(b.capture([sys.executable,'-c','import os,time; os.close(2); time.sleep(.02); print("later")'],4096,timeout=1,capture_stderr=True),b'later\n')
+        self.assertEqual(b.capture([sys.executable,'-c','import os,sys; os.close(1); sys.stderr.write("warning")'],4096,timeout=1,capture_stderr=True),b'')
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            b.capture([sys.executable,'-c',program+'; sys.stderr.write("[D_SYM_NOTYPES]"); sys.exit(1)'],4096,timeout=1,capture_stderr=True)
+        error=caught.exception
+        self.assertEqual(error.output,marker)
+        self.assertIn(b'[D_SYM_NOTYPES]',error.stderr)
+        facts=b.kernel_debug_state(read=lambda *args,**kwargs: (_ for _ in ()).throw(error))
+        detail=facts['debug_boot_arg']['error']
+        self.assertEqual(detail['reason'],'command_failed')
+        self.assertEqual(detail['exit_code'],1)
+        self.assertEqual(detail['tags'],['D_SYM_NOTYPES'])
+        self.assertNotIn('0xffffabcd',str(facts))
+        self.assertEqual(b.optional_summary({'kernel_debug_state':facts})['kernel_debug_state'],facts)
+
+    def test_capture_stderr_both_pipe_quotas_and_timeout_keep_partial_bytes(self):
+        import subprocess
+        for stream in ('stdout','stderr'):
+            with self.assertRaises(b.CaptureLimit) as caught:
+                b.capture([sys.executable,'-c','import sys; sys.'+stream+'.write("x"*100000)'],64,timeout=1,capture_stderr=True)
+            self.assertLessEqual(len(caught.exception.output)+len(caught.exception.stderr),64)
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            b.capture([sys.executable,'-c','import sys,time; print("part",flush=True); print("[D_IDENT_UNDEF]",file=sys.stderr,flush=True); time.sleep(10)'],4096,timeout=.1,capture_stderr=True)
+        self.assertEqual(caught.exception.output,b'part\n')
+        self.assertIn(b'D_IDENT_UNDEF',caught.exception.stderr)
+        facts=b.kernel_debug_state(read=lambda *a,**k: (_ for _ in ()).throw(caught.exception))
+        self.assertTrue(all(value['error']['reason']=='timeout' for value in facts.values()))
+
+    def test_kernel_error_safe_fields_roundtrip_and_reject_raw_or_bad_types(self):
+        import subprocess,hashlib
+        stderr=b'private address 0xffff1234 [D_SYM_NOTYPES] [D_IDENT_UNDEF] [D_IDENT_UNDEF]'
+        original=subprocess.CalledProcessError(1,['private-command'],output=b'0\n',stderr=stderr)
+        detail=b.kernel_failure('command_failed',original)
+        self.assertEqual(detail,{'reason':'command_failed','exit_code':1,'output_bytes':len(b'0\n'+stderr),
+            'output_sha256':hashlib.sha256(b'0\n'+stderr).hexdigest(),'tags':['D_IDENT_UNDEF','D_SYM_NOTYPES']})
+        for changed in ({'raw':'secret'},{'reason':'permission guessed'},{'exit_code':True},{'output_bytes':4097},
+                {'output_sha256':'bad'},{'tags':['D_TAG','D_TAG']},{'tags':['private address']},
+                {'tags':['D_A','D_B','D_C','D_D','D_E']},{'output_bytes':None}):
+            value={'kernel_debug_state':{'debug_boot_arg':{'status':'unavailable','error':{**detail,**changed}}}}
+            self.assertEqual(b.optional_summary(value)['kernel_debug_state'],{'debug_boot_arg':{'status':'invalid'}})
+        states={'debug_boot_arg':{'status':'unavailable','error':detail}}
+        class Inventory:
+            calls=0
+            def inventory(self):
+                self.calls+=1
+                return {'kernel_debug_state':states}
+        with tempfile.TemporaryDirectory() as tmp:
+            platform=Inventory(); directory=Path(tmp)
+            first=b.observe_once(directory,MARKER,platform,self.save,lambda _:None,current_boot_uuid='new')
+            again=b.observe_once(directory,MARKER,platform,self.save,lambda _:None,current_boot_uuid='new')
+            self.assertEqual(first,again); self.assertEqual(again['kernel_debug_state'],states)
+            self.assertEqual(platform.calls,1)
+            saved=(directory/'debug-boot-inventory-result.json').read_text()
+            self.assertNotIn('private address',saved); self.assertNotIn('private-command',saved)
+            self.assertNotIn('0xffff1234',saved)
+
+    def test_capture_exact_shared_limit_and_eof_and_default_path(self):
+        program='import sys; sys.stdout.write("a"*2048); sys.stdout.flush(); sys.stderr.write("b"*2048)'
+        self.assertEqual(b.capture([sys.executable,'-c',program],4096,timeout=1,capture_stderr=True),b'a'*2048)
+        with self.assertRaises(b.CaptureLimit) as caught:
+            b.capture([sys.executable,'-c',program.replace('"b"*2048','"b"*2049')],4096,timeout=1,capture_stderr=True)
+        self.assertEqual(len(caught.exception.output)+len(caught.exception.stderr),4096)
+        self.assertEqual(b.capture([sys.executable,'-c','print("a"*4095)'],4096,timeout=1),b'a'*4095+b'\n')
+        with self.assertRaises(ValueError): b.capture([sys.executable,'-c','print("a"*4096)'],4096,timeout=1)
+
     def test_kernel_field_parser_requires_exact_typed_marker_and_cli_one_lf(self):
         self.assertEqual(b.parse_kernel_field('debug_boot_arg',b'VZKSTATE v1 debug_boot_arg u32 8192\n\n'),8192)
         self.assertEqual(b.parse_kernel_field('dtrace_destructive_disallow',b'VZKSTATE v1 dtrace_destructive_disallow i32 -1\n\n'),-1)
@@ -506,8 +576,9 @@ class Bootargs(unittest.TestCase):
 
     def test_native_failed_reader_never_publishes_zero(self):
         import subprocess
-        def read(argv,limit,timeout):
-            self.assertEqual(argv[:3],['/usr/sbin/dtrace','-q','-n'])
+        def read(argv,limit,timeout,*,capture_stderr=False):
+            self.assertTrue(capture_stderr)
+            self.assertEqual(argv[:5],['/usr/sbin/dtrace','-q','-x','errtags','-n'])
             self.assertEqual((limit,timeout),(4096,5))
             name=next(name for name in b.KERNEL_FIELDS if 'VZKSTATE v1 '+name+' ' in argv[-1])
             kind=b.KERNEL_FIELDS[name][1]
@@ -515,7 +586,7 @@ class Bootargs(unittest.TestCase):
             return b.capture([sys.executable,'-c','import sys; sys.stdout.write('+repr(raw)+'); sys.exit(1)'],limit,timeout)
         result=b.kernel_debug_state(read=read)
         self.assertEqual(set(result),set(b.KERNEL_FIELDS))
-        self.assertTrue(all(value=={'status':'unavailable'} for value in result.values()))
+        self.assertTrue(all(value['status']=='unavailable' and value['error']['exit_code']==1 for value in result.values()))
 
     def test_kernel_debug_state_has_only_allowed_numeric_fields(self):
         def capture(argv, *_args, **_kwargs):
@@ -527,14 +598,13 @@ class Bootargs(unittest.TestCase):
             raise OSError("static symbol unavailable")
         with patch.object(b, "capture", capture):
             facts = b.kernel_debug_state()
-        self.assertEqual(facts, {"debug_boot_arg": {"status": "observed", "value": 8192},
-                                 "kdp_flag": {"status": "observed", "value": 129},
-                                 "send_registered": {"status": "unavailable"}, "receive_registered": {"status": "unavailable"},
-                                 "panicDebugging": {"status": "unavailable"}, "dtrace_destructive_disallow": {"status": "unavailable"},
-                                 "coprocessor_paniclog_flush": {"status": "unavailable"}, "commit_paniclog_to_nvram": {"status": "unavailable"}})
+        unavailable={'status':'unavailable','error':{'reason':'os_error','exit_code':None,'output_bytes':None,'output_sha256':None,'tags':[]}}
+        expected={name:unavailable for name in b.KERNEL_FIELDS}
+        expected.update(debug_boot_arg={'status':'observed','value':8192},kdp_flag={'status':'observed','value':129})
+        self.assertEqual(facts,expected)
         with patch.object(b, "capture", lambda *_args, **_kwargs: b"secret"):
             invalid = b.kernel_debug_state()
-        self.assertTrue(all(value == {"status": "invalid"} for value in invalid.values()))
+        self.assertTrue(all(value["status"] == "invalid" and value["error"]["reason"] == "output_invalid" for value in invalid.values()))
         self.assertNotIn("secret", str(invalid))
 
     def test_observation_save_failure_still_restores(self):

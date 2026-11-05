@@ -120,32 +120,58 @@ def boot_argument_profile(value):
             'nondebug_sha256': hashlib.sha256(canonical).hexdigest()}
 
 
-def capture(argv, limit=4_000_000, timeout=8):
-    child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+class CaptureLimit(ValueError):
+    def __init__(self, output, stderr):
+        super().__init__("platform response oversized")
+        self.output, self.stderr = output, stderr
+
+
+def capture(argv, limit=4_000_000, timeout=8, *, capture_stderr=False):
+    child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL, bufsize=0)
     selector = selectors.DefaultSelector()
+    buffers = {'stdout': bytearray(), 'stderr': bytearray()}
     try:
-        selector.register(child.stdout, selectors.EVENT_READ)
-        deadline, data = time.monotonic() + timeout, bytearray()
-        while True:
+        selector.register(child.stdout, selectors.EVENT_READ, 'stdout')
+        if capture_stderr: selector.register(child.stderr, selectors.EVENT_READ, 'stderr')
+        deadline, total = time.monotonic() + timeout, 0
+        while selector.get_map():
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not selector.select(remaining):
-                raise subprocess.TimeoutExpired(argv, timeout)
-            chunk = os.read(child.stdout.fileno(), min(65536, limit + 1 - len(data)))
-            if not chunk:
-                break
-            data.extend(chunk)
-            if len(data) > limit:
-                raise ValueError("platform response oversized")
-        code = child.wait(timeout=max(0.01, deadline - time.monotonic()))
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout,
+                    output=bytes(buffers['stdout']) if capture_stderr else None,
+                    stderr=bytes(buffers['stderr']) if capture_stderr else None)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(argv, timeout,
+                    output=bytes(buffers['stdout']) if capture_stderr else None,
+                    stderr=bytes(buffers['stderr']) if capture_stderr else None)
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), min(65536, limit + 1 - total))
+                if not chunk:
+                    selector.unregister(key.fileobj); continue
+                buffers[key.data].extend(chunk[:limit-total])
+                total += len(chunk)
+                if total > limit:
+                    if capture_stderr: raise CaptureLimit(bytes(buffers['stdout']), bytes(buffers['stderr']))
+                    raise ValueError("platform response oversized")
+        try:
+            code = child.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired(argv, timeout,
+                output=bytes(buffers['stdout']) if capture_stderr else None,
+                stderr=bytes(buffers['stderr']) if capture_stderr else None) from None
         if code:
-            raise subprocess.CalledProcessError(code, argv)
-        return bytes(data)
+            raise subprocess.CalledProcessError(code, argv,
+                output=bytes(buffers['stdout']) if capture_stderr else None,
+                stderr=bytes(buffers['stderr']) if capture_stderr else None)
+        return bytes(buffers['stdout'])
     finally:
         selector.close()
         if child.poll() is None:
             child.kill()
             child.wait(timeout=2)
         child.stdout.close()
+        if child.stderr is not None: child.stderr.close()
 
 
 def csr_allowed():
@@ -211,17 +237,58 @@ def parse_kernel_field(name, raw):
     return kernel_field_value(name, bool(value) if kind == 'bool' else value)
 
 
+KERNEL_ERROR_REASONS = frozenset(('command_failed', 'timeout', 'output_limit', 'os_error', 'unknown', 'output_invalid'))
+
+
+def kernel_error_summary(value):
+    if (type(value) is not dict or set(value) != {'reason', 'exit_code', 'output_bytes', 'output_sha256', 'tags'} or
+            type(value['reason']) is not str or value['reason'] not in KERNEL_ERROR_REASONS or
+            not (value['exit_code'] is None or type(value['exit_code']) is int and -255 <= value['exit_code'] <= 255) or
+            not (value['output_bytes'] is None or type(value['output_bytes']) is int and 0 <= value['output_bytes'] <= 4096) or
+            not (value['output_sha256'] is None or type(value['output_sha256']) is str and re.fullmatch('[0-9a-f]{64}', value['output_sha256'])) or
+            (value['output_bytes'] is None) != (value['output_sha256'] is None) or
+            type(value['tags']) is not list or len(value['tags']) > 4 or
+            not all(type(tag) is str and re.fullmatch('D_[A-Z0-9_]{1,40}', tag) for tag in value['tags']) or
+            value['tags'] != sorted(set(value['tags']))):
+        raise ValueError('kernel error invalid')
+    return {**value, 'tags': list(value['tags'])}
+
+
+def kernel_failure(reason, error=None, raw=None):
+    output = raw if type(raw) is bytes else getattr(error, 'output', None)
+    stderr = getattr(error, 'stderr', None)
+    collected = type(output) is bytes or type(stderr) is bytes
+    output = output if type(output) is bytes else b''
+    stderr = stderr if type(stderr) is bytes else b''
+    combined = (output + stderr)[:4096]
+    code = getattr(error, 'returncode', 0 if type(raw) is bytes else None)
+    if type(code) is not int or not -255 <= code <= 255: code = None
+    tags = sorted(set(tag.decode('ascii') for tag in re.findall(rb'\[(D_[A-Z0-9_]{1,40})\]', stderr)))[:4]
+    return kernel_error_summary({'reason': reason, 'exit_code': code,
+        'output_bytes': len(combined) if collected else None,
+        'output_sha256': hashlib.sha256(combined).hexdigest() if collected else None, 'tags': tags})
+
+
 def kernel_debug_state(*, read=None):
     read = capture if read is None else read
     result = {}
     for name in KERNEL_FIELDS:
+        raw = None
         try:
-            raw = read(["/usr/sbin/dtrace", "-q", "-n", kernel_field_program(name)], 4096, timeout=5)
+            raw = read(["/usr/sbin/dtrace", "-q", "-x", "errtags", "-n", kernel_field_program(name)], 4096, timeout=5, capture_stderr=True)
             result[name] = {"status": "observed", "value": parse_kernel_field(name, raw)}
-        except (OSError, subprocess.SubprocessError):
-            result[name] = {"status": "unavailable"}
+        except subprocess.CalledProcessError as error:
+            result[name] = {"status": "unavailable", "error": kernel_failure('command_failed', error)}
+        except subprocess.TimeoutExpired as error:
+            result[name] = {"status": "unavailable", "error": kernel_failure('timeout', error)}
+        except CaptureLimit as error:
+            result[name] = {"status": "unavailable", "error": kernel_failure('output_limit', error)}
+        except OSError as error:
+            result[name] = {"status": "unavailable", "error": kernel_failure('os_error', error)}
+        except subprocess.SubprocessError as error:
+            result[name] = {"status": "unavailable", "error": kernel_failure('unknown', error)}
         except ValueError:
-            result[name] = {"status": "invalid"}
+            result[name] = {"status": "invalid", "error": kernel_failure('output_invalid', raw=raw)}
     return result
 
 
@@ -452,6 +519,12 @@ def optional_summary(data):
                     record["value"] = kernel_field_value(name, number)
                 except ValueError:
                     record["status"] = "invalid"
+            if 'error' in value:
+                try:
+                    if record['status'] == 'observed': raise ValueError('kernel error invalid')
+                    record['error'] = kernel_error_summary(value['error'])
+                except ValueError:
+                    record = {'status': 'invalid'}
             result["kernel_debug_state"][name] = record
     return result
 
