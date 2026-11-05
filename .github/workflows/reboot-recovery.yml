@@ -3,6 +3,11 @@ name: Intel reboot and panic recovery
 on:
   workflow_dispatch:
     inputs:
+      netdump_discovery_only:
+        description: Check the receiver and host plan without rebooting
+        required: false
+        type: boolean
+        default: false
       cleanup_check:
         description: Unfinished recovery check from an earlier run
         required: false
@@ -51,7 +56,7 @@ permissions:
 
 jobs:
   controller:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.after_debug_boot != 'none' && 20 || 12 }}
     env:
@@ -74,7 +79,7 @@ jobs:
           RECOVERY_CLEANUP_CHECK_ID: ${{ inputs.cleanup_check }}
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py controller
   verify:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && !inputs.netdump_discovery_only }}
     runs-on: macos-26-intel
     timeout-minutes: ${{ inputs.after_debug_boot != 'none' && 20 || 12 }}
     env:
@@ -114,3 +119,44 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py arm
       - name: Run the recovery control on the disposable runner
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/reboot-recovery.py trigger
+  netdump_discovery:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' && inputs.netdump_discovery_only }}
+    name: Netdump discovery ${{ matrix.role }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: intel
+            command: discover
+            os: macos-26-intel
+          - role: receiver
+            command: receiver
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 6
+    permissions:
+      contents: read
+      checks: write
+    env:
+      KDP_ROLE: ${{ matrix.role }}
+      KDP_PORT_MODE: kernel-source
+      KDP_STUN_HOST: stun.cloudflare.com
+      KDP_STUN_PORT: '3478'
+    steps:
+      - name: Check out trusted diagnostic scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Discover the bounded network plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KDP_REPORT_CERT: ${{ inputs.report_cert }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/recovery_netdump.py ${{ matrix.command }}
+      - name: Preserve the filtered discovery result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: netdump-discovery-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/debug/netdump-discovery.json
+          if-no-files-found: warn
