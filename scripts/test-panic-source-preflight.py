@@ -43,6 +43,28 @@ class Preflight(unittest.TestCase):
                 p.command([sys.executable, '-c', 'import sys; sys.stderr.write("x" * 100000)'], root, 'large')
             self.assertLessEqual((root / 'large.stderr').stat().st_size, p.LIMIT)
 
+    def test_private_logs_ignore_umask_and_reject_symlinks(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = os.umask(0o022)
+            try:
+                p.command([sys.executable, '-c', 'print("ok")'], root, 'mode')
+                self.assertEqual((root / 'mode.stdout').stat().st_mode & 0o777, 0o600)
+                self.assertEqual((root / 'mode.stderr').stat().st_mode & 0o777, 0o600)
+                (root / 'unsafe').symlink_to(root / 'mode.stdout')
+                with self.assertRaises(OSError): p.open_private(root / 'unsafe', append=True)
+                (root / 'mode.stdout').chmod(0o644)
+                with self.assertRaises(OSError): p.open_private(root / 'mode.stdout', append=True)
+            finally:
+                os.umask(old)
+
+    def test_command_uses_explicit_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = p.command([sys.executable, '-c', 'import os; print(os.getenv("GITHUB_TOKEN", "absent"))'],
+                                  Path(tmp), 'environment', env={'PATH': '/usr/bin:/bin'})
+            self.assertEqual((code, out), (0, b'absent\n'))
+
     def test_diagnostics_capture_actual_mismatch_without_raw_values(self):
         name = 'vz_nonce_' + 'a' * 64
         data = f'READY\nHIT pid456:helper:{name}:return\n'.encode()

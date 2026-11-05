@@ -8,6 +8,7 @@ import re
 import secrets
 import selectors
 import subprocess
+import stat
 import sys
 import time
 
@@ -77,9 +78,24 @@ def write_public(path, result):
         stream.write('\n'); stream.flush(); os.fchmod(stream.fileno(), 0o644); os.fsync(stream.fileno())
 
 
-def command(argv, directory, label, timeout=15):
-    with (directory / (label + '.stdout')).open('wb') as sink, (directory / (label + '.stderr')).open('wb') as errors:
-        child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def open_private(path, *, append=False):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= os.O_APPEND if append else os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise OSError('private_file_invalid')
+        return os.fdopen(fd, 'ab' if append else 'wb')
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def command(argv, directory, label, timeout=15, *, env=None):
+    with open_private(directory / (label + '.stdout')) as sink, open_private(directory / (label + '.stderr')) as errors:
+        child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         selector = selectors.DefaultSelector()
         selector.register(child.stdout, selectors.EVENT_READ, sink)
         selector.register(child.stderr, selectors.EVENT_READ, errors)
@@ -126,18 +142,18 @@ def guard(directory):
     return True
 
 
-def observe(binary, nonce, directory, facts):
+def observe(binary, nonce, directory, facts, *, env=None):
     name = 'vz_nonce_' + nonce
-    helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     tracer = None
     try:
-        code, listing = command(['/usr/sbin/dtrace', '-p', str(helper.pid), '-l', '-n', 'pid$target::' + name + ':entry'], directory, 'listing')
+        code, listing = command(['/usr/sbin/dtrace', '-p', str(helper.pid), '-l', '-n', 'pid$target::' + name + ':entry'], directory, 'listing', env=env)
         facts['list_exit'] = code
         facts['list_status'] = parse_probe_list(listing.decode('utf-8', 'replace'), helper.pid, name)
         facts['list_stderr'] = stderr_kind((directory / 'listing.stderr').read_bytes())
         if code or facts['list_status'] != 'matched': raise ValueError('probe_unavailable')
-        with (directory / 'trace.stderr').open('wb') as errors, (directory / 'trace.stdout').open('wb') as log:
-            tracer = subprocess.Popen(['/usr/sbin/dtrace', '-q', '-x', 'switchrate=10hz', '-p', str(helper.pid), '-n', probe_script(nonce, False)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with open_private(directory / 'trace.stderr') as errors, open_private(directory / 'trace.stdout') as log:
+            tracer = subprocess.Popen(['/usr/sbin/dtrace', '-q', '-x', 'switchrate=10hz', '-p', str(helper.pid), '-n', probe_script(nonce, False)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
             selector = selectors.DefaultSelector()
             selector.register(tracer.stdout, selectors.EVENT_READ, log)
             selector.register(tracer.stderr, selectors.EVENT_READ, errors)
@@ -176,10 +192,10 @@ def observe(binary, nonce, directory, facts):
                 except subprocess.TimeoutExpired: pass
 
 
-def compile_panic(binary, nonce, directory):
-    helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def compile_panic(binary, nonce, directory, *, env=None):
+    helper = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     try:
-        code, _ = command(['/usr/sbin/dtrace', '-w', '-e', '-p', str(helper.pid), '-n', probe_script(nonce, True)], directory, 'panic-compile')
+        code, _ = command(['/usr/sbin/dtrace', '-w', '-e', '-p', str(helper.pid), '-n', probe_script(nonce, True)], directory, 'panic-compile', env=env)
         return code == 0
     finally:
         helper.stdin.close()
