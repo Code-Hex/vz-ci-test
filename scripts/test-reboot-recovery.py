@@ -193,6 +193,37 @@ class Recovery(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 r.checked_boot_argument_profile({**valid, **extra})
 
+    def test_runtime_watch_ready_timeout_reaps_its_own_child_before_fire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, _ = self.followup_fixture()
+            config['python'] = str(Path(r.sys.executable).resolve())
+            child = subprocess.Popen([r.sys.executable, '-c', 'import time; time.sleep(60)'])
+            try:
+                with patch.object(r, 'runtime_watch_executable_matches', lambda *_: True), \
+                        patch.object(r.subprocess, 'Popen', lambda *_args, **_kwargs: child), \
+                        patch.object(r.time, 'monotonic', side_effect=[0, 26]):
+                    with self.assertRaises(TimeoutError):
+                        r.start_runtime_watch(directory, config, saved['scope'], {'helper_sha256': 'f' * 64})
+                self.assertIsNotNone(child.poll())
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+
+    def test_runtime_watch_accepts_the_same_copied_script_through_a_directory_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / 'real'
+            real.mkdir()
+            (real / 'recovery.py').write_text('same script')
+            alias = Path(tmp) / 'alias'
+            alias.symlink_to(real, target_is_directory=True)
+            python = str(Path(r.sys.executable).resolve())
+            with patch.object(r, '__file__', str(real / 'recovery.py')):
+                self.assertTrue(r.runtime_watch_executable_matches(alias, python))
+                self.assertFalse(r.runtime_watch_executable_matches(Path(tmp), python))
+                self.assertFalse(r.runtime_watch_executable_matches(alias, '/unrelated/python'))
+
     def test_debug_source_context_is_explicit_and_bound(self):
         base = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
                 'runner_environment': 'github-hosted', 'run_id': '123', 'attempt': '1', 'sha': 'a' * 40,

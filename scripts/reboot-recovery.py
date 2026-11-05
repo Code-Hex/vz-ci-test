@@ -1445,10 +1445,15 @@ def runtime_watch_alive(watch, minimum=60):
     return watch['child'].poll() is None and watch['deadline_monotonic'] - time.monotonic() >= minimum
 
 
+def runtime_watch_executable_matches(directory, python):
+    return (Path(__file__).resolve() == (directory / 'recovery.py').resolve() and
+            str(Path(sys.executable).resolve()) == python)
+
+
 def start_runtime_watch(directory, config, scope, prepared):
     identity = runtime_watch_identity(config, scope, prepared['helper_sha256'])
     copied = directory / 'recovery.py'
-    if Path(__file__).resolve() != copied or str(Path(sys.executable).resolve()) != config['python']:
+    if not runtime_watch_executable_matches(directory, config['python']):
         raise ValueError('runtime watch executable changed')
     private_write(directory / 'runtime-watch-launch.json', json.dumps(identity).encode())
     sync_directory(directory)
@@ -1457,21 +1462,27 @@ def start_runtime_watch(directory, config, scope, prepared):
                              env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LC_ALL': 'C', 'PYTHONDONTWRITEBYTECODE': '1'},
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
-    reap_runtime_watch(child)
-    while time.monotonic() - launched < 25:
-        if child.poll() is not None:
-            raise RuntimeError('runtime watch exited before fire')
-        try:
-            raw = recovery_panic_control.read_private(directory / 'runtime-watch-ready.json', 0o600, 4096)
-        except FileNotFoundError:
-            time.sleep(0.1)
-            continue
-        deadline = runtime_watch_ready(json.loads(raw), identity, child.pid, launched, time.monotonic())
-        watch = {'child': child, 'deadline_monotonic': deadline}
-        if not runtime_watch_alive(watch):
-            raise RuntimeError('runtime watch budget exhausted')
-        return watch
-    raise TimeoutError('runtime watch readiness timed out')
+    try:
+        reap_runtime_watch(child)
+        while time.monotonic() - launched < 25:
+            if child.poll() is not None:
+                raise RuntimeError('runtime watch exited before fire')
+            try:
+                raw = recovery_panic_control.read_private(directory / 'runtime-watch-ready.json', 0o600, 4096)
+            except FileNotFoundError:
+                time.sleep(0.1)
+                continue
+            deadline = runtime_watch_ready(json.loads(raw), identity, child.pid, launched, time.monotonic())
+            watch = {'child': child, 'deadline_monotonic': deadline}
+            if not runtime_watch_alive(watch):
+                raise RuntimeError('runtime watch budget exhausted')
+            return watch
+        raise TimeoutError('runtime watch readiness timed out')
+    except BaseException:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+        raise
 
 
 def runtime_watch(directory):
@@ -1500,7 +1511,7 @@ def runtime_watch(directory):
             raise ValueError('runtime watch check changed')
     try:
         config = load_config(directory)
-        if Path(__file__).resolve() != directory / 'recovery.py' or str(Path(sys.executable).resolve()) != config['python']:
+        if not runtime_watch_executable_matches(directory, config['python']):
             raise ValueError('runtime watch executable changed')
         saved = read_followup_debug(directory, config)
         if boot_uuid() != saved['scope']['debug_boot_uuid']:
