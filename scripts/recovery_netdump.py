@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import signal
 import socket
 import subprocess
@@ -19,12 +20,15 @@ import time
 import kdp_udp_preflight as udp
 import recovery_reports as reports
 import recovery_sources as sources
+import recovery_netdump_capture as capture
 from recovery_netdump_settings import NetdumpSettings
 
 SCOPE = 'netdump_discovery_only'
 PRIME_TRANSPORT = 'userspace_udp_only'
 UUID = re.compile(r'[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}')
 NETWORK_KEYS = ('netdump_sha256', 'udp_sha256', 'codec_sha256', 'reports_sha256')
+SYNTHETIC_SCOPE = 'netdump_synthetic_capture_only'
+SYNTHETIC_JOB = 'Netdump synthetic capture (intel)'
 
 
 def require(condition):
@@ -490,7 +494,89 @@ def validate_waiting(value, offer, b1_plan, expected_probe=None):
     return json.loads(canonical(value))
 
 
-def check_attributes(ctx, role, prime=False, boot_uuid=None):
+def producer_record(value, ctx):
+    exact(value, ('job_id', 'run_id', 'attempt', 'head_sha', 'name', 'status', 'conclusion'))
+    context_binding(ctx)
+    require(type(value['job_id']) is int and value['job_id'] > 0 and type(value['run_id']) is int and value['run_id'] == int(ctx['run']) and
+            type(value['attempt']) is int and value['attempt'] == int(ctx['attempt']) and value['head_sha'] == ctx['sha'] and
+            value['name'] == SYNTHETIC_JOB and value['status'] == 'completed' and value['conclusion'] == 'success')
+    return dict(value)
+
+
+def producer_terminal(listing, ctx):
+    context_binding(ctx)
+    require(type(listing) is dict and type(listing.get('jobs')) is list and type(listing.get('total_count')) is int and
+            listing['total_count'] == len(listing['jobs']) <= 100 and all(type(job) is dict for job in listing['jobs']))
+    matches = [job for job in listing['jobs'] if job.get('name') == SYNTHETIC_JOB]
+    require(len(matches) <= 1)
+    if not matches: return None
+    job = matches[0]
+    require(type(job.get('id')) is int and job['id'] > 0 and type(job.get('run_id')) is int and job['run_id'] == int(ctx['run']) and
+            job.get('head_sha') == ctx['sha'])
+    if 'run_attempt' in job: require(type(job['run_attempt']) is int and job['run_attempt'] == int(ctx['attempt']))
+    if job.get('status') != 'completed':
+        require(job.get('status') in ('queued', 'in_progress', 'waiting', 'pending', 'requested') and job.get('conclusion') is None)
+        return None
+    return producer_record({'job_id': job['id'], 'run_id': job['run_id'], 'attempt': int(ctx['attempt']),
+                            **{key: job.get(key) for key in ('head_sha', 'name', 'status', 'conclusion')}}, ctx)
+
+
+def synthetic_fixture(offer, b1_plan):
+    require(offer.purpose == 'discovery' and validate_host_fact(b1_plan, offer)['phase'] == 'plan')
+    run, attempt, sha = offer.binding.split('/')
+    ctx = {'run': run, 'attempt': attempt, 'sha': sha, 'role': 'intel', 'port_mode': 'kernel-source'}
+    _, body = udp.wire_fixture(ctx, bytes.fromhex(b1_plan['nonce'][:32]), bytes.fromhex(offer.nonce))
+    return b1_plan['nonce'][:16], body
+
+
+def synthetic_body(stream, offer, b1_plan):
+    require(type(stream) is capture.FragmentStream and stream.termination == 'idle' and stream.eof_accepted is False)
+    _, expected = synthetic_fixture(offer, b1_plan)
+    require(stream.data == expected and stream.forensic == b'')
+    return stream.data
+
+
+def synthetic_result(offer, b1_plan, receiver_id, stream, producer, envelope):
+    body = synthetic_body(stream, offer, b1_plan)
+    value = {'protocol': 'netdump-synthetic-capture-v1', 'scope': SYNTHETIC_SCOPE, 'kind': 'synthetic', 'phase': 'captured',
+             'offer': offer.record(), 'b1_plan': b1_plan, 'b1_plan_sha256': digest(b1_plan), 'receiver_check_id': receiver_id,
+             'fixture_sha256': hashlib.sha256(body).hexdigest(), 'byte_count': len(body), 'eof_accepted': False,
+             'termination': 'idle', 'producer': producer, 'envelope': envelope}
+    run, attempt, sha = offer.binding.split('/')
+    ctx = {'run': run, 'attempt': attempt, 'sha': sha, 'role': 'receiver', 'port_mode': 'kernel-source'}
+    return validate_synthetic_capture(value, ctx, offer.cert_fingerprint, offer.core_identity, dict(offer.network_sources))
+
+
+def validate_synthetic_capture(value, ctx, fingerprint, core_identity, network_sources):
+    exact(value, ('protocol', 'scope', 'kind', 'phase', 'offer', 'b1_plan', 'b1_plan_sha256', 'receiver_check_id',
+                  'fixture_sha256', 'byte_count', 'eof_accepted', 'termination', 'producer', 'envelope'))
+    require(value['protocol'] == 'netdump-synthetic-capture-v1' and value['scope'] == SYNTHETIC_SCOPE and
+            value['kind'] == 'synthetic' and value['phase'] == 'captured')
+    offer = match_offer(value['offer'], ctx, fingerprint, core_identity, network_sources)
+    b1_plan = validate_host_fact(value['b1_plan'], offer)
+    _, fixture = synthetic_fixture(offer, b1_plan)
+    require(value['b1_plan_sha256'] == digest(b1_plan) and type(value['receiver_check_id']) is int and value['receiver_check_id'] > 0 and
+            type(value['byte_count']) is int and value['byte_count'] == len(fixture) and
+            value['fixture_sha256'] == hashlib.sha256(fixture).hexdigest() and value['eof_accepted'] is False and value['termination'] == 'idle')
+    producer_record(value['producer'], ctx)
+    udp.wire_envelope(value['envelope'], fingerprint)
+    return json.loads(canonical(value))
+
+
+def console_fact(value):
+    result = {key: value[key] for key in ('protocol', 'scope', 'phase', 'kind', 'status', 'cleanup', 'byte_count', 'fixture_sha256')
+              if key in value and type(value[key]) in (str, int, bool)}
+    if type(value.get('scope')) is dict: result['scope_sha256'] = digest(value['scope'])
+    if type(value.get('envelope')) is dict:
+        for key in ('cipher_sha256', 'cert_fingerprint'):
+            if hexadecimal(value['envelope'].get(key)): result[key] = value['envelope'][key]
+    return result
+
+
+def check_attributes(ctx, role, prime=False, boot_uuid=None, synthetic_digest=None):
+    if synthetic_digest is not None:
+        require(role == 'receiver' and not prime and boot_uuid is None and hexadecimal(synthetic_digest))
+        return 'Netdump synthetic capture ' + ctx['run'], 'netdump-synthetic/' + context_binding(ctx) + '/' + synthetic_digest
     name = 'Netdump ' + ('prime ' if prime else '') + ('plan' if role == 'intel' else 'receiver') + ' ' + ctx['run']
     external = ('netdump-prime/' if prime else 'netdump/') + role + '/' + context_binding(ctx)
     if prime and role == 'intel':
@@ -499,13 +585,13 @@ def check_attributes(ctx, role, prime=False, boot_uuid=None):
     return name, external
 
 
-def check_identity(check, ctx, role, *, prime=False, boot_uuid=None):
+def check_identity(check, ctx, role, *, prime=False, boot_uuid=None, synthetic_digest=None):
     if prime and role == 'intel' and boot_uuid is None:
         external = check.get('external_id')
         if type(external) is not str: return False
         boot_uuid = external.rsplit('/', 1)[-1]
         if not UUID.fullmatch(boot_uuid): return False
-    name, external = check_attributes(ctx, role, prime, boot_uuid)
+    name, external = check_attributes(ctx, role, prime, boot_uuid, synthetic_digest)
     number = check.get('id')
     return (type(number) is int and number > 0 and check.get('name') == name
             and check.get('head_sha') == ctx['sha'] and check.get('external_id') == external
@@ -598,31 +684,31 @@ def operation_deadline(hard_deadline, now):
 
 
 class CheckOwner:
-    def __init__(self, ctx, token, role, hard_deadline, *, prime=False, boot_uuid=None):
+    def __init__(self, ctx, token, role, hard_deadline, *, prime=False, boot_uuid=None, synthetic_digest=None):
         self.ctx, self.token, self.role, self.hard_deadline = ctx, token, role, hard_deadline
         self.check_id, self.attempted, self.latest = None, False, {'scope': SCOPE}
-        self.prime, self.boot_uuid = prime, boot_uuid
+        self.prime, self.boot_uuid, self.synthetic_digest = prime, boot_uuid, synthetic_digest
 
     def publish(self, value, deadline, *, complete=False):
         self.latest = value
         summary = canonical(value)
         require(len(summary) <= 16000)
-        payload = {'status': 'completed' if complete or self.prime else 'in_progress',
+        payload = {'status': 'completed' if complete or self.prime or self.synthetic_digest is not None else 'in_progress',
                    'output': {'title': 'Netdump discovery only', 'summary': summary, 'text': ''}}
-        if self.prime: payload['conclusion'] = 'neutral'
+        if self.prime or self.synthetic_digest is not None: payload['conclusion'] = 'neutral'
         elif complete: payload['conclusion'] = 'success' if value.get('phase') in ('plan', 'plan_ack') else 'neutral'
         if self.check_id is None:
             require(not self.attempted)
-            name, external = check_attributes(self.ctx, self.role, self.prime, self.boot_uuid)
+            name, external = check_attributes(self.ctx, self.role, self.prime, self.boot_uuid, self.synthetic_digest)
             payload.update(name=name, head_sha=self.ctx['sha'], external_id=external)
             self.attempted = True
             created = call(deadline, 'POST', '/check-runs', self.token, payload)
-            require(check_identity(created, self.ctx, self.role, prime=self.prime, boot_uuid=self.boot_uuid))
+            require(check_identity(created, self.ctx, self.role, prime=self.prime, boot_uuid=self.boot_uuid, synthetic_digest=self.synthetic_digest))
             self.check_id = created['id']
         else:
             call(deadline, 'PATCH', '/check-runs/' + str(self.check_id), self.token, payload)
         saved = call(deadline, 'GET', '/check-runs/' + str(self.check_id), self.token)
-        require(check_identity(saved, self.ctx, self.role, prime=self.prime, boot_uuid=self.boot_uuid) and saved['id'] == self.check_id and
+        require(check_identity(saved, self.ctx, self.role, prime=self.prime, boot_uuid=self.boot_uuid, synthetic_digest=self.synthetic_digest) and saved['id'] == self.check_id and
                 saved.get('status') == payload['status'] and saved.get('conclusion') == payload.get('conclusion') and
                 saved.get('output', {}).get('summary') == summary and saved.get('output', {}).get('title') == payload['output']['title'] and
                 saved.get('output', {}).get('text') in (None, ''))
@@ -720,43 +806,48 @@ def save_private(plan):
     write_file(directory / 'discovery-plan.json', plan.record(), 0o600)
 
 
+def discover_open(ctx, token, cert, nonce64, main_path, purpose, baseline, hard_deadline, deadline):
+    fingerprint = reports.cert_fingerprint(cert)
+    core, network = source_identity(main_path)
+    require(peer(ctx, token, 'intel', deadline) is None)
+    receiver_id, offered = wait_peer(ctx, token, 'receiver', ('offer',), deadline)
+    exact(offered, ('scope', 'phase', 'offer', 'offer_digest'))
+    require(offered['scope'] == SCOPE and offered['phase'] == 'offer')
+    offer = match_offer(offered['offer'], ctx, fingerprint, core, dict(network), purpose)
+    require(offered['offer_digest'] == offer.digest())
+    sock, endpoint = open_socket(offer.endpoint.port)
+    owner = CheckOwner(ctx, token, 'intel', hard_deadline)
+    try:
+        require(sock.getsockname()[1] == offer.endpoint.port)
+        address = (offer.endpoint.ip, offer.endpoint.port)
+        sock.connect(address)
+        source = private_ipv4(sock.getsockname()[0])
+        gateway, interface = route(offer.endpoint)
+        settings = NetdumpSettings(offer.endpoint.ip, gateway, offer.endpoint.port, nonce64[:16])
+        plan = DiscoveryPlan(offer, nonce64, endpoint, source, interface, settings, None, baseline)
+        public = plan.public_fact()
+        owner.publish(public, deadline)
+        stats = hello(ConnectedPeer(sock, address), offer.endpoint, nonce64, offer.nonce, deadline)
+        plan = DiscoveryPlan(offer, nonce64, endpoint, source, interface, settings, stats, baseline)
+        public = plan.public_fact()
+        owner.publish(public, deadline)
+        _, acknowledged = wait_peer(ctx, token, 'receiver', ('plan_ack',), deadline, receiver_id)
+        validate_ack(acknowledged, offer, public)
+        owner.publish(public, deadline, complete=True)
+        return plan, sock
+    except Exception:
+        sock.close()
+        raise DiscoveryFailure(owner.cleanup()) from None
+
+
 def discover(ctx, token, cert, nonce64, *, main_path, purpose='discovery', baseline=None):
     require(context_binding(ctx) and ctx['role'] == 'intel' and hexadecimal(nonce64))
     require((purpose == 'prime' and type(baseline) is BootBaseline) or (purpose == 'discovery' and baseline is None))
     with bounded_session() as hard_deadline:
         deadline = operation_deadline(hard_deadline, time.monotonic())
-        fingerprint = reports.cert_fingerprint(cert)
-        core, network = source_identity(main_path)
-        require(peer(ctx, token, 'intel', deadline) is None)
-        receiver_id, offered = wait_peer(ctx, token, 'receiver', ('offer',), deadline)
-        exact(offered, ('scope', 'phase', 'offer', 'offer_digest'))
-        require(offered['scope'] == SCOPE and offered['phase'] == 'offer')
-        offer = match_offer(offered['offer'], ctx, fingerprint, core, dict(network), purpose)
-        require(offered['offer_digest'] == offer.digest())
-        sock, endpoint = open_socket(offer.endpoint.port)
-        owner = CheckOwner(ctx, token, 'intel', hard_deadline)
-        try:
-            require(sock.getsockname()[1] == offer.endpoint.port)
-            address = (offer.endpoint.ip, offer.endpoint.port)
-            sock.connect(address)
-            source = private_ipv4(sock.getsockname()[0])
-            gateway, interface = route(offer.endpoint)
-            settings = NetdumpSettings(offer.endpoint.ip, gateway, offer.endpoint.port, nonce64[:16])
-            plan = DiscoveryPlan(offer, nonce64, endpoint, source, interface, settings, None, baseline)
-            public = plan.public_fact()
-            owner.publish(public, deadline)
-            stats = hello(ConnectedPeer(sock, address), offer.endpoint, nonce64, offer.nonce, deadline)
-            plan = DiscoveryPlan(offer, nonce64, endpoint, source, interface, settings, stats, baseline)
-            public = plan.public_fact()
-            owner.publish(public, deadline)
-            _, acknowledged = wait_peer(ctx, token, 'receiver', ('plan_ack',), deadline, receiver_id)
-            validate_ack(acknowledged, offer, public)
-            owner.publish(public, deadline, complete=True)
-            return plan
-        except Exception:
-            raise DiscoveryFailure(owner.cleanup()) from None
-        finally:
-            sock.close()
+        plan, sock = discover_open(ctx, token, cert, nonce64, main_path, purpose, baseline, hard_deadline, deadline)
+        sock.close()
+        return plan
 
 
 def serve_b1(ctx, token, fingerprint, core, network, sock, endpoint, deadline, hard_deadline, purpose):
@@ -876,12 +967,109 @@ def serve_prime(ctx, token, cert, *, main_path):
             sock.close()
 
 
+def send_synthetic(sock, peer_address, filename, body, deadline):
+    require(type(body) is bytes and body.startswith(udp.SYNTHETIC_PREFIX) and 0 < len(body) <= 12288)
+    udp._wire_packet(sock, peer_address, udp.wire.encode_wrq(filename), 0, deadline)
+    for block, offset in enumerate(range(0, len(body), 512), 1):
+        packet = udp.wire.encode_paniclog_data(block, body[offset:offset + 512], filename, b'Y' * (len(filename) + 1))
+        udp._wire_packet(sock, peer_address, packet, block, deadline)
+
+
+def receive_fragment(sock, peer_address, filename, prefix, deadline, *, idle_seconds=15):
+    require(type(idle_seconds) in (int, float) and 0 < idle_seconds <= 15)
+    stream = capture.FragmentStream(filename, required_prefix=prefix)
+    idle_at = time.monotonic() + idle_seconds
+    packets, wire_bytes = 0, 0
+    while stream.termination is None:
+        now = time.monotonic()
+        if now >= deadline:
+            stream.finish('deadline')
+            break
+        if now >= idle_at:
+            stream.finish('idle')
+            break
+        if not select.select([sock], [], [], min(.25, deadline - now, idle_at - now))[0]: continue
+        packet, address = sock.recvfrom(65536)
+        packets += 1
+        wire_bytes += len(packet)
+        if packets > 4096 or wire_bytes > 2 * 1024 * 1024:
+            stream.finish('limit')
+            break
+        if address != peer_address or packet.startswith(b'KDP1'): continue
+        ack = stream.receive(packet)
+        if ack is not None:
+            sock.sendto(ack, peer_address)
+            idle_at = time.monotonic() + idle_seconds
+    return stream
+
+
+def wait_producer(ctx, token, deadline):
+    path = '/actions/runs/' + ctx['run'] + '/attempts/' + ctx['attempt'] + '/jobs?per_page=100'
+    while time.monotonic() < deadline:
+        fact = producer_terminal(call(deadline, 'GET', path, token), ctx)
+        if fact is not None: return fact
+        time.sleep(1)
+    raise TimeoutError('discovery_deadline')
+
+
+def synthetic_sender(ctx, token, cert, *, main_path):
+    require(context_binding(ctx) and ctx['role'] == 'intel')
+    with bounded_session() as hard:
+        deadline = operation_deadline(hard, time.monotonic())
+        plan, sock = discover_open(ctx, token, cert, secrets.token_hex(32), main_path, 'discovery', None, hard, deadline)
+        try:
+            filename, body = synthetic_fixture(plan.offer, plan.public_fact())
+            address = (plan.offer.endpoint.ip, plan.offer.endpoint.port)
+            send_synthetic(ConnectedPeer(sock, address), address, filename, body, deadline)
+            return {'protocol': 'netdump-synthetic-capture-v1', 'scope': SYNTHETIC_SCOPE, 'kind': 'synthetic',
+                    'phase': 'producer_returned', 'binding': context_binding(ctx), 'b1_plan_sha256': digest(plan.public_fact()),
+                    'fixture_sha256': hashlib.sha256(body).hexdigest(), 'byte_count': len(body), 'eof_sent': False}
+        finally:
+            sock.close()
+
+
+def serve_synthetic_capture(ctx, token, cert, *, main_path):
+    require(context_binding(ctx) and ctx['role'] == 'receiver')
+    with bounded_session(300) as hard:
+        deadline = operation_deadline(hard, time.monotonic())
+        fingerprint = reports.cert_fingerprint(cert)
+        core, network = source_identity(main_path)
+        require(peer(ctx, token, 'receiver', deadline) is None)
+        sock, endpoint = open_socket(0)
+        owner = None
+        try:
+            offer, plan, _ = serve_b1(ctx, token, fingerprint, core, network, sock, endpoint, deadline, hard, 'discovery')
+            owner = CheckOwner(ctx, token, 'receiver', hard, synthetic_digest=digest(plan))
+            waiting = {'protocol': 'netdump-synthetic-capture-v1', 'scope': SYNTHETIC_SCOPE, 'kind': 'synthetic',
+                       'phase': 'waiting_producer', 'offer': offer.record(), 'b1_plan_sha256': digest(plan)}
+            owner.publish(waiting, deadline)
+            filename, expected = synthetic_fixture(offer, plan)
+            peer_endpoint = Endpoint.from_record(plan['intel_public_endpoint'])
+            stream = receive_fragment(sock, (peer_endpoint.ip, peer_endpoint.port), filename, udp.SYNTHETIC_PREFIX, deadline)
+            body = synthetic_body(stream, offer, plan)
+            producer = wait_producer(ctx, token, deadline)
+            require(deadline - time.monotonic() >= 55)
+            metadata = {'kind': 'synthetic', 'scope': SYNTHETIC_SCOPE, 'offer': offer.record(), 'b1_plan': plan,
+                        'b1_plan_sha256': digest(plan), 'receiver_check_id': owner.check_id, 'producer': producer,
+                        'fixture_sha256': hashlib.sha256(expected).hexdigest(), **stream.public_fact()}
+            envelope = reports.encrypt_bundle(cert, metadata, body)
+            value = synthetic_result(offer, plan, owner.check_id, stream, producer, envelope)
+            owner.publish(value, deadline, complete=True)
+            return value
+        except Exception as error:
+            if owner is None and isinstance(error, DiscoveryFailure): raise
+            raise DiscoveryFailure(owner.cleanup() if owner is not None else 'not_created') from None
+        finally:
+            sock.close()
+
+
 def main():
     token = os.environ.pop('GITHUB_TOKEN', '')
     cert = os.environ.pop('KDP_REPORT_CERT', '').encode()
-    result, code = {'scope': SCOPE, 'status': 'failed', 'cleanup': 'not_created'}, 1
+    scope = SYNTHETIC_SCOPE if len(sys.argv) == 2 and sys.argv[1] in ('synthetic-sender', 'synthetic-receiver') else SCOPE
+    result, code = {'scope': scope, 'status': 'failed', 'cleanup': 'not_created'}, 1
     try:
-        require(len(sys.argv) == 2 and sys.argv[1] in ('discover', 'receiver', 'prime-receiver') and token and cert)
+        require(len(sys.argv) == 2 and sys.argv[1] in ('discover', 'receiver', 'prime-receiver', 'synthetic-sender', 'synthetic-receiver') and token and cert)
         ctx = udp.validate_context()
         path = Path(__file__).with_name('reboot-recovery.py')
         if sys.argv[1] == 'discover':
@@ -890,8 +1078,12 @@ def main():
             result = plan.public_fact()
         elif sys.argv[1] == 'receiver':
             result = serve_discovery(ctx, token, cert, main_path=path)
-        else:
+        elif sys.argv[1] == 'prime-receiver':
             result = serve_prime(ctx, token, cert, main_path=path)
+        elif sys.argv[1] == 'synthetic-sender':
+            result = synthetic_sender(ctx, token, cert, main_path=path)
+        else:
+            result = serve_synthetic_capture(ctx, token, cert, main_path=path)
         code = 0
     except DiscoveryFailure as error:
         result['cleanup'] = error.cleanup
@@ -901,7 +1093,7 @@ def main():
     output.mkdir(exist_ok=True)
     require(not output.is_symlink())
     write_file(output / 'netdump-discovery.json', result, 0o644)
-    print(canonical(result), flush=True)
+    print(canonical(console_fact(result)), flush=True)
     return code
 
 

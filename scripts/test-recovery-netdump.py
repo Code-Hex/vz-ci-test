@@ -1,10 +1,13 @@
 import copy
+import base64
 import dataclasses
+import hashlib
 import json
 from pathlib import Path
 import socket
 import tempfile
 import threading
+import time
 import unittest
 
 import recovery_netdump as n
@@ -12,6 +15,83 @@ from recovery_netdump_settings import NetdumpSettings
 
 
 class Discovery(unittest.TestCase):
+    def jobs(self):
+        return {'total_count': 1, 'jobs': [{'id': 25, 'run_id': 123, 'head_sha': 'a' * 40,
+                'name': 'Netdump synthetic capture (intel)', 'status': 'completed', 'conclusion': 'success',
+                'steps': [{'private': 'never-public'}]}]}
+
+    def synthetic_stream(self, *, eof=False):
+        plan = self.plan()
+        filename, body = n.synthetic_fixture(plan.offer, plan.public_fact())
+        stream = n.capture.FragmentStream(filename, required_prefix=b'VZ_SYNTHETIC_NON_KERNEL\n')
+        self.assertEqual(n.udp.wire.decode_ack(stream.receive(n.udp.wire.encode_wrq(filename))), 0)
+        block = 1
+        for start in range(0, len(body), 512):
+            packet = n.udp.wire.encode_paniclog_data(block, body[start:start + 512], filename, b'Y' * (len(filename) + 1))
+            self.assertEqual(n.udp.wire.decode_ack(stream.receive(packet)), block)
+            block += 1
+        if eof: stream.receive(n.udp.wire.encode_eof(block))
+        stream.finish('idle')
+        return stream
+
+    def test_provider_job_terminal_fact_is_attempt_scoped_unique_and_not_script_exit(self):
+        job = n.producer_terminal(self.jobs(), self.context('receiver'))
+        self.assertEqual(job, {'job_id': 25, 'run_id': 123, 'attempt': 1, 'head_sha': 'a' * 40,
+                              'name': 'Netdump synthetic capture (intel)', 'status': 'completed', 'conclusion': 'success'})
+        self.assertNotIn('never-public', str(job))
+        pending = self.jobs()
+        pending['jobs'][0].update(status='in_progress', conclusion=None)
+        self.assertIsNone(n.producer_terminal(pending, self.context('receiver')))
+        for key, bad in (('id', True), ('run_id', 124), ('head_sha', '0' * 40), ('conclusion', 'failure'), ('run_attempt', 2)):
+            listing = self.jobs()
+            listing['jobs'][0][key] = bad
+            with self.subTest(key=key), self.assertRaises(ValueError): n.producer_terminal(listing, self.context('receiver'))
+        duplicate = self.jobs()
+        duplicate['jobs'] *= 2
+        duplicate['total_count'] = 2
+        with self.assertRaises(ValueError): n.producer_terminal(duplicate, self.context('receiver'))
+        with self.assertRaises(ValueError): n.producer_terminal({**self.jobs(), 'total_count': 2}, self.context('receiver'))
+
+    def test_synthetic_capture_requires_exact_non_kernel_fixture_no_eof_and_provider_success(self):
+        plan, stream = self.plan(), self.synthetic_stream()
+        filename, body = n.synthetic_fixture(plan.offer, plan.public_fact())
+        self.assertEqual(filename, 'f' * 16)
+        self.assertEqual(len(body), 1306)
+        self.assertEqual(hashlib.sha256(body).hexdigest(), 'bcdb1e0edc763deac2619fd757dbb405efe17d8df027e6fec72e7fa29938ddea')
+        cipher = b'synthetic envelope shape only'
+        envelope = {'ciphertext': base64.b64encode(cipher).decode(), 'cipher_sha256': hashlib.sha256(cipher).hexdigest(), 'cert_fingerprint': 'c' * 64}
+        producer = n.producer_terminal(self.jobs(), self.context('receiver'))
+        value = n.synthetic_result(plan.offer, plan.public_fact(), 26, stream, producer, envelope)
+        self.assertEqual(n.validate_synthetic_capture(value, self.context('receiver'), 'c' * 64, 'd' * 64, dict(plan.offer.network_sources)), value)
+        self.assertEqual((value['kind'], value['scope'], value['eof_accepted']), ('synthetic', 'netdump_synthetic_capture_only', False))
+        self.assertNotIn('192.168.64', n.canonical(value))
+        self.assertNotIn('ciphertext', n.canonical(n.console_fact(value)))
+        for key, bad in (('producer', None), ('kind', 'kernel_netdump_fragment'), ('fixture_sha256', '0' * 64), ('byte_count', True)):
+            with self.assertRaises(ValueError): n.validate_synthetic_capture({**value, key: bad}, self.context('receiver'), 'c' * 64, 'd' * 64, dict(plan.offer.network_sources))
+        with self.assertRaises(ValueError): n.synthetic_result(plan.offer, plan.public_fact(), 26, self.synthetic_stream(eof=True), producer, envelope)
+    def test_synthetic_public_boundary_rejects_foreign_scope_source_recipient_and_raw_fields(self):
+        plan, stream = self.plan(), self.synthetic_stream()
+        cipher = b'shape only'
+        envelope = {'ciphertext': base64.b64encode(cipher).decode(), 'cipher_sha256': hashlib.sha256(cipher).hexdigest(), 'cert_fingerprint': 'c' * 64}
+        value = n.synthetic_result(plan.offer, plan.public_fact(), 26, stream,
+                                   n.producer_terminal(self.jobs(), self.context('receiver')), envelope)
+        for path, bad in ((('scope',), 'netdump_capture'), (('raw',), 'private'),
+                          (('receiver_check_id',), True), (('offer', 'core_identity'), '0' * 64),
+                          (('offer', 'cert_fingerprint'), '0' * 64), (('b1_plan', 'nonce'), '0' * 64),
+                          (('producer', 'attempt'), True), (('envelope', 'cert_fingerprint'), '0' * 64)):
+            changed = copy.deepcopy(value)
+            target = changed
+            for key in path[:-1]: target = target[key]
+            target[path[-1]] = bad
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                n.validate_synthetic_capture(changed, self.context('receiver'), 'c' * 64, 'd' * 64, dict(plan.offer.network_sources))
+        check = {'id': 26, 'name': 'Netdump synthetic capture 123', 'head_sha': 'a' * 40,
+                 'external_id': 'netdump-synthetic/' + plan.offer.binding + '/' + n.digest(plan.public_fact()),
+                 'app': {'id': 15368, 'slug': 'github-actions'},
+                 'details_url': 'https://github.com/Code-Hex/vz-ci-test/runs/26'}
+        self.assertTrue(n.check_identity(check, self.context('receiver'), 'receiver', synthetic_digest=n.digest(plan.public_fact())))
+        self.assertFalse(n.check_identity({**check, 'head_sha': '0' * 40}, self.context('receiver'), 'receiver', synthetic_digest=n.digest(plan.public_fact())))
+
     def test_waiting_mapping_rejects_a_primary_change_even_if_it_returns(self):
         expected = n.Endpoint('8.8.8.8', 40000)
         primary = {'server_ip': '1.1.1.1', 'state': 'observed', 'ip': expected.ip, 'port': expected.port}
@@ -291,6 +371,40 @@ class Discovery(unittest.TestCase):
         self.assertEqual(n.check_payload(check, ctx, 'receiver'), value)
         for field, bad in (('status', 'in_progress'), ('conclusion', 'failure'), ('app', None)):
             with self.assertRaises(ValueError): n.check_payload({**check, field: bad}, ctx, 'receiver')
+
+    def test_no_eof_sender_exits_before_receiver_finishes_real_udp(self):
+        plan = self.plan()
+        filename, body = n.synthetic_fixture(plan.offer, plan.public_fact())
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+            receiver.bind(('127.0.0.1', 0))
+            sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sender.bind(('127.0.0.1', 0))
+            peer = sender.getsockname()
+            sent = []
+            def produce():
+                try:
+                    n.send_synthetic(sender, receiver.getsockname(), filename, body, time.monotonic() + 3)
+                    sent.append('returned')
+                finally:
+                    sender.close()
+            thread = threading.Thread(target=produce)
+            thread.start()
+            stream = n.receive_fragment(receiver, peer, filename, b'VZ_SYNTHETIC_NON_KERNEL\n',
+                                        time.monotonic() + 3, idle_seconds=.15)
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(sent, ['returned'])
+            self.assertEqual(stream.termination, 'idle')
+            self.assertFalse(stream.eof_accepted)
+            self.assertIsNone(stream.pending_eof_ack)
+            self.assertEqual(n.synthetic_body(stream, plan.offer, plan.public_fact()), body)
+
+    def test_synthetic_check_has_separate_completed_neutral_identity(self):
+        ctx = self.context('receiver')
+        name, external = n.check_attributes(ctx, 'receiver', synthetic_digest='b' * 64)
+        self.assertEqual(name, 'Netdump synthetic capture 123')
+        self.assertEqual(external, 'netdump-synthetic/123/1/' + 'a' * 40 + '/' + 'b' * 64)
+        with self.assertRaises(ValueError): n.check_attributes(ctx, 'intel', synthetic_digest='b' * 64)
 
     def test_connected_adapter_runs_existing_hello_ack_on_real_udp(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as a, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as b:
