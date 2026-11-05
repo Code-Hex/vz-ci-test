@@ -214,14 +214,14 @@ def _sync_directory(path):
 def capture_timeout(target, directory, *, sync=_sync_directory):
     directory = Path(directory)
     budget = 65536
-    ps_status = sample_status = 'unavailable'
+    ps_status = spindump_status = 'unavailable'
     if target.poll() is None:
-        ps_status, budget = _timeout_command(['/bin/ps', '-p', str(target.pid), '-o', 'pid=,state=,wchan=,comm='],
+        ps_status, budget = _timeout_command(['/bin/ps', '-p', str(target.pid), '-o', 'pid=,state=,wchan=,comm=,etime=,time=,pcpu='],
                                              directory, 'ps', budget, 2)
     if target.poll() is None:
-        sample_status, budget = _timeout_command(['/usr/bin/sample', str(target.pid), '1', '-file', '/dev/stdout'],
-                                                 directory, 'sample', budget, 3)
-    once_record(directory, 'timeout-diagnostic.json', {'ps_status': ps_status, 'sample_status': sample_status,
+        spindump_status, budget = _timeout_command(['/usr/sbin/spindump', str(target.pid), '1', '10',
+            '-onlyTarget', '-noSymbolicate', '-noBinary', '-noFile'], directory, 'spindump', budget, 3)
+    once_record(directory, 'timeout-diagnostic.json', {'ps_status': ps_status, 'profiler': 'spindump', 'spindump_status': spindump_status,
                                                        'bytes_captured': 65536 - budget}, sync)
 
 

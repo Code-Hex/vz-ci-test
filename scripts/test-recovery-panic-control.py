@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import recovery_panic_control as control
 
@@ -106,18 +107,31 @@ class PanicControl(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             callback_pids = []
+            calls = []
+            actual_command = control._timeout_command
+            def benign_command(argv, directory, label, budget, timeout):
+                calls.append((argv, label, budget, timeout))
+                return actual_command([sys.executable, '-c', 'import sys; sys.stdout.write("x" * 40000)'],
+                                      directory, label, budget, timeout)
             def capture(child):
                 callback_pids.append(child.pid)
                 control.capture_timeout(child, root)
-            with self.assertRaises(TimeoutError):
+                self.assertIsNone(child.poll())
+            with patch.object(control, '_timeout_command', benign_command), self.assertRaises(TimeoutError):
                 preflight.command([sys.executable, '-c', 'import time; time.sleep(10)'], root, 'target',
                                   timeout=0.05, env=control.CHILD_ENV, on_timeout=capture)
             self.assertEqual(len(callback_pids), 1)
             diagnostic = __import__('json').loads((root / 'timeout-diagnostic.json').read_text())
             self.assertIn(diagnostic['ps_status'], ('ok', 'failed', 'timeout', 'limit', 'unavailable'))
-            self.assertIn(diagnostic['sample_status'], ('ok', 'failed', 'timeout', 'limit', 'unavailable'))
-            paths = [root / ('timeout-' + kind + '.' + channel) for kind in ('ps', 'sample') for channel in ('stdout', 'stderr')]
-            self.assertLessEqual(sum(path.stat().st_size for path in paths if path.exists()), 65536)
+            self.assertEqual(diagnostic['profiler'], 'spindump')
+            self.assertEqual(diagnostic['spindump_status'], 'limit')
+            self.assertEqual(calls[1], (['/usr/sbin/spindump', str(callback_pids[0]), '1', '10', '-onlyTarget',
+                                        '-noSymbolicate', '-noBinary', '-noFile'], 'spindump', 25536, 3))
+            self.assertEqual((calls[0][1], calls[0][2], calls[0][3]), ('ps', 65536, 2))
+            self.assertEqual(calls[0][0], ['/bin/ps', '-p', str(callback_pids[0]), '-o',
+                                          'pid=,state=,wchan=,comm=,etime=,time=,pcpu='])
+            paths = [root / ('timeout-' + kind + '.' + channel) for kind in ('ps', 'spindump') for channel in ('stdout', 'stderr')]
+            self.assertEqual(sum(path.stat().st_size for path in paths if path.exists()), 65536)
             for path in paths:
                 if path.exists(): self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 

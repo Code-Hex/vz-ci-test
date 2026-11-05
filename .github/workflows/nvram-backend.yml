@@ -13,6 +13,12 @@ on:
           - bootplist-propagation
           - panic-source-preflight
           - cf-spawn-control
+          - profiler-preflight
+      report_cert:
+        description: Public recipient certificate for encrypted profiler output
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -67,6 +73,7 @@ jobs:
         env:
           BOOT_CONTROL: ${{ inputs.control }}
           CF_SPAWN_CASE: ${{ matrix.cf_case }}
+          PROFILER_REPORT_CERT: ${{ inputs.report_cert }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/debug"
@@ -75,6 +82,7 @@ jobs:
             bootplist-propagation) control_script=scripts/bootplist-preflight.py ;;
             panic-source-preflight) control_script=scripts/panic-source-preflight.py ;;
             cf-spawn-control) control_script=scripts/cf-spawn-control.py ;;
+            profiler-preflight) control_script=scripts/profiler-preflight.py ;;
             staged-sync|'') control_script=scripts/nvram-staged-sync.py ;;
             *) exit 64 ;;
           esac
@@ -91,6 +99,7 @@ jobs:
             GITHUB_SHA="$GITHUB_SHA" \
             RUNNER_TEMP="$RUNNER_TEMP" \
             CF_SPAWN_CASE="$CF_SPAWN_CASE" \
+            PROFILER_REPORT_CERT="$PROFILER_REPORT_CERT" \
             "$native_python" "$control_script"
       - name: Preserve the direct IOKit results
         if: always()
@@ -103,4 +112,5 @@ jobs:
             ${{ runner.temp }}/debug/bootplist-preflight.json
             ${{ runner.temp }}/debug/panic-source-preflight.json
             ${{ runner.temp }}/debug/cf-spawn-control.json
+            ${{ runner.temp }}/debug/profiler-preflight.json
           if-no-files-found: error
