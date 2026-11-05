@@ -207,12 +207,13 @@ class Recovery(unittest.TestCase):
             config, saved, _b3 = self.followup_fixture()
             current = saved['scope']['debug_boot_uuid']
             config['debug_boot'] = True
+            config['context']['after_debug_boot'] = 'panic-nonce-nvram-off'
             r.private_write(directory / 'token', b'synthetic-token')
             r.private_write(directory / 'ready.json', r.json.dumps({'baseline': config['baseline'], 'nonce': config['nonce'], 'preboot_patch': True}).encode())
             original_write = r.private_write
             events = []
             def write(path, data):
-                if path.name == 'boot-argument-observation.json':
+                if path.name in ('boot-argument-observation.json', 'nvram-paniclog-control.json'):
                     raise OSError('synthetic storage failure')
                 original_write(path, data)
             def finish(*_args, **_kwargs):
@@ -221,10 +222,13 @@ class Recovery(unittest.TestCase):
             def core(_directory, _config, _current, facts, _token):
                 self.assertEqual(facts['boot_argument_profiles']['postboot'], {'status': 'invalid'})
                 self.assertIsNone(facts['boot_argument_profiles']['nondebug_equal'])
+                self.assertEqual(facts['nvram_paniclog_control'], {'status': 'invalid'})
+                self.assertFalse(r.nvram_off_control_proven(facts))
                 events.append('ack')
                 return facts
             with patch.object(r, 'load_config', lambda _: config), patch.object(r, 'boot_uuid', lambda: current), \
                     patch.object(r, 'observe_boot_argument_profile', lambda: {'status': 'unavailable'}), \
+                    patch.object(r.recovery_bootargs.MacPlatform, 'active', lambda _: 'alpha=1 nvram_paniclog=0 debug=0x102000'), \
                     patch.object(r, 'private_write', write), patch.object(r.recovery_bootplist, 'finish', finish), \
                     patch.object(r, 'publish_debug_core', core), patch.object(r, 'followup_start', lambda *_: events.append('followup')):
                 r.collect(directory)
@@ -268,6 +272,83 @@ class Recovery(unittest.TestCase):
                 self.assertTrue(r.runtime_watch_executable_matches(alias, python))
                 self.assertFalse(r.runtime_watch_executable_matches(Path(tmp), python))
                 self.assertFalse(r.runtime_watch_executable_matches(alias, '/unrelated/python'))
+
+    def test_nvram_off_mode_is_bound_and_requires_the_exact_control_token(self):
+        config, saved, _ = self.followup_fixture()
+        ctx = {**config['context'], 'after_debug_boot': 'panic-nonce-nvram-off', 'actions': 'true', 'repo': r.REPO,
+               'ref': 'refs/heads/main', 'event': 'workflow_dispatch', 'runner_environment': 'github-hosted'}
+        self.assertTrue(r.valid_context(ctx, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        self.assertTrue(r.panic_followup(ctx))
+        self.assertEqual(r.expected_debug_mask(ctx), 0x102000)
+        initial = r.recovery_bootargs.boot_argument_profile('alpha=1 beta=2')
+        active = 'alpha=1 beta=2 nvram_paniclog=0 debug=0x102000'
+        control = r.parse_nvram_off_control(active)
+        facts = {**saved['facts'], 'boot_argument_profiles': {'initial': initial,
+                 'postboot': r.recovery_bootargs.boot_argument_profile(active)}, 'nvram_paniclog_control': control}
+        self.assertTrue(r.nvram_off_control_proven(facts))
+        for raw in ('alpha=1 beta=2 debug=0x102000', 'alpha=1 beta=2 -nvram_paniclog=0 debug=0x102000',
+                    'alpha=1 beta=2 nvram_paniclog=0 nvram_paniclog=0 debug=0x102000',
+                    'alpha=1 beta=2 nvram_paniclog=1 debug=0x102000'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                r.parse_nvram_off_control(raw)
+        for changed in ('beta=2 alpha=1 nvram_paniclog=0 debug=0x102000',
+                        'alpha=1 beta=2 extra=1 nvram_paniclog=0 debug=0x102000'):
+            changed_control = r.parse_nvram_off_control(changed)
+            self.assertFalse(r.nvram_off_control_proven({**facts, 'nvram_paniclog_control': changed_control,
+                'boot_argument_profiles': {'initial': initial, 'postboot': changed_control['full_profile']}}))
+        for bad in ({'status': 'unavailable'}, {'status': 'invalid'}, {**control, 'raw': 'private'}):
+            self.assertFalse(r.nvram_off_control_proven({**facts, 'nvram_paniclog_control': bad}))
+
+    def test_nvram_off_observation_is_immutable_and_bound_to_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, _ = self.followup_fixture()
+            config['context']['after_debug_boot'] = 'panic-nonce-nvram-off'
+            current = saved['scope']['debug_boot_uuid']
+            with patch.object(r.recovery_bootargs.MacPlatform, 'active', lambda _: 'alpha=1 nvram_paniclog=0 debug=0x102000'):
+                first = r.postboot_paniclog_control(directory, config, current)
+            self.assertEqual(first['status'], 'observed')
+            with patch.object(r.recovery_bootargs.MacPlatform, 'active', lambda _: self.fail('repeated control read')):
+                self.assertEqual(r.postboot_paniclog_control(directory, config, current), first)
+            config['context']['after_debug_boot'] = 'panic-nonce'
+            self.assertEqual(r.postboot_paniclog_control(directory, config, current), {'status': 'invalid'})
+
+    def test_nvram_off_proof_is_required_by_replay_and_controller(self):
+        config, saved, b3 = self.followup_fixture()
+        config['context']['after_debug_boot'] = 'panic-nonce-nvram-off'
+        initial = r.recovery_bootargs.boot_argument_profile('alpha=1')
+        control = r.parse_nvram_off_control('alpha=1 nvram_paniclog=0 debug=0x102000')
+        facts = {**saved['facts'], 'nvram_paniclog_control': control,
+                 'boot_argument_profiles': {'initial': initial, 'postboot': control['full_profile']}}
+        trigger = {'scope': saved['scope'], 'helper_sha256': 'f' * 64, 'helper_pid': 123, 'tracer_pid': 456, 'ready': True}
+        pending = {'nonce': config['nonce'], 'baseline_boot_uuid': config['baseline']}
+        data = {'debug_boot_facts': facts, 'debug_boot_uuid': saved['scope']['debug_boot_uuid'],
+                'current_boot_uuid': b3, 'panic_trigger': trigger}
+        self.assertTrue(r.debug_lineage_matches(data, pending, config['context']))
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = directory / 'panic-followup-debug.json'
+            target.write_text(r.json.dumps({'scope': saved['scope'], 'facts': facts}))
+            self.assertEqual(r.read_followup_debug(directory, config)['facts'], facts)
+            missing = {k: v for k, v in facts.items() if k != 'nvram_paniclog_control'}
+            target.write_text(r.json.dumps({'scope': saved['scope'], 'facts': missing}))
+            with self.assertRaises(ValueError):
+                r.read_followup_debug(directory, config)
+            self.assertFalse(r.debug_lineage_matches({**data, 'debug_boot_facts': missing}, pending, config['context']))
+
+    def test_nvram_off_missing_proof_prevents_prepare_and_fire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            config, saved, _ = self.followup_fixture()
+            config['context']['after_debug_boot'] = 'panic-nonce-nvram-off'
+            completed = []
+            def forbidden(*_args, **_kwargs):
+                self.fail('unproven NVRAM logging control reached prepare or fire')
+            with patch.object(r.recovery_panic_control, 'prepare', forbidden), patch.object(r.recovery_panic_control, 'fire', forbidden), \
+                    patch.object(r, 'complete_recovery', lambda *_a: completed.append(True)):
+                r.followup_start(directory, config, saved['scope']['debug_boot_uuid'], saved['facts'], 'token')
+            self.assertEqual(completed, [True])
+            self.assertFalse((directory / 'panic-control' / 'intent.json').exists())
 
     def test_debug_source_context_is_explicit_and_bound(self):
         base = {'actions': 'true', 'repo': r.REPO, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',

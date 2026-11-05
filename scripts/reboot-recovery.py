@@ -41,7 +41,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
-              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off") and
               (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
@@ -62,7 +62,11 @@ def panic_mode(ctx):
 
 
 def panic_followup(ctx):
-    return ctx.get("after_debug_boot", "none") == "panic-nonce"
+    return ctx.get("after_debug_boot", "none") in ("panic-nonce", "panic-nonce-nvram-off")
+
+
+def nvram_off_control(ctx):
+    return ctx.get("after_debug_boot") == "panic-nonce-nvram-off"
 
 
 def expected_debug_mask(ctx):
@@ -153,6 +157,8 @@ def sealed_matches(data, pending, ctx):
 def debug_lineage_matches(data, pending, ctx):
     facts = data.get("debug_boot_facts")
     if not debug_boot_proven(facts, ctx["debug_source"], expected_debug_mask(ctx)):
+        return False
+    if nvram_off_control(ctx) and not nvram_off_control_proven(facts):
         return False
     if not panic_followup(ctx):
         return facts.get("current_boot_uuid") == data.get("current_boot_uuid")
@@ -384,6 +390,72 @@ def postboot_argument_profiles(directory, config, current):
     if initial["status"] == profile["status"] == "observed":
         equal = all(initial[key] == profile[key] for key in ("nondebug_token_count", "nondebug_sha256"))
     return {"initial": initial, "postboot": profile, "nondebug_equal": equal}
+
+
+def parse_nvram_off_control(raw):
+    tokens = recovery_bootargs.text(raw).split()
+    candidates = [index for index, token in enumerate(tokens) if token.partition('=')[0].lstrip('-') == 'nvram_paniclog']
+    if len(candidates) != 1 or tokens[candidates[0]] != 'nvram_paniclog=0':
+        raise ValueError('NVRAM logging control not applied exactly')
+    return {'status': 'observed', 'parameter': 'nvram_paniclog=0',
+            'full_profile': recovery_bootargs.boot_argument_profile(raw),
+            'remaining_profile': recovery_bootargs.boot_argument_profile(' '.join(tokens[:candidates[0]] + tokens[candidates[0] + 1:]))}
+
+
+def checked_paniclog_control(value):
+    if value in ({'status': 'unavailable'}, {'status': 'invalid'}, {'status': 'not_requested'}):
+        return dict(value)
+    if (not isinstance(value, dict) or set(value) != {'status', 'parameter', 'full_profile', 'remaining_profile'} or
+            value['status'] != 'observed' or value['parameter'] != 'nvram_paniclog=0'):
+        raise ValueError('NVRAM logging observation invalid')
+    full = checked_boot_argument_profile(value['full_profile'])
+    remaining = checked_boot_argument_profile(value['remaining_profile'])
+    if (full['status'] != 'observed' or remaining['status'] != 'observed' or
+            full['nondebug_token_count'] != remaining['nondebug_token_count'] + 1 or
+            full['debug_mask'] != remaining['debug_mask']):
+        raise ValueError('NVRAM logging profiles inconsistent')
+    return {'status': 'observed', 'parameter': 'nvram_paniclog=0', 'full_profile': full, 'remaining_profile': remaining}
+
+
+def nvram_off_control_proven(facts):
+    try:
+        value = checked_paniclog_control(facts['nvram_paniclog_control'])
+        profiles = facts['boot_argument_profiles']
+        initial = checked_boot_argument_profile(profiles['initial'])
+        postboot = checked_boot_argument_profile(profiles['postboot'])
+        if value['status'] != 'observed' or initial['status'] != 'observed' or postboot != value['full_profile']:
+            return False
+        remaining = value['remaining_profile']
+        return (remaining['debug_mask'] == 0x102000 and
+                all(remaining[key] == initial[key] for key in ('nondebug_token_count', 'nondebug_sha256')))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def postboot_paniclog_control(directory, config, current):
+    scope = {'marker': debug_boot_marker(config), 'current_boot_uuid': current,
+             'mode': config['context'].get('after_debug_boot')}
+    path = directory / 'nvram-paniclog-control.json'
+    try:
+        if not panic_followup(config['context']):
+            raise ValueError('NVRAM logging mode mismatch')
+        if path.exists():
+            saved = json.loads(path.read_text())
+            if not isinstance(saved, dict) or set(saved) != {'scope', 'observation'} or saved['scope'] != scope:
+                raise ValueError('NVRAM logging observation scope mismatch')
+            return checked_paniclog_control(saved['observation'])
+        try:
+            raw = recovery_bootargs.MacPlatform().active()
+            observation = parse_nvram_off_control(raw) if nvram_off_control(config['context']) else {'status': 'not_requested'}
+        except (OSError, subprocess.SubprocessError):
+            observation = {'status': 'unavailable'}
+        except ValueError:
+            observation = {'status': 'invalid'}
+        private_write(path, json.dumps({'scope': scope, 'observation': observation}).encode())
+        sync_directory(directory)
+        return checked_paniclog_control(observation)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {'status': 'invalid'}
 
 
 def root_dir(ctx):
@@ -950,7 +1022,8 @@ def debug_owner(directory, config, current):
             raise ValueError("kernel debugging not permitted")
         if source == "bootplist":
             debug_event(directory, config, "bootplist_inflight", current)
-            fact = recovery_bootplist.stage(directory, marker, private_write, sync_directory, debug_mask=expected_debug_mask(config["context"]))
+            fact = recovery_bootplist.stage(directory, marker, private_write, sync_directory, debug_mask=expected_debug_mask(config["context"]),
+                                               nvram_paniclog=0 if nvram_off_control(config["context"]) else None)
             debug_event(directory, config, "bootplist_staged", current, bootplist_stage=fact)
         else:
             recovery_bootargs.stage(directory, marker, platform, private_write, sync_directory)
@@ -1361,6 +1434,8 @@ def read_followup_debug(directory, config):
     if (scope != expected or config["debug_source_identity"] != debug_source_identity() or
             not debug_boot_proven(saved["facts"], "bootplist", expected_debug_mask(config["context"])) or saved["facts"].get("current_boot_uuid") != scope["debug_boot_uuid"]):
         raise ValueError("followup debug proof invalid")
+    if nvram_off_control(config["context"]) and not nvram_off_control_proven(saved["facts"]):
+        raise ValueError("NVRAM logging control proof invalid")
     return saved
 
 
@@ -1585,6 +1660,8 @@ def followup_start(directory, config, current, facts, token):
     private_write(directory / "panic-followup-debug.json", json.dumps(saved).encode())
     sync_directory(directory)
     try:
+        if nvram_off_control(config["context"]) and not nvram_off_control_proven(facts):
+            raise ValueError("NVRAM logging control not proven")
         prepared = recovery_panic_control.prepare(directory, config["nonce"], private_write, sync_directory)
         publish_followup(directory, config, token, followup_summary(config, "panic_prepared", current, saved, prepared=prepared),
                          "Nonce panic control prepared")
@@ -1731,8 +1808,10 @@ def collect(directory):
         return
     debug_facts = {}
     argument_profiles = None
+    paniclog_control = None
     if reboot_observed(config["baseline"], current) and panic_followup(config["context"]):
         argument_profiles = postboot_argument_profiles(directory, config, current)
+        paniclog_control = postboot_paniclog_control(directory, config, current)
     if reboot_observed(config["baseline"], current) and config.get("debug_boot", False):
         try:
             if config["context"]["debug_source"] == "bootplist":
@@ -1754,6 +1833,8 @@ def collect(directory):
                                     "nic_inventory_status": "unsupported", "kernel_debug_state": {}})
         if argument_profiles is not None:
             debug_facts["boot_argument_profiles"] = argument_profiles
+        if paniclog_control is not None:
+            debug_facts["nvram_paniclog_control"] = paniclog_control
         debug_facts["owner_events"] = []
         for event in DEBUG_EVENTS:
             if (directory / ("debug-reboot-" + event + ".json")).exists():

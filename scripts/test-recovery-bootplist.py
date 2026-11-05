@@ -21,6 +21,85 @@ def sync(path):
 
 
 class Transaction(unittest.TestCase):
+    def test_nvram_off_derivation_adds_only_fixed_token(self):
+        original = plistlib.dumps({'Kernel Flags': '-v', 'other': 'preserved'}, fmt=plistlib.FMT_BINARY)
+        default = core.stage_content(original, 0x102000)
+        self.assertEqual(core.stage_content(original, 0x102000, nvram_paniclog=None), default)
+        staged = core.stage_content(original, 0x102000, nvram_paniclog=0)
+        self.assertTrue(staged.startswith(b'bplist00'))
+        self.assertEqual(plistlib.loads(staged), {'Kernel Flags': '-v debug=0x102000 nvram_paniclog=0', 'other': 'preserved'})
+        empty = plistlib.dumps({'Kernel Flags': ''})
+        self.assertEqual(core.flags(core.stage_content(empty, 0x102000, nvram_paniclog=0), allow_debug=True),
+                         'debug=0x102000 nvram_paniclog=0')
+
+    def test_nvram_off_rejects_overrides_and_invalid_modes(self):
+        for token in ('nvram_paniclog=1', 'nvram_paniclog=0', '-nvram_paniclog=1',
+                      '--nvram_paniclog', 'nvram_paniclog =0', 'nvram_paniclog=bad\t-v'):
+            with self.subTest(token=token):
+                original = plistlib.dumps({'Kernel Flags': token})
+                with self.assertRaises(ValueError):
+                    core.stage_content(original, 0x102000, nvram_paniclog=0)
+        original = plistlib.dumps({'Kernel Flags': 'nvram_paniclog=1'})
+        self.assertEqual(core.flags(core.stage_content(original, 0x102000), allow_debug=True),
+                         'nvram_paniclog=1 debug=0x102000')
+        for mode in (False, True, '0', 1, -1, []):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                core.stage_content(plistlib.dumps({'Kernel Flags': '-v'}), 0x102000, nvram_paniclog=mode)
+        with self.assertRaises(ValueError):
+            core.stage_content(plistlib.dumps({'Kernel Flags': '-v'}), 0x2000, nvram_paniclog=0)
+
+    def test_nvram_off_restores_both_original_files_and_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data, preboot, directory, original, marker = self.fixture(Path(tmp).resolve())
+            os.utime(data, ns=(1_700_000_000_000_000_000, 1_700_000_001_000_000_000))
+            os.utime(preboot, ns=(1_700_000_002_000_000_000, 1_700_000_003_000_000_000))
+            before = {path: core.snapshot(path) for path in (data, preboot)}
+            core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(),
+                             debug_mask=0x102000, nvram_paniclog=0)
+            self.assertEqual(json.loads((directory / 'bootplist-manifest.json').read_text())['nvram_paniclog'], 0)
+            for path in (data, preboot):
+                self.assertEqual(core.flags(path.read_bytes(), allow_debug=True), '-v debug=0x102000 nvram_paniclog=0')
+            result = core.finish_files(directory, marker, data, preboot,
+                                       'BBBBBBBB-2222-2222-2222-222222222222', 0x102000, save, sync)
+            self.assertTrue(result['bootplist_restored'])
+            for path in (data, preboot):
+                self.assertEqual(path.read_bytes(), original)
+                after = core.snapshot(path)
+                for key in ('uid', 'gid', 'mode', 'flags', 'mtime_ns', 'xattr_count', 'xattr_sha256'):
+                    self.assertEqual(after[key], before[path][key])
+            self.assertEqual(result['bootplist_restore'], {name: {'bytes': True, 'metadata': True, 'timestamps': True}
+                                                           for name in ('data', 'preboot')})
+
+    def test_nvram_off_manifest_tampering_does_not_write(self):
+        for mode in (None, False, True, '0', 1, 'missing', 'extra'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                data, preboot, directory, _original, marker = self.fixture(Path(tmp).resolve())
+                core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(),
+                                 debug_mask=0x102000, nvram_paniclog=0)
+                before = data.read_bytes(), preboot.read_bytes()
+                path = directory / 'bootplist-manifest.json'
+                manifest = json.loads(path.read_text())
+                if mode == 'missing': del manifest['nvram_paniclog']
+                elif mode == 'extra': manifest['extra'] = 'unowned'
+                else: manifest['nvram_paniclog'] = mode
+                path.write_text(json.dumps(manifest))
+                with self.assertRaises(ValueError):
+                    core.finish_files(directory, marker, data, preboot,
+                                      'BBBBBBBB-2222-2222-2222-222222222222', 0x102000, save, sync)
+                self.assertEqual((data.read_bytes(), preboot.read_bytes()), before)
+
+    def test_invalid_nvram_mode_or_existing_policy_never_stages(self):
+        for mode, original_flags in ((False, '-v'), ('0', '-v'), (0, '-v --nvram_paniclog=1')):
+            with self.subTest(mode=mode, original_flags=original_flags), tempfile.TemporaryDirectory() as tmp:
+                data, preboot, directory, _original, marker = self.fixture(Path(tmp).resolve())
+                original = plistlib.dumps({'Kernel Flags': original_flags})
+                data.write_bytes(original); preboot.write_bytes(original)
+                with self.assertRaises(ValueError):
+                    core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid(),
+                                     debug_mask=0x102000, nvram_paniclog=mode)
+                self.assertEqual((data.read_bytes(), preboot.read_bytes()), (original, original))
+                self.assertEqual(list(directory.iterdir()), [])
+
     def fixture(self, root):
         original = plistlib.dumps({'Kernel Flags': '-v', 'other': 'not-public'})
         data, preboot, directory = root / 'data', root / 'preboot', root / 'private'
@@ -32,6 +111,7 @@ class Transaction(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data, preboot, directory, original, marker = self.fixture(Path(tmp).resolve())
             fact = core.stage_files(directory, marker, data, preboot, save, sync, owner_uid=os.geteuid())
+            self.assertIsNone(json.loads((directory / 'bootplist-manifest.json').read_text())['nvram_paniclog'])
             self.assertEqual(fact, {'data': 'staged', 'preboot': 'staged', 'metadata_preserved': True})
             self.assertEqual(core.flags(data.read_bytes(), allow_debug=True), '-v debug=0x2000')
             result = core.finish_files(directory, marker, data, preboot, 'BBBBBBBB-2222-2222-2222-222222222222', 0x2000, save, sync)

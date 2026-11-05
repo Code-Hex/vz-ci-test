@@ -47,11 +47,17 @@ def flags(raw, *, allow_debug=False):
     return data['Kernel Flags']
 
 
-def stage_content(raw, debug_mask=0x2000):
+def stage_content(raw, debug_mask=0x2000, *, nvram_paniclog=None):
     if type(debug_mask) is not int or debug_mask not in (0x2000, 0x102000): raise ValueError('debug_mask_invalid')
+    if nvram_paniclog is not None and (type(nvram_paniclog) is not int or nvram_paniclog != 0 or debug_mask != 0x102000):
+        raise ValueError('nvram_paniclog_invalid')
     original = flags(raw)
+    if nvram_paniclog == 0 and any(token.partition('=')[0].lstrip('-') == 'nvram_paniclog' for token in original.split()):
+        raise ValueError('existing_nvram_paniclog')
     data = plistlib.loads(raw)
     data['Kernel Flags'] = original + (' ' if original else '') + 'debug=0x' + format(debug_mask, 'x')
+    if nvram_paniclog == 0:
+        data['Kernel Flags'] += ' nvram_paniclog=0'
     boot.text(data['Kernel Flags'])
     return plistlib.dumps(data, fmt=plistlib.FMT_BINARY if raw.startswith(b'bplist00') else plistlib.FMT_XML, sort_keys=False)
 
@@ -280,19 +286,23 @@ def _record(directory, name, value, save, sync):
 def _load(directory, marker, data_path, preboot_path):
     validate_marker(marker)
     manifest = json.loads((directory / 'bootplist-manifest.json').read_text())
-    if (not isinstance(manifest, dict) or manifest.get('marker') != marker or
+    if (not isinstance(manifest, dict) or set(manifest) != {'marker', 'debug_mask', 'nvram_paniclog', 'paths', 'scope', 'files'} or
+            manifest.get('marker') != marker or
             manifest.get('paths') != {'data': str(data_path), 'preboot': str(preboot_path)} or
-            type(manifest.get('debug_mask')) is not int or manifest['debug_mask'] not in (0x2000, 0x102000)):
+            type(manifest.get('debug_mask')) is not int or manifest['debug_mask'] not in (0x2000, 0x102000) or
+            (manifest['nvram_paniclog'] is not None and
+             (type(manifest['nvram_paniclog']) is not int or manifest['nvram_paniclog'] != 0 or manifest['debug_mask'] != 0x102000)) or
+            not isinstance(manifest['files'], dict) or set(manifest['files']) != {'data', 'preboot'}):
         raise ValueError('manifest_invalid')
     saved = {}
     for name in ('data', 'preboot'):
         item = manifest.get('files', {}).get(name)
-        if not isinstance(item, dict): raise ValueError('manifest_invalid')
+        if not isinstance(item, dict) or set(item) != {'meta', 'original_sha256', 'staged_sha256'}: raise ValueError('manifest_invalid')
         original = (directory / (name + '.original')).read_bytes()
         staged = (directory / (name + '.staged')).read_bytes()
         if hashlib.sha256(original).hexdigest() != item.get('original_sha256') or hashlib.sha256(staged).hexdigest() != item.get('staged_sha256'):
             raise ValueError('backup_invalid')
-        if stage_content(original, manifest['debug_mask']) != staged: raise ValueError('backup_invalid')
+        if stage_content(original, manifest['debug_mask'], nvram_paniclog=manifest['nvram_paniclog']) != staged: raise ValueError('backup_invalid')
         saved[name] = {'original': original, 'staged': staged, 'meta': item['meta']}
     return saved, manifest['debug_mask']
 
@@ -340,7 +350,7 @@ def _current_boot_uuid():
     return subprocess.check_output(['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'], timeout=10).decode('ascii').strip()
 
 
-def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner_uid=0, writer=write_if_expected, scope=None, boot_uuid=_current_boot_uuid, debug_mask=0x2000):
+def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner_uid=0, writer=write_if_expected, scope=None, boot_uuid=_current_boot_uuid, debug_mask=0x2000, nvram_paniclog=None):
     validate_marker(marker)
     directory = Path(directory); data_path = Path(data_path); preboot_path = Path(preboot_path)
     if (directory / 'bootplist-manifest.json').exists(): raise ValueError('already_staged')
@@ -353,8 +363,9 @@ def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner
         check = metadata_facts(path, originals[name])
         check['checks']['uid_root'] = originals[name]['uid'] == owner_uid
         if not metadata_allowed(check): raise ValueError('metadata_unsupported')
-    desired = {name: stage_content(item['raw'], debug_mask) for name, item in originals.items()}
-    manifest = {'marker': marker, 'debug_mask': debug_mask, 'paths': {name: str(path) for name, path in paths.items()}, 'scope': scope, 'files': {}}
+    desired = {name: stage_content(item['raw'], debug_mask, nvram_paniclog=nvram_paniclog) for name, item in originals.items()}
+    manifest = {'marker': marker, 'debug_mask': debug_mask, 'nvram_paniclog': nvram_paniclog,
+                'paths': {name: str(path) for name, path in paths.items()}, 'scope': scope, 'files': {}}
     for name in paths:
         original = originals[name]
         save(directory / (name + '.original'), original['raw'])
@@ -481,9 +492,10 @@ def finish_files(directory, marker, data_path, preboot_path, current_boot_uuid, 
     return result
 
 
-def stage(directory, marker, save, sync, *, debug_mask=0x2000):
+def stage(directory, marker, save, sync, *, debug_mask=0x2000, nvram_paniclog=None):
     data, preboot, group, system = resolve_paths()
-    result = stage_files(directory, marker, data, preboot, save, sync, scope={'group': group, 'system': system}, debug_mask=debug_mask)
+    result = stage_files(directory, marker, data, preboot, save, sync, scope={'group': group, 'system': system},
+                         debug_mask=debug_mask, nvram_paniclog=nvram_paniclog)
     return result
 
 

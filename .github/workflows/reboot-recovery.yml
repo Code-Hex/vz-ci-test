@@ -38,6 +38,7 @@ on:
         options:
           - none
           - panic-nonce
+          - panic-nonce-nvram-off
         default: none
       report_cert:
         description: Public recipient certificate for encrypted panic reports
@@ -52,7 +53,7 @@ jobs:
   controller:
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ inputs.after_debug_boot == 'panic-nonce' && 20 || 12 }}
+    timeout-minutes: ${{ inputs.after_debug_boot != 'none' && 20 || 12 }}
     env:
       RECOVERY_TRIGGER: ${{ inputs.trigger || 'reboot' }}
       RECOVERY_DEBUG_BOOT: ${{ inputs.debug_boot && '1' || '0' }}
@@ -75,7 +76,7 @@ jobs:
   verify:
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'Code-Hex/vz-ci-test' && github.ref == 'refs/heads/main' }}
     runs-on: macos-26-intel
-    timeout-minutes: ${{ inputs.after_debug_boot == 'panic-nonce' && 20 || 12 }}
+    timeout-minutes: ${{ inputs.after_debug_boot != 'none' && 20 || 12 }}
     env:
       RECOVERY_TRIGGER: ${{ inputs.trigger || 'reboot' }}
       RECOVERY_DEBUG_BOOT: ${{ inputs.debug_boot && '1' || '0' }}
