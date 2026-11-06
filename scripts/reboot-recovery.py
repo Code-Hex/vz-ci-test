@@ -48,7 +48,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
-              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "panic-nonce-syscall", "panic-nonce-begin", "kernel-state", "bootargs-marker", "bootargs-marker-sample", "netdump-prime", "panic-nonce-netdump") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "panic-nonce-syscall", "panic-nonce-begin", "begin-nonce-control", "kernel-state", "bootargs-marker", "bootargs-marker-sample", "netdump-prime", "panic-nonce-netdump") and
               (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
@@ -69,11 +69,11 @@ def panic_mode(ctx):
 
 
 def panic_followup(ctx):
-    return ctx.get("after_debug_boot", "none") in ("panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "panic-nonce-syscall", "panic-nonce-begin")
+    return ctx.get("after_debug_boot", "none") in ("panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "panic-nonce-syscall", "panic-nonce-begin", "begin-nonce-control")
 
 
 def panic_control_kind(ctx):
-    if ctx.get('after_debug_boot') == 'panic-nonce-begin':
+    if ctx.get('after_debug_boot') in ('panic-nonce-begin', 'begin-nonce-control'):
         return 'dtrace-begin-v1'
     if ctx.get('after_debug_boot') == 'panic-nonce-syscall':
         return 'reboot-panic-v1'
@@ -104,11 +104,11 @@ def panic_trigger_valid(trigger, scope, control_kind):
 
 
 def bootmarker_mode(ctx):
-    return ctx.get('after_debug_boot') in ('bootargs-marker', 'bootargs-marker-sample', 'panic-nonce-begin')
+    return ctx.get('after_debug_boot') in ('bootargs-marker', 'bootargs-marker-sample', 'panic-nonce-begin', 'begin-nonce-control')
 
 
 def kernel_sample_mode(ctx):
-    return ctx.get('after_debug_boot') in ('bootargs-marker-sample', 'panic-nonce-begin')
+    return ctx.get('after_debug_boot') in ('bootargs-marker-sample', 'panic-nonce-begin', 'begin-nonce-control')
 
 
 def bootmarker_proven(facts, nonce, baseline):
@@ -389,6 +389,8 @@ def debug_boot_proven(facts, source, expected_mask=0x2000):
 
 
 def panic_envelope_matches(data, ciphertext, pending, ctx):
+    if ctx.get('after_debug_boot') == 'begin-nonce-control':
+        return False
     if not boot_proof_matches(data, pending, ctx):
         return False
     if panic_followup(ctx):
@@ -2137,6 +2139,8 @@ def followup_start(directory, config, current, facts, token, *, deadline=None):
 
 
 def classify_followup(raw, config, trigger, *, active_bootargs_sha256=None):
+    if config['context'].get('after_debug_boot') == 'begin-nonce-control':
+        return {'status': 'unexpected_reboot', 'freshness': 'unverified', 'completeness': 'unknown', 'encoding': None}
     if raw is None:
         return {"status": "unavailable", "freshness": "unverified", "completeness": "unknown", "encoding": None}
     if panic_control_kind(config['context']) == 'dtrace-begin-v1':

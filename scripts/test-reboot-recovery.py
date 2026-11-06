@@ -15,6 +15,22 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def test_begin_control_mode_is_closed_and_never_claims_panic_success(self):
+        ctx={'actions':'true','repo':r.REPO,'ref':'refs/heads/main','event':'workflow_dispatch',
+             'runner_environment':'github-hosted','run_id':'123','attempt':'1','sha':'a'*40,'trigger':'reboot-quick',
+             'debug_boot':True,'debug_source':'bootplist','after_debug_boot':'begin-nonce-control'}
+        self.assertTrue(r.valid_context(ctx,'Darwin','x86_64',r.KERNEL_UUID))
+        self.assertEqual(r.panic_control_kind(ctx),'dtrace-begin-v1')
+        self.assertTrue(r.panic_followup(ctx));self.assertTrue(r.bootmarker_mode(ctx));self.assertTrue(r.kernel_sample_mode(ctx))
+        self.assertTrue(r.report_required(ctx));self.assertTrue(r.certificate_required(ctx))
+        for change in ({'trigger':'reboot'},{'debug_boot':False},{'debug_source':'nvram'},{'after_debug_boot':'begin-nonce-control-extra'}):
+            self.assertFalse(r.valid_context({**ctx,**change},'Darwin','x86_64',r.KERNEL_UUID))
+        def forbidden(*a,**kw):self.fail('nonpanic control attempted positive panic classification')
+        with patch.object(r.recovery_nvram_panic,'classify_begin',forbidden):
+            result=r.classify_followup(b'panic-looking raw',{'context':ctx,'nonce':'b'*64},{},active_bootargs_sha256='c'*64)
+        self.assertEqual(result,{'status':'unexpected_reboot','freshness':'unverified','completeness':'unknown','encoding':None})
+        self.assertFalse(r.panic_envelope_matches({},'eA==',{},ctx))
+
     def test_begin_mode_and_trigger_are_closed_without_invented_process_identity(self):
         ctx={'actions':'true','repo':r.REPO,'ref':'refs/heads/main','event':'workflow_dispatch',
              'runner_environment':'github-hosted','run_id':'123','attempt':'1','sha':'a'*40,
@@ -38,14 +54,14 @@ class Recovery(unittest.TestCase):
                        {'after_debug_boot':'panic-nonce-begin-extra'}):
             self.assertFalse(r.valid_context({**ctx,**change},'Darwin','x86_64',r.KERNEL_UUID))
 
-    def begin_fixture(self):
+    def begin_fixture(self, mode='panic-nonce-begin'):
         config,facts,current=self.bootmarker_fixture()
-        config['context']['after_debug_boot']='panic-nonce-begin';config['cert_fingerprint']='a'*64
+        config['context']['after_debug_boot']=mode;config['cert_fingerprint']='a'*64
         saved={'scope':{**r.debug_boot_marker(config),'debug_boot_uuid':current},'facts':facts}
         n=r.recovery_begin_panic
         prepared={'protocol':n.PROTOCOL,'control_kind':n.KIND,'source_hashes':n.source_hashes(),
             'context_sha256':n.sha(n.canonical(config['context'])),'nonce_sha256':n.sha(config['nonce'].encode()),
-            'program_sha256':n.sha(n.program(config['nonce'])),'dtrace_sha256':'f'*64,'permission_verified':False,
+            'program_sha256':n.sha(n.program(config['nonce'],context=config['context'])),'dtrace_sha256':'f'*64,'permission_verified':False,
             'build_status':'written','compile_status':'passed','debug_boot_uuid':current,
             'destructive_policy':{'status':'observed','value':0}}
         return config,saved,self.followup_fixture()[2],prepared
@@ -76,9 +92,9 @@ class Recovery(unittest.TestCase):
             with self.assertRaises(ValueError):r.read_followup_debug(directory,config)
 
     def test_begin_b3_uses_exact_bootargs_classifier_and_cms_without_fake_pid_or_flags(self):
-        for body in ('fresh','missing','wrong_args','wrong_nonce','wrong_program','old_trigger'):
+        for body in ('fresh','missing','wrong_args','wrong_nonce','wrong_program','old_trigger','control_unexpected'):
             with self.subTest(body=body),tempfile.TemporaryDirectory() as tmp:
-                directory=Path(tmp);config,saved,b3,prepared=self.begin_fixture();(directory/'panic-control').mkdir()
+                directory=Path(tmp);config,saved,b3,prepared=self.begin_fixture('begin-nonce-control' if body=='control_unexpected' else 'panic-nonce-begin');(directory/'panic-control').mkdir()
                 trigger={'scope':saved['scope'],'program_sha256':prepared['program_sha256'],'dtrace_sha256':prepared['dtrace_sha256'],'prepared':True}
                 if body=='wrong_program':trigger['program_sha256']='0'*64
                 if body=='old_trigger':trigger['helper_pid']=123
@@ -93,7 +109,7 @@ class Recovery(unittest.TestCase):
                 completed=[];metadata_seen=[]
                 def encrypt(cert,metadata,report):
                     metadata_seen.append(metadata);self.assertEqual(report,raw)
-                    self.assertEqual(metadata['after_debug_boot'],'panic-nonce-begin');self.assertEqual(metadata['control_kind'],'dtrace-begin-v1')
+                    self.assertEqual(metadata['after_debug_boot'],config['context']['after_debug_boot']);self.assertEqual(metadata['control_kind'],'dtrace-begin-v1')
                     self.assertEqual(metadata['program_sha256'],prepared['program_sha256']);self.assertEqual(metadata['dtrace_sha256'],prepared['dtrace_sha256'])
                     self.assertEqual(metadata['active_bootargs_sha256'],saved['facts']['boot_marker_control']['active_sha256'])
                     self.assertTrue({'helper_pid','tracer_pid','helper_sha256','flags'}.isdisjoint(metadata))
@@ -115,11 +131,14 @@ class Recovery(unittest.TestCase):
                 else:
                     self.assertEqual(completed[0][0],body=='fresh');self.assertEqual(completed[0][1]['prepared'],prepared)
                     self.assertEqual(len(metadata_seen),int(raw is not None))
+                    if body=='control_unexpected':
+                        self.assertEqual(completed[0][1]['panic_capture']['status'],'unexpected_reboot')
+                        self.assertEqual(completed[0][1]['capture_state'],'encrypted_unvalidated')
 
     def test_begin_followup_gates_single_launch_and_keeps_negative_latch_without_watch(self):
-        for case in ('returned','mask_zero','marker_invalid','budget','timeout','prepare_fail','policy_bad','boot_bad','ack_fail','trigger_bad','save_started','save_followup'):
+        for case in ('returned','control_returned','mask_zero','marker_invalid','budget','timeout','prepare_fail','policy_bad','boot_bad','ack_fail','trigger_bad','save_started','save_followup'):
             with self.subTest(case=case),tempfile.TemporaryDirectory() as tmp:
-                directory=Path(tmp);config,saved,_b3,prepared=self.begin_fixture();current=saved['scope']['debug_boot_uuid']
+                directory=Path(tmp);config,saved,_b3,prepared=self.begin_fixture('begin-nonce-control' if case=='control_returned' else 'panic-nonce-begin');current=saved['scope']['debug_boot_uuid']
                 facts=copy.deepcopy(saved['facts']);calls=[];reports=[];launches=[];reads=[];samples=[];clock=[0]
                 facts.pop('kernel_debug_state');facts.pop('optional_inventory_status')
                 if case=='marker_invalid':facts['boot_marker_control']={'status':'invalid'}
@@ -150,7 +169,7 @@ class Recovery(unittest.TestCase):
                 def fire(_d,scope,value,_save,_sync,on_ready,current_boot_uuid,*,context,deadline):
                     calls.append('fire');self.assertEqual(scope,saved['scope']);self.assertEqual(deadline,180)
                     if on_ready(trigger):launches.append(True)
-                    return {'phase':'returned','launch_status':'launched','dtrace_exit':70,'outcome':'after_action',
+                    return {'phase':'returned','launch_status':'launched','dtrace_exit':70,'outcome':'control' if case=='control_returned' else 'after_action',
                             'fault_code':None,'output_complete':True,'output_overflow':False,'ownership_faults':0}
                 def forbidden(*a,**kw):self.fail('BEGIN touched legacy Watch/fire/profile path')
                 with contextlib.ExitStack() as stack:
@@ -168,13 +187,17 @@ class Recovery(unittest.TestCase):
                     if case!='save_followup':
                         with patch.object(r,'load_config',lambda _:config),patch.object(r.recovery_bootplist,'finish',forbidden):
                             r.collect(directory)
-                self.assertEqual(launches,[True] if case=='returned' else [])
+                self.assertEqual(launches,[True] if case in ('returned','control_returned') else [])
                 self.assertEqual(len(reports),1);self.assertFalse(reports[0][1]);self.assertEqual(reports[0][2],clock[0]+60)
-                self.assertEqual('prepare' in calls,case in ('returned','prepare_fail','policy_bad','boot_bad','ack_fail','trigger_bad'))
+                self.assertEqual('prepare' in calls,case in ('returned','control_returned','prepare_fail','policy_bad','boot_bad','ack_fail','trigger_bad'))
                 self.assertEqual(len(reads),0 if case in ('budget','save_started') else 1)
                 self.assertEqual(len(samples),int(case=='timeout'))
                 self.assertEqual((directory/'panic-followup-debug.json').exists(),case!='save_followup')
-                if case=='returned':self.assertEqual(calls,['prepare','panic_prepared','fire','panic_intent'])
+                if case in ('returned','control_returned'):self.assertEqual(calls,['prepare','panic_prepared','fire','panic_intent'])
+                if case=='control_returned':
+                    data=r.json.loads(reports[0][0]['summary'])
+                    self.assertEqual(data['after_debug_boot'],'begin-nonce-control')
+                    self.assertEqual(data['panic_control']['result']['outcome'],'control')
 
     def test_begin_restore_failure_retries_only_restore_before_core_latch_return(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -199,13 +222,13 @@ class Recovery(unittest.TestCase):
             self.assertEqual(len(finishes),2);self.assertFalse((directory/'panic-control'/'launch-attempt.json').exists())
 
     def test_begin_controller_pins_b1_profile_and_requires_b3_receipt_and_body(self):
-        for case in ('fresh','missing_baseline','changed_b1','policy','marker','missing_body','program'):
+        for case in ('fresh','missing_baseline','changed_b1','policy','marker','missing_body','program','control_false_success'):
             with self.subTest(case=case):
-                config,saved,b3,prepared=self.begin_fixture();ctx=config['context'];cipher=b'encrypted boundary'
+                config,saved,b3,prepared=self.begin_fixture('begin-nonce-control' if case=='control_false_success' else 'panic-nonce-begin');ctx=config['context'];cipher=b'encrypted boundary'
                 trigger={'scope':saved['scope'],'program_sha256':prepared['program_sha256'],'dtrace_sha256':prepared['dtrace_sha256'],'prepared':True}
                 public={'protocol':'vz-recovery-v1','phase':'public_key','binding':r.binding(ctx),'nonce':config['nonce'],
                     'baseline_boot_uuid':config['baseline'],'public_key':'public','cert_fingerprint':config['cert_fingerprint'],
-                    'debug_boot':True,'debug_source':'bootplist','after_debug_boot':'panic-nonce-begin','trigger':'reboot-quick',
+                    'debug_boot':True,'debug_source':'bootplist','after_debug_boot':ctx['after_debug_boot'],'trigger':'reboot-quick',
                     'initial_boot_argument_profile':config['initial_boot_argument_profile']}
                 if case=='missing_baseline':public.pop('initial_boot_argument_profile')
                 final=r.followup_summary(config,'boot_observed',b3,saved,prepared=prepared,panic_trigger=trigger,
@@ -614,7 +637,7 @@ class Recovery(unittest.TestCase):
             if begin:
                 built=r.json.loads((directory/'panic-control'/'built.json').read_text())
                 self.assertEqual(built['control_kind'],'dtrace-begin-v1');self.assertIs(built['permission_verified'],False)
-                self.assertEqual((directory/'panic-control'/'program.d').read_bytes(),r.recovery_begin_panic.program(actual['nonce']))
+                self.assertEqual((directory/'panic-control'/'program.d').read_bytes(),r.recovery_begin_panic.program(actual['nonce'],context=actual['context']))
                 self.assertFalse((directory/'panic-control'/'prepared.json').exists());self.assertFalse((directory/'panic-control'/'launch-attempt.json').exists())
 
     def test_bootmarker_controller_pins_b1_profile_before_accepting_b2(self):

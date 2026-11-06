@@ -30,17 +30,20 @@ def _hex(value): return type(value) is str and re.fullmatch(r'[0-9a-f]{64}',valu
 
 def validate_context(context):
     expected={'actions':'true','repo':'Code-Hex/vz-ci-test','ref':'refs/heads/main','event':'workflow_dispatch',
-              'runner_environment':'github-hosted','trigger':'reboot-quick','debug_source':'bootplist','after_debug_boot':'panic-nonce-begin'}
-    if (type(context) is not dict or any(context.get(k)!=v for k,v in expected.items()) or context.get('debug_boot') is not True or
+              'runner_environment':'github-hosted','trigger':'reboot-quick','debug_source':'bootplist'}
+    if (type(context) is not dict or context.get('after_debug_boot') not in ('panic-nonce-begin','begin-nonce-control') or any(context.get(k)!=v for k,v in expected.items()) or context.get('debug_boot') is not True or
             any(type(context.get(k)) is not str or not re.fullmatch(pattern,context[k]) for k,pattern in
                 (('run_id',r'[1-9][0-9]{0,19}'),('attempt',r'[1-9][0-9]{0,4}'),('sha',r'[0-9a-f]{40}')))):
         raise ValueError('begin_context_invalid')
 
 
-def program(nonce):
+def program(nonce,*,context):
+    validate_context(context)
     if not _hex(nonce): raise ValueError('begin_nonce_invalid')
+    action='panic(); ' if context['after_debug_boot']=='panic-nonce-begin' else ''
+    marker='VZ_BEGIN_AFTER_PANIC' if action else 'VZ_BEGIN_CONTROL'
     return ('dtrace:::ERROR { printf("VZ_BEGIN_FAULT '+nonce+' %u\\n", (uint32_t)arg4); exit(71); }\n'
-            'dtrace:::BEGIN { panic(); printf("VZ_BEGIN_AFTER_PANIC '+nonce+'\\n"); exit(70); }\n').encode('ascii')
+            'dtrace:::BEGIN { '+action+'printf("'+marker+' '+nonce+'\\n"); exit(70); }\n').encode('ascii')
 
 
 def source_hashes():
@@ -64,7 +67,7 @@ def _record(directory,name,value,save,sync):
 
 
 def _checked_built(value,nonce,context):
-    validate_context(context);raw=program(nonce)
+    validate_context(context);raw=program(nonce,context=context)
     if (type(value) is not dict or set(value)!=BUILT_KEYS or value['protocol']!=PROTOCOL or value['control_kind']!=KIND or
             value['source_hashes']!=source_hashes() or value['context_sha256']!=sha(canonical(context)) or
             value['nonce_sha256']!=sha(nonce.encode()) or value['program_sha256']!=sha(raw) or not _hex(value['dtrace_sha256']) or
@@ -84,7 +87,7 @@ def checked_prepared(value,nonce,*,context):
 
 
 def build(directory,nonce,save,sync,*,context):
-    validate_context(context);raw=program(nonce);tool_sha=_tool_sha()
+    validate_context(context);raw=program(nonce,context=context);tool_sha=_tool_sha()
     private=Path(directory)/'panic-control';private.mkdir(mode=0o700);sync(Path(directory))
     save(private/'program.d',raw);sync(private)
     built={'protocol':PROTOCOL,'control_kind':KIND,'source_hashes':source_hashes(),'context_sha256':sha(canonical(context)),
@@ -97,7 +100,7 @@ def validate_prepared(directory,nonce,prepared,*,context):
     value=checked_prepared(prepared,nonce,context=context);private=Path(directory)/'panic-control'
     if (json.loads(utility.read_private(private/'prepared.json',0o600,LIMIT))!=value or
             json.loads(utility.read_private(private/'built.json',0o600,LIMIT))!={k:value[k] for k in BUILT_KEYS} or
-            utility.read_private(private/'program.d',0o600,LIMIT)!=program(nonce) or _tool_sha()!=value['dtrace_sha256']):
+            utility.read_private(private/'program.d',0o600,LIMIT)!=program(nonce,context=context) or _tool_sha()!=value['dtrace_sha256']):
         raise ValueError('begin_private_binding_invalid')
     return Path(DTRACE)
 
@@ -144,14 +147,14 @@ def prepare(directory,nonce,save,sync,*,context,deadline,run_command=None,read=N
     policy={'status':'unavailable'}
     try:
         built=_checked_built(json.loads(utility.read_private(private/'built.json',0o600,LIMIT)),nonce,context)
-        if utility.read_private(private/'program.d',0o600,LIMIT)!=program(nonce) or _tool_sha()!=built['dtrace_sha256']:
+        if utility.read_private(private/'program.d',0o600,LIMIT)!=program(nonce,context=context) or _tool_sha()!=built['dtrace_sha256']:
             raise ValueError('begin_private_binding_invalid')
         current=_boot_uuid(run,private,'prepare-boot',end)
         if end-time.monotonic()<7:raise TimeoutError('begin_policy_budget_unavailable')
         policy=boot.kernel_field_state('dtrace_destructive_disallow',read=read,timeout=5)
         if type(policy) is not dict or set(policy)!={'status','value'} or policy['status']!='observed' or type(policy['value']) is not int or policy['value']!=0:
             raise ValueError('begin_policy_not_observed_zero')
-        code,_,_=run([DTRACE,'-w','-e','-q','-n',program(nonce).decode('ascii')],private,'begin-compile',min(end,time.monotonic()+20))
+        code,_,_=run([DTRACE,'-w','-e','-q','-n',program(nonce,context=context).decode('ascii')],private,'begin-compile',min(end,time.monotonic()+20))
         if code!=0:raise ValueError('begin_compile_failed')
         if _boot_uuid(run,private,'prepared-boot',end)!=current:raise ValueError('begin_boot_changed')
         prepared={**built,'compile_status':'passed','debug_boot_uuid':current,'destructive_policy':policy}
@@ -162,9 +165,11 @@ def prepare(directory,nonce,save,sync,*,context,deadline,run_command=None,read=N
         raise
 
 
-def parse_returned(raw,code,nonce):
-    program(nonce)
-    if raw==('VZ_BEGIN_AFTER_PANIC '+nonce+'\n\n').encode() and type(code) is int and code==70:return 'after_action',None
+def parse_returned(raw,code,nonce,*,context):
+    program(nonce,context=context)
+    control=context['after_debug_boot']=='begin-nonce-control'
+    marker='VZ_BEGIN_CONTROL' if control else 'VZ_BEGIN_AFTER_PANIC'
+    if raw==(marker+' '+nonce+'\n\n').encode() and type(code) is int and code==70:return ('control' if control else 'after_action'),None
     match=re.fullmatch(rb'VZ_BEGIN_FAULT '+nonce.encode()+rb' (0|[1-9][0-9]{0,9})\n\n',raw)
     if match and int(match[1])<=0xffffffff and type(code) is int and code==71:return 'fault',int(match[1])
     raise ValueError('begin_return_unrecognized')
@@ -188,7 +193,7 @@ def fire(directory,scope,prepared,save,sync,on_ready,current_boot_uuid,*,context
     utility.once_record(private,'launch-attempt.json',trigger,sync)
     if time.monotonic()>=end:return result
     start=subprocess.Popen if start_child is None else start_child;reader=drain_owner._drain if drain is None else drain
-    try:child=start([DTRACE,'-w','-q','-n',program(scope['nonce']).decode('ascii')],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=utility.CHILD_ENV)
+    try:child=start([DTRACE,'-w','-q','-n',program(scope['nonce'],context=context).decode('ascii')],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=utility.CHILD_ENV)
     except BaseException:return {**result,'phase':'unknown','launch_status':'unknown'}
     faults=0
     while True:
@@ -198,7 +203,7 @@ def fire(directory,scope,prepared,save,sync,on_ready,current_boot_uuid,*,context
     for stream in (child.stdout,child.stderr):stream.close()
     save(private/'dtrace.stdout',out);save(private/'dtrace.stderr',err);sync(private)
     outcome,fault_code='unrecognized',None
-    try:outcome,fault_code=parse_returned(out,child.returncode,scope['nonce'])
+    try:outcome,fault_code=parse_returned(out,child.returncode,scope['nonce'],context=context)
     except ValueError:pass
     _record(private,'returned.json',{'stdout_bytes':len(out),'stdout_sha256':sha(out),'stderr_bytes':len(err),'stderr_sha256':sha(err)},save,sync)
     return {'phase':'returned' if outcome!='unrecognized' and not overflow and not faults else 'unknown','launch_status':'launched',
