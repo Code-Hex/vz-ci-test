@@ -1,5 +1,6 @@
 """Read one panic property and identify a run-specific panic without printing it."""
 import ctypes
+import hashlib
 import re
 
 from nonce_usdt import ProbeSpec
@@ -88,6 +89,39 @@ def classify_syscall(raw, nonce, helper_pid):
     header = re.compile(rb'^panic\(cpu [0-9]+(?: caller (?:0x)?[0-9a-fA-F]+)?\): userspace panic: (' +
                         re.escape(marker.encode('ascii')) + rb')(?:\r?\n|$)')
     return _classify(raw, marker, header)
+
+
+def classify_begin(raw, nonce, active_bootargs_sha256):
+    if type(nonce) is not str or not re.fullmatch(r'[0-9a-f]{64}', nonce):
+        raise ValueError('invalid nonce')
+    if type(active_bootargs_sha256) is not str or not re.fullmatch(r'[0-9a-f]{64}', active_bootargs_sha256):
+        raise ValueError('invalid boot arguments digest')
+    header = re.compile(rb'^panic\(cpu [0-9]+(?: caller (?:0x)?[0-9a-fA-F]+)?\): dtrace: panic action at probe '
+                        rb'(dtrace:::BEGIN) \(ecb (?:0x)?[0-9a-fA-F]+\)(?:\r?\n|$)')
+    result = _classify(raw, 'dtrace:::BEGIN', header)
+    if result['status'] != 'fresh_fragment':
+        return result
+    candidate = raw if result['encoding'] == 'raw' else unpack_a(raw[:len(raw) - len(raw) % 7])
+    end = candidate.find(b'\0')
+    text = candidate if end < 0 else candidate[:end]
+    prefixes = re.findall(rb'(?im)(?:^|\x00)Boot args:', candidate)
+    lines = re.findall(rb'(?m)^Boot args: ([ -~]{0,255})\r?\n', text)
+    if len(prefixes) != 1:
+        status = 'ambiguous' if len(prefixes) > 1 else 'bootargs_missing'
+    elif len(lines) != 1:
+        status = 'bootargs_invalid'
+    else:
+        body = lines[0]
+        tokens = body.split()
+        markers = [token for token in tokens if token.partition(b'=')[0].lstrip(b'-') == b'vz_ci_nonce']
+        if markers != [('vz_ci_nonce=' + nonce).encode('ascii')]:
+            status = 'nonce_missing'
+        elif hashlib.sha256(body).hexdigest() != active_bootargs_sha256:
+            status = 'bootargs_mismatch'
+        else:
+            return result
+    result.update(status=status, freshness='unverified')
+    return result
 
 
 def _classify(raw, expected, header):

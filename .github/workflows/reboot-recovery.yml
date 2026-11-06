@@ -52,6 +52,7 @@ on:
           - panic-nonce-usdt
           - panic-nonce-usdt-nvram-off
           - panic-nonce-syscall
+          - panic-nonce-begin
           - kernel-state
           - bootargs-marker
           - bootargs-marker-sample

@@ -258,4 +258,84 @@ class SyscallPanicData(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(TypeError): self.classify(raw)
 
 
+
+
+BEGIN_BOOT = b'keepsyms=1 debug=0x102000 vz_ci_nonce=' + NONCE.encode()
+BEGIN_HEADER = b'panic(cpu 1 caller 0xffffff8000012345): dtrace: panic action at probe dtrace:::BEGIN (ecb 0xffffff8000001234)\n'
+BEGIN_REPORT = BEGIN_HEADER + b'Boot args: ' + BEGIN_BOOT + b'\nKernel UUID: ' + UUID.encode() + b'\n\0'
+BEGIN_PACKED = base64.b64decode(
+    '8LA7PUaN4XVQDDQOs9llOQiGN5vNZrMZB4PBYDHZjFZL6UBkujw8LutA8LA7PQaFx/T02w0K00Fw+VtcBpHp8vC4rNPphMVj0glC'
+    'lcdiEAxvNpvNZjMOBoPBYDHZjJZSCN9vOigsP891oHW5DJ/n2/NeDEQui+vnHgwfg8lgMBjIrv+O01/32z0u98LhcDgcDofD4XA4'
+    'HA6Hw+FwOBwOh8PhcDgcDofD4XA4HA6Hw+FwOBwOh8PhcDgcDofD4XA4HA6HFcuy3F1mg6rVJFEHwt1otZkwRmwFY7ZZaxYzBlvC'
+    '2UzYghmFNGHxhivaijgFAAAAAAA=')
+
+
+class BeginPanicData(unittest.TestCase):
+    def digest(self, body=BEGIN_BOOT):
+        import hashlib
+        return hashlib.sha256(body).hexdigest()
+
+    def report(self, body=BEGIN_BOOT, ending=b'\n'):
+        return BEGIN_HEADER + b'Boot args: ' + body + ending + b'Kernel UUID: ' + UUID.encode() + b'\n\0'
+
+    def test_same_panic_bootargs_proves_freshness(self):
+        self.assertEqual(panic.classify_begin(BEGIN_REPORT,NONCE,self.digest()),
+                         {'status':'fresh_fragment','encoding':'raw','freshness':'verified','completeness':'unknown',
+                          'terminator_present':True,'packed_tail_bytes':0})
+        self.assertEqual(panic.classify_begin(BEGIN_REPORT[:-1],NONCE,self.digest())['freshness'],'verified')
+        self.assertEqual(panic.classify_begin(self.report(ending=b'\r\n'),NONCE,self.digest())['freshness'],'verified')
+
+    def test_literal_packed_report_and_tail(self):
+        result=panic.classify_begin(BEGIN_PACKED,NONCE,self.digest())
+        self.assertEqual((result['status'],result['encoding'],result['completeness']),('fresh_fragment','packA','unknown'))
+        result=panic.classify_begin(BEGIN_PACKED+b'xyz',NONCE,self.digest())
+        self.assertEqual((result['freshness'],result['packed_tail_bytes']),('verified',3))
+
+    def test_nonce_hash_uuid_and_header_are_all_required(self):
+        self.assertEqual(panic.classify_begin(BEGIN_REPORT,'b'*64,self.digest())['freshness'],'unverified')
+        self.assertEqual(panic.classify_begin(BEGIN_REPORT,NONCE,'c'*64)['freshness'],'unverified')
+        for raw in (BEGIN_REPORT.replace(UUID.encode(),b'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA'),
+                    BEGIN_REPORT.replace(b'dtrace:::BEGIN',b'dtrace:::END'),
+                    BEGIN_HEADER+b'Kernel UUID: '+UUID.encode()+b'\n\0'):
+            with self.subTest(raw=raw):self.assertEqual(panic.classify_begin(raw,NONCE,self.digest())['freshness'],'unverified')
+        changed=BEGIN_BOOT.replace(b'keepsyms=1',b'keepsyms=2')
+        self.assertEqual(panic.classify_begin(self.report(changed),NONCE,self.digest())['freshness'],'unverified')
+
+    def test_full_token_ascii_and_255_byte_bound(self):
+        body=b'x'*(254-len(BEGIN_BOOT))+b' '+BEGIN_BOOT
+        self.assertEqual(len(body),255)
+        self.assertEqual(panic.classify_begin(self.report(body),NONCE,self.digest(body))['freshness'],'verified')
+        bodies=(b'x'+body,BEGIN_BOOT.replace(b'vz_ci_nonce=',b'-vz_ci_nonce='),
+                BEGIN_BOOT+b' vz_ci_nonce='+NONCE.encode(),BEGIN_BOOT+b'x',
+                BEGIN_BOOT.replace(b'keepsyms=1',b'keepsyms=\t1'),BEGIN_BOOT+b'\x80')
+        for invalid in bodies:
+            with self.subTest(body=invalid):self.assertEqual(panic.classify_begin(self.report(invalid),NONCE,self.digest(invalid))['freshness'],'unverified')
+        self.assertEqual(panic.classify_begin(self.report(ending=b''),NONCE,self.digest())['freshness'],'unverified')
+
+    def test_duplicate_and_after_nul_lines_do_not_supply_freshness(self):
+        raws=(BEGIN_REPORT[:-1]+b'Boot args: '+BEGIN_BOOT+b'\n\0',
+              BEGIN_REPORT+b'Boot args: '+BEGIN_BOOT+b'\n',
+              BEGIN_HEADER+b'Kernel UUID: '+UUID.encode()+b'\n\0Boot args: '+BEGIN_BOOT+b'\n',
+              BEGIN_REPORT+BEGIN_REPORT,
+              BEGIN_REPORT[:-1]+b'Kernel UUID: '+UUID.encode()+b'\n\0')
+        for raw in raws:
+            with self.subTest(raw=raw):self.assertEqual(panic.classify_begin(raw,NONCE,self.digest())['freshness'],'unverified')
+
+    def test_every_required_prefix_cut_is_unverified(self):
+        for end in range(len(BEGIN_REPORT)-1):
+            with self.subTest(end=end):self.assertEqual(panic.classify_begin(BEGIN_REPORT[:end],NONCE,self.digest())['freshness'],'unverified')
+
+    def test_argument_types_and_limits_are_closed(self):
+        for nonce,digest in ((None,self.digest()),('A'*64,self.digest()),(NONCE,None),(NONCE,'g'*64)):
+            with self.subTest(nonce=nonce,digest=digest),self.assertRaises(ValueError):panic.classify_begin(BEGIN_REPORT,nonce,digest)
+        with self.assertRaises(TypeError):panic.classify_begin('not bytes',NONCE,self.digest())
+        self.assertEqual(panic.classify_begin(b'',NONCE,self.digest())['status'],'empty')
+        self.assertEqual(panic.classify_begin(b'x'*(panic.MAX_RAW+1),NONCE,self.digest())['status'],'oversized')
+
+    def test_old_classifiers_do_not_accept_begin(self):
+        self.assertEqual(panic.classify(BEGIN_REPORT,NONCE)['freshness'],'unverified')
+        self.assertEqual(panic.classify_usdt(BEGIN_REPORT,NONCE,123)['freshness'],'unverified')
+        self.assertEqual(panic.classify_syscall(BEGIN_REPORT,NONCE,123)['freshness'],'unverified')
+
+
 if __name__ == '__main__': unittest.main()

@@ -12,7 +12,7 @@ NAMES = ('recovery.py', 'recovery_reports.py', 'recovery_bootargs.py', 'recovery
          'recovery_nvram_panic.py', 'recovery_panic_control.py', 'panic-source-preflight.py',
          'recovery_arrival.py', 'kdp_registry.py', 'recovery_netdump_settings.py', 'recovery_sources.py',
          'recovery_netdump.py', 'kdp_udp_preflight.py', 'kdp_crashdump.py', 'recovery_netdump_capture.py',
-         'udp_observer.py', 'nonce_usdt.py', 'recovery_reboot_panic.py', 'recovery_kernel_sample.py')
+         'udp_observer.py', 'nonce_usdt.py', 'recovery_reboot_panic.py', 'recovery_kernel_sample.py', 'recovery_begin_panic.py')
 
 
 class Sources(unittest.TestCase):
@@ -86,6 +86,7 @@ class Sources(unittest.TestCase):
                        'import nonce_usdt; assert Path(nonce_usdt.__file__).resolve() == (main.parent / "nonce_usdt.py").resolve(); '
                        'import recovery_reboot_panic; assert Path(recovery_reboot_panic.__file__).resolve() == (main.parent / "recovery_reboot_panic.py").resolve(); '
                        'import recovery_kernel_sample; assert Path(recovery_kernel_sample.__file__).resolve() == (main.parent / "recovery_kernel_sample.py").resolve(); '
+                       'import recovery_begin_panic; assert Path(recovery_begin_panic.__file__).resolve() == (main.parent / "recovery_begin_panic.py").resolve(); '
                        'print(module["debug_source_identity"]())')
             result = subprocess.run([sys.executable, '-c', program, str(private / 'recovery.py')],
                                     env={'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'},
