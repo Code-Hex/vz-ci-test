@@ -1,6 +1,7 @@
 """Generate a shell entry point that reports before the Python collector."""
 import hashlib
 import json
+import os
 import ipaddress
 import re
 import shlex
@@ -10,6 +11,26 @@ from pathlib import Path
 VERSION = "boot-arrival-v1"
 URL = "https://api.github.com/repos/Code-Hex/vz-ci-test/check-runs"
 UUID = re.compile(r"[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\Z")
+
+STAGES = (
+    "arrival_before_curl", "arrival_after_curl", "marker_done", "python_dispatch",
+    "python_entry", "imports_done", "config_loaded", "boot_uuid_done",
+    "finish_before", "finish_after", "core_saved", "patch_enter",
+    "patch_request_ready", "patch_opener_ready", "patch_response_opened",
+    "patch_json_done", "patch_return", "get_enter", "get_request_ready",
+    "get_opener_ready", "get_response_opened", "get_json_done", "get_return", "core_ack",
+)
+SHELL_STAGE = "stage() { (printf '%s\\n' \"$1\" >&3) 2>/dev/null || :; }"
+
+
+def pipe_stage(stage):
+    if stage not in STAGES:
+        return
+    try:
+        os.set_blocking(3, False)
+        os.write(3, (stage + "\n").encode("ascii"))
+    except OSError:
+        pass
 
 
 def authorization_header(token):
@@ -138,4 +159,53 @@ exit "$python_status"
                         "EXIT_FORMAT": shlex.quote(exit_body), "EXIT_ARGUMENTS": exit_arguments,
                         "RESOLVE_OPTION": "--resolve " + shlex.quote("api.github.com:443:" + api_ip) if api_ip else ""}.items():
         script = script.replace(name, value)
+    if ctx.get("after_debug_boot") == "begin-nonce-control":
+        script = observed_shell(script, config, binding, api_ip)
     return script.encode("utf-8")
+
+
+def observed_shell(script, config, binding, api_ip):
+    if not api_ip:
+        raise ValueError("collector stage API address unavailable")
+    source = config.get("debug_source_identity")
+    if not isinstance(source, str) or not re.fullmatch(r"[0-9a-f]{64}", source):
+        raise ValueError("collector stage source invalid")
+    start = 'if [ "$fresh" = true ] && [ ! -f "$directory/arrival-$boot.posted" ]; then'
+    header, rest = script.split(start, 1)
+    body = start + rest
+    observed = body.replace('        code=$(/usr/bin/curl', '        stage arrival_before_curl\n        code=$(/usr/bin/curl', 1)
+    observed = observed.replace('2>/dev/null) || code=000\n', '2>/dev/null) || code=000\n        stage arrival_after_curl\n', 1)
+    observed = observed.replace('> "$directory/arrival-$boot.posted") 2>/dev/null',
+                                '> "$directory/arrival-$boot.posted") 2>/dev/null && stage marker_done', 1)
+    observed = observed.replace('"$python" "$directory/recovery.py" collect "$directory"',
+                                'stage python_dispatch\n"$python" "$directory/recovery.py" collect-observed "$directory" "$boot"', 1)
+    cases = []
+    for stage in STAGES:
+        summary = json.dumps({"protocol": "collector-stage-v1", "phase": "collector_stage", "stage": stage,
+                              "binding": binding, "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"],
+                              "actual_boot_uuid": "STAGE_BOOT", "source_identity": source,
+                              "source_generator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()})
+        payload = {"name": "Collector stage " + stage + " " + config["context"]["run_id"],
+                   "head_sha": config["context"]["sha"], "external_id": binding + "/STAGE_EXTERNAL/collector-stage/" + stage,
+                   "status": "completed", "conclusion": "neutral",
+                   "output": {"title": "Collector stage observed", "summary": summary}}
+        fmt, args = shell_payload(payload, {"STAGE_BOOT": "$boot", "STAGE_EXTERNAL": "$boot"})
+        cases.append(stage + ') printf ' + shlex.quote(fmt) + ' ' + args + ';;')
+    resolve = "--resolve " + shlex.quote("api.github.com:443:" + api_ip) if api_ip else ""
+    observer = '''stage_observer() {
+    seen='|'
+    while IFS= read -r stage_value; do
+        case "$stage_value" in STAGE_LIST) ;; *) continue;; esac
+        case "$seen" in *"|$stage_value|"*) continue;; esac
+        seen="$seen$stage_value|"
+        case "$stage_value" in
+STAGE_CASES
+        esac | /usr/bin/curl --disable --silent --proto '=https' --connect-timeout 3 --max-time 8 --request POST RESOLVE \\
+            --header "@$directory/arrival.headers" --header 'Content-Type: application/json' \\
+            --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' \\
+            --data-binary @- --output /dev/null FIXED_URL >/dev/null 2>&1 || :
+    done
+}
+'''.replace('STAGE_LIST', '|'.join(STAGES)).replace('STAGE_CASES', '\n'.join(cases)).replace('RESOLVE', resolve).replace('FIXED_URL', shlex.quote(URL))
+    return (header + SHELL_STAGE + '\n' + observer + start + '\n'
+            'exec 4>&1\n{\nexec 3>&1 1>&4\n' + observed + '} | stage_observer\nelse\n' + body + 'fi\n')

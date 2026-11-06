@@ -15,6 +15,66 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def test_observed_cli_exposes_entry_and_imports_without_launching_collect_work(self):
+        result=subprocess.run(['/bin/sh','-c','exec 3>&1; exec "$1" "$2" collect-observed /invalid BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB',
+                               'fixture',r.sys.executable,str(Path(r.__file__).resolve())],capture_output=True,timeout=15)
+        self.assertEqual(result.returncode,1)
+        self.assertEqual(result.stdout.splitlines(),[b'python_entry',b'imports_done'])
+
+    def test_api_checkpoints_with_a_real_http_exchange(self):
+        import http.server
+        import threading
+        observations=[];received=[]
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_PATCH(self):
+                received.append(r.json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+                raw=b'{"ok":true}'
+                self.send_response(200);self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+            def log_message(self,*_args):pass
+        server=http.server.HTTPServer(('127.0.0.1',0),Handler)
+        thread=threading.Thread(target=server.serve_forever);thread.start()
+        try:
+            url='http://127.0.0.1:'+str(server.server_port)+'/checks'
+            with patch.object(r,'CHECKS',url):
+                result=r.api('PATCH',url,'fixture-token',{'value':'literal'},observe=observations.append)
+            self.assertEqual(result,{'ok':True});self.assertEqual(received,[{'value':'literal'}])
+            self.assertEqual(observations,['request_ready','opener_ready','response_opened','json_done'])
+        finally:server.shutdown();thread.join();server.server_close()
+
+    def test_core_checkpoints_keep_patch_and_get_distinct_after_local_save(self):
+        import http.server
+        import threading
+        config,saved,_=self.followup_fixture();config['context']['after_debug_boot']='begin-nonce-control'
+        observations=[];methods=[];check={}
+        with tempfile.TemporaryDirectory() as temp:
+            directory=Path(temp)
+            outer=self
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def respond(self):
+                    raw=r.json.dumps(check).encode()
+                    self.send_response(200);self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+                def do_PATCH(self):
+                    methods.append('PATCH')
+                    outer.assertTrue((directory/'debug-boot-core.json').exists())
+                    data=r.json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                    check.update(id=config['check_id'],name='Runner recovery 123',head_sha=config['context']['sha'],
+                                 external_id=r.binding(config['context']),app={'id':15368,'slug':'github-actions'},
+                                 details_url='https://github.com/Code-Hex/vz-ci-test/runs/'+str(config['check_id']),
+                                 status='in_progress',conclusion=None,output=data['output'])
+                    self.respond()
+                def do_GET(self):methods.append('GET');self.respond()
+                def log_message(self,*_args):pass
+            server=http.server.HTTPServer(('127.0.0.1',0),Handler)
+            thread=threading.Thread(target=server.serve_forever);thread.start()
+            try:
+                with patch.object(r,'CHECKS','http://127.0.0.1:'+str(server.server_port)+'/checks'):
+                    facts=r.publish_debug_core(directory,config,saved['scope']['debug_boot_uuid'],saved['facts'],'fixture-token',observe=observations.append)
+                self.assertEqual(facts,saved['facts']);self.assertEqual(methods,['PATCH','GET'])
+                self.assertEqual(observations,['core_saved','patch_enter','patch_request_ready','patch_opener_ready',
+                    'patch_response_opened','patch_json_done','patch_return','get_enter','get_request_ready','get_opener_ready',
+                    'get_response_opened','get_json_done','get_return','core_ack'])
+            finally:server.shutdown();thread.join();server.server_close()
+
     def test_begin_control_mode_is_closed_and_never_claims_panic_success(self):
         ctx={'actions':'true','repo':r.REPO,'ref':'refs/heads/main','event':'workflow_dispatch',
              'runner_environment':'github-hosted','run_id':'123','attempt':'1','sha':'a'*40,'trigger':'reboot-quick',

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """Normal-reboot proof through a second job's sealed check-run credential."""
+import os
+import sys
+if len(sys.argv)==4 and sys.argv[1]=='collect-observed':
+    try:
+        os.set_blocking(3,False)
+        os.write(3,b'python_entry\n')
+    except OSError:
+        pass
 import base64
 import hashlib
 import recovery_reports
@@ -17,7 +25,6 @@ import recovery_netdump
 import recovery_netdump_capture
 import json
 import math
-import os
 from pathlib import Path
 import plistlib
 import re
@@ -26,12 +33,14 @@ import selectors
 import stat
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+
+if len(sys.argv)==4 and sys.argv[1]=='collect-observed':
+    recovery_arrival.pipe_stage('imports_done')
 
 REPO = "Code-Hex/vz-ci-test"
 KERNEL_UUID = "87453B1D-A163-31FA-B33B-0FB4BE78E6E8"
@@ -489,7 +498,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def api(method, url, token, payload=None, timeout=10):
+def api(method, url, token, payload=None, timeout=10, *, observe=None):
     valid = (url == CHECKS or re.fullmatch(re.escape(CHECKS) + r"/[1-9][0-9]*", url) or
              re.fullmatch(re.escape(API) + r"/commits/[0-9a-f]{40}/check-runs\?filter=all&per_page=100", url))
     if not valid:
@@ -499,8 +508,14 @@ def api(method, url, token, payload=None, timeout=10):
                                  headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
                                           "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28",
                                           "User-Agent": "vz-recovery-smoke"})
-    with urllib.request.build_opener(NoRedirect).open(req, timeout=timeout) as response:
-        return json.load(response)
+    if observe is not None: observe('request_ready')
+    opener=urllib.request.build_opener(NoRedirect)
+    if observe is not None: observe('opener_ready')
+    with opener.open(req, timeout=timeout) as response:
+        if observe is not None: observe('response_opened')
+        result=json.load(response)
+        if observe is not None: observe('json_done')
+        return result
 
 
 def list_check(ctx, token):
@@ -1577,7 +1592,7 @@ def panic_capture(directory, config, current, deadline):
     raise recovery_reports.NoReport("report capture timeout")
 
 
-def publish_debug_core(directory, config, current, facts, token):
+def publish_debug_core(directory, config, current, facts, token, *, observe=None):
     require_root_writer(directory, config)
     scope = {"marker": debug_boot_marker(config), "current_boot_uuid": current}
     path = directory / "debug-boot-core.json"
@@ -1591,6 +1606,7 @@ def publish_debug_core(directory, config, current, facts, token):
         sync_directory(directory)
     if facts.get("current_boot_uuid") != current:
         raise ValueError("boot core observation mismatch")
+    if observe is not None: observe('core_saved')
     ctx = config["context"]
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "boot_core", "binding": binding(ctx),
                           "nonce": config["nonce"], "baseline_boot_uuid": config["baseline"], "current_boot_uuid": current,
@@ -1598,13 +1614,21 @@ def publish_debug_core(directory, config, current, facts, token):
                           "debug_boot": True, "debug_source": ctx["debug_source"], "after_debug_boot": ctx.get("after_debug_boot", "none"), "debug_boot_facts": facts})
     output = {"title": "Boot core recovered", "summary": summary, "text": ""}
     url = CHECKS + "/" + str(config["check_id"])
-    api("PATCH", url, token, {"status": "in_progress", "output": output})
-    check = api("GET", url, token)
+    if observe is None:
+        api("PATCH", url, token, {"status": "in_progress", "output": output})
+        check = api("GET", url, token)
+    else:
+        observe('patch_enter')
+        api("PATCH",url,token,{"status":"in_progress","output":output},observe=lambda event:observe('patch_'+event))
+        observe('patch_return');observe('get_enter')
+        check=api("GET",url,token,observe=lambda event:observe('get_'+event))
+        observe('get_return')
     verified_summary(check, config)
     actual = check.get("output", {})
     if (check.get("status") != "in_progress" or check.get("conclusion") is not None or
             actual.get("title") != output["title"] or actual.get("summary") != summary or actual.get("text") not in (None, "")):
         raise ValueError("boot core acknowledgement mismatch")
+    if observe is not None: observe('core_ack')
     return facts
 
 
@@ -2324,14 +2348,27 @@ def publish_kernel_sample(directory, config, current, sampler, facts, token, dea
     return result
 
 
-def collect(directory):
+def collect(directory, *, observed_boot=None):
+    observe=None
+    if observed_boot is not None:
+        if type(observed_boot) is not str or not recovery_panic_control.UUID.fullmatch(observed_boot):
+            raise ValueError('collector observer boot invalid')
+        observe=recovery_arrival.pipe_stage
     config = load_config(directory)
+    if observe is not None:
+        if config['context'].get('after_debug_boot')!='begin-nonce-control':
+            raise ValueError('collector observer mode invalid')
+        observe('config_loaded')
     marker_core_preexisting = bootmarker_mode(config["context"]) and (directory / "debug-boot-core.json").exists()
     if (directory / "completed.json").exists():
         return
     if netdump_capture(config['context']) and any((directory / name).exists() for name in ('panic-followup-debug.json', 'capture-handoff-started.json')):
         return
     current = boot_uuid()
+    if observe is not None:
+        if current.upper()!=observed_boot.upper() or current.upper()==config['baseline'].upper():
+            raise ValueError('collector observer boot mismatch')
+        observe('boot_uuid_done')
     if panic_followup(config["context"]) and (directory / "panic-followup-debug.json").exists():
         if (panic_control_kind(config['context']) == 'dtrace-begin-v1' and
                 not (directory / 'panic-control' / 'launch-attempt.json').exists()):
@@ -2356,6 +2393,7 @@ def collect(directory):
         argument_profiles = postboot_argument_profiles(directory, config, current)
         paniclog_control = postboot_paniclog_control(directory, config, current)
     if reboot_observed(config["baseline"], current) and config.get("debug_boot", False):
+        if observe is not None: observe('finish_before')
         try:
             if config["context"]["debug_source"] == "bootplist":
                 debug_facts = recovery_bootplist.finish(directory, debug_boot_marker(config), private_write, sync_directory,
@@ -2378,6 +2416,7 @@ def collect(directory):
                                     "debugger_count": None, "debugger_inventory_status": "unavailable",
                                     "network_inventory_status": "unavailable", "virtio_network_classes": [],
                                     "nic_inventory_status": "unsupported", "kernel_debug_state": {}})
+        if observe is not None: observe('finish_after')
         if argument_profiles is not None:
             debug_facts["boot_argument_profiles"] = argument_profiles
         if paniclog_control is not None:
@@ -2418,7 +2457,10 @@ def collect(directory):
     deadline = time.monotonic() + 180
     if config.get("debug_boot", False):
         try:
-            debug_facts = dict(publish_debug_core(directory, config, current, debug_facts, token))
+            if observe is None:
+                debug_facts = dict(publish_debug_core(directory, config, current, debug_facts, token))
+            else:
+                debug_facts = dict(publish_debug_core(directory, config, current, debug_facts, token,observe=observe))
         except (OSError, ValueError, urllib.error.URLError):
             return
         if panic_followup(config["context"]):
@@ -2777,6 +2819,8 @@ def main():
          "debug-request-root": debug_request_root, "quick-execute-root": quick_execute_root}[op](json.load(sys.stdin))
     elif op == 'runtime-watch' and len(sys.argv) == 3:
         runtime_watch(Path(sys.argv[2]))
+    elif op == 'collect-observed' and len(sys.argv) == 4:
+        collect(Path(sys.argv[2]),observed_boot=sys.argv[3])
     elif op == "collect" and len(sys.argv) == 3:
         collect(Path(sys.argv[2]))
     else:
