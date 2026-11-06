@@ -48,14 +48,19 @@ def flags(raw, *, allow_debug=False):
     return data['Kernel Flags']
 
 
-def stage_content(raw, debug_mask=0x2000, *, nvram_paniclog=None, netdump_settings=None):
+def stage_content(raw, debug_mask=0x2000, *, nvram_paniclog=None, netdump_settings=None, boot_marker_nonce=None):
     if netdump_settings is not None and type(netdump_settings) is not NetdumpSettings:
         raise ValueError('netdump_settings_invalid')
     masks = (0x2000, 0x102000) if netdump_settings is None else (DEBUG_MASK,)
     if type(debug_mask) is not int or debug_mask not in masks: raise ValueError('debug_mask_invalid')
     if nvram_paniclog is not None and (type(nvram_paniclog) is not int or nvram_paniclog != 0 or debug_mask != 0x102000):
         raise ValueError('nvram_paniclog_invalid')
+    if boot_marker_nonce is not None:
+        boot._bootmarker_nonce(boot_marker_nonce)
+        if debug_mask!=0x102000 or nvram_paniclog is not None or netdump_settings is not None: raise ValueError('boot_marker_mode_invalid')
     original = flags(raw)
+    if boot_marker_nonce is not None and any(t.partition('=')[0].lstrip('-')=='vz_ci_nonce' for t in original.split()):
+        raise ValueError('existing_boot_marker')
     if nvram_paniclog == 0 and any(token.partition('=')[0].lstrip('-') == 'nvram_paniclog' for token in original.split()):
         raise ValueError('existing_nvram_paniclog')
     data = plistlib.loads(raw)
@@ -64,6 +69,10 @@ def stage_content(raw, debug_mask=0x2000, *, nvram_paniclog=None, netdump_settin
         data['Kernel Flags'] += ' ' + ' '.join(netdump_settings.tokens())
     if nvram_paniclog == 0:
         data['Kernel Flags'] += ' nvram_paniclog=0'
+    if boot_marker_nonce is not None:
+        data['Kernel Flags'] += ' '+boot._bootmarker_nonce(boot_marker_nonce)
+        if len(data['Kernel Flags'].encode('ascii'))>255 or any(ord(c)<32 or ord(c)>126 for c in data['Kernel Flags']):
+            raise ValueError('boot_marker_arguments_invalid')
     boot.text(data['Kernel Flags'])
     return plistlib.dumps(data, fmt=plistlib.FMT_BINARY if raw.startswith(b'bplist00') else plistlib.FMT_XML, sort_keys=False)
 
@@ -292,7 +301,14 @@ def _record(directory, name, value, save, sync):
 def _load(directory, marker, data_path, preboot_path):
     validate_marker(marker)
     manifest = json.loads((directory / 'bootplist-manifest.json').read_text())
-    if (not isinstance(manifest, dict) or set(manifest) != {'marker', 'debug_mask', 'nvram_paniclog', 'netdump_settings', 'paths', 'scope', 'files'} or
+    keys={'marker','debug_mask','nvram_paniclog','netdump_settings','paths','scope','files'}
+    if type(manifest) is not dict: raise ValueError('manifest_invalid')
+    nonce=None
+    if 'boot_marker_nonce' in manifest:
+        keys.add('boot_marker_nonce'); nonce=manifest['boot_marker_nonce']
+        boot._bootmarker_nonce(nonce)
+        if nonce!=marker['nonce']: raise ValueError('manifest_invalid')
+    if (set(manifest) != keys or
             manifest.get('marker') != marker or
             manifest.get('paths') != {'data': str(data_path), 'preboot': str(preboot_path)} or
             type(manifest.get('debug_mask')) is not int or
@@ -309,10 +325,10 @@ def _load(directory, marker, data_path, preboot_path):
         staged = (directory / (name + '.staged')).read_bytes()
         if hashlib.sha256(original).hexdigest() != item.get('original_sha256') or hashlib.sha256(staged).hexdigest() != item.get('staged_sha256'):
             raise ValueError('backup_invalid')
-        if stage_content(original, manifest['debug_mask'], nvram_paniclog=manifest['nvram_paniclog'], netdump_settings=settings) != staged:
+        if stage_content(original, manifest['debug_mask'], nvram_paniclog=manifest['nvram_paniclog'], netdump_settings=settings, boot_marker_nonce=nonce) != staged:
             raise ValueError('backup_invalid')
         saved[name] = {'original': original, 'staged': staged, 'meta': item['meta']}
-    return saved, manifest['debug_mask'], settings
+    return saved, manifest['debug_mask'], settings, nonce
 
 
 def _pending(directory, prefix, marker, saved, *, require_done=False):
@@ -358,8 +374,9 @@ def _current_boot_uuid():
     return subprocess.check_output(['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'], timeout=10).decode('ascii').strip()
 
 
-def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner_uid=0, writer=write_if_expected, scope=None, boot_uuid=_current_boot_uuid, debug_mask=0x2000, nvram_paniclog=None, netdump_settings=None):
+def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner_uid=0, writer=write_if_expected, scope=None, boot_uuid=_current_boot_uuid, debug_mask=0x2000, nvram_paniclog=None, netdump_settings=None, boot_marker_nonce=None):
     validate_marker(marker)
+    if boot_marker_nonce is not None and boot_marker_nonce!=marker['nonce']: raise ValueError('boot_marker_scope_invalid')
     directory = Path(directory); data_path = Path(data_path); preboot_path = Path(preboot_path)
     if (directory / 'bootplist-manifest.json').exists(): raise ValueError('already_staged')
     paths = {'data': data_path, 'preboot': preboot_path}
@@ -371,10 +388,11 @@ def stage_files(directory, marker, data_path, preboot_path, save, sync, *, owner
         check = metadata_facts(path, originals[name])
         check['checks']['uid_root'] = originals[name]['uid'] == owner_uid
         if not metadata_allowed(check): raise ValueError('metadata_unsupported')
-    desired = {name: stage_content(item['raw'], debug_mask, nvram_paniclog=nvram_paniclog, netdump_settings=netdump_settings) for name, item in originals.items()}
+    desired = {name: stage_content(item['raw'], debug_mask, nvram_paniclog=nvram_paniclog, netdump_settings=netdump_settings, boot_marker_nonce=boot_marker_nonce) for name, item in originals.items()}
     manifest = {'marker': marker, 'debug_mask': debug_mask, 'nvram_paniclog': nvram_paniclog,
                 'netdump_settings': None if netdump_settings is None else netdump_settings.record(),
                 'paths': {name: str(path) for name, path in paths.items()}, 'scope': scope, 'files': {}}
+    if boot_marker_nonce is not None: manifest['boot_marker_nonce']=boot_marker_nonce
     for name in paths:
         original = originals[name]
         save(directory / (name + '.original'), original['raw'])
@@ -432,7 +450,7 @@ def rollback_files(directory, marker, data_path, preboot_path, save, sync, *, cu
             current_boot_uuid.upper() != marker['baseline'].upper()):
         raise ValueError('rollback_boot_mismatch')
     directory = Path(directory); data_path = Path(data_path); preboot_path = Path(preboot_path)
-    saved, _, _ = _load(directory, marker, data_path, preboot_path)
+    saved, _, _, _ = _load(directory, marker, data_path, preboot_path)
     _pending(directory, 'stage', marker, saved); _pending(directory, 'restore', marker, saved)
     paths = {'data': data_path, 'preboot': preboot_path}
     current = {name: snapshot(path) for name, path in paths.items()}
@@ -453,7 +471,7 @@ def finish_files(directory, marker, data_path, preboot_path, current_boot_uuid, 
         raise ValueError('boot_invalid')
     if (active_status not in ('observed', 'unavailable', 'invalid') or (active_status != 'observed' and active_mask is not None) or
             (active_mask is not None and (type(active_mask) is not int or not 0 <= active_mask <= 0xffffffff))): raise ValueError('active_invalid')
-    saved, expected_mask, _ = _load(directory, marker, data_path, preboot_path)
+    saved, expected_mask, _, _ = _load(directory, marker, data_path, preboot_path)
     if active_status == 'observed':
         active_status = 'observed_debug' if active_mask == expected_mask else 'observed_no_debug'
     _pending(directory, 'stage', marker, saved, require_done=True); _pending(directory, 'restore', marker, saved)
@@ -501,10 +519,10 @@ def finish_files(directory, marker, data_path, preboot_path, current_boot_uuid, 
     return result
 
 
-def stage(directory, marker, save, sync, *, debug_mask=0x2000, nvram_paniclog=None, netdump_settings=None):
+def stage(directory, marker, save, sync, *, debug_mask=0x2000, nvram_paniclog=None, netdump_settings=None, boot_marker_nonce=None):
     data, preboot, group, system = resolve_paths()
     result = stage_files(directory, marker, data, preboot, save, sync, scope={'group': group, 'system': system},
-                         debug_mask=debug_mask, nvram_paniclog=nvram_paniclog, netdump_settings=netdump_settings)
+                         debug_mask=debug_mask, nvram_paniclog=nvram_paniclog, netdump_settings=netdump_settings, boot_marker_nonce=boot_marker_nonce)
     return result
 
 
@@ -595,9 +613,72 @@ def _netdump_capture(directory, marker, current, settings, baseline, save, sync)
         return invalid
 
 
+def _marker_json(path):
+    with path.open('rb') as stream: raw=stream.read(8193)
+    if len(raw)>8192: raise ValueError('boot_marker_cache_invalid')
+    return json.loads(raw)
+
+
+def _checked_marker_capture(value, scope, nonce, baseline):
+    if type(value) is not dict or set(value)!={'scope','active_mask','active_status','control'} or value['scope']!=scope:
+        raise ValueError('boot_marker_cache_invalid')
+    mask,status=value['active_mask'],value['active_status']
+    if (status not in ('observed','invalid','unavailable') or
+            (mask is not None and (type(mask) is not int or not 0<=mask<=0xffffffff)) or
+            (status!='observed' and mask is not None)):
+        raise ValueError('boot_marker_cache_invalid')
+    control=boot.checked_bootmarker_control(value['control'],nonce,baseline)
+    if ((control['status']=='observed' and (status!='observed' or mask!=0x102000)) or
+            (control['status'] in ('unavailable','uncertain') and status!='unavailable')):
+        raise ValueError('boot_marker_cache_invalid')
+    return value
+
+
+def _bootmarker_capture(directory, marker, current, nonce, baseline, save, sync):
+    def negative(status):
+        return {'active_mask':None,'active_status':'invalid' if status=='invalid' else 'unavailable','control':{'status':status}}
+    try:
+        scope={'marker':marker,'current_boot_uuid':current.upper(),'mode':'bootargs-marker'}
+        started=directory/'boot-marker-started.json'; captured=directory/'boot-marker-observation.json'
+        if started.exists() or captured.exists():
+            try:
+                if _marker_json(started)!=scope: return negative('invalid')
+                if not captured.exists(): return negative('uncertain')
+                return _checked_marker_capture(_marker_json(captured),scope,nonce,baseline)
+            except (ValueError,TypeError,KeyError): return negative('invalid')
+        if any((directory/name).exists() for name in ('debug-boot-core.json','bootplist-observation.json','bootplist-restored.json','data.restore-pending.json','preboot.restore-pending.json','data.restore-done.json','preboot.restore-done.json')):
+            return negative('uncertain')
+        _record(directory,started.name,scope,save,sync)
+        mask,status,control=None,'unavailable',{'status':'unavailable'}
+        try:
+            raw=boot.capture(['/usr/sbin/sysctl','-n','kern.bootargs'],1025,timeout=8)
+            mask=boot.debug_mask(boot.decode_bootmarker_stdout(raw)); status='observed'
+            try: control=boot.bootmarker_control(raw,nonce,baseline)
+            except ValueError: control={'status':'invalid'}
+        except ValueError:
+            mask,status,control=None,'invalid',{'status':'invalid'}
+        except (OSError,subprocess.SubprocessError): pass
+        value=_checked_marker_capture({'scope':scope,'active_mask':mask,'active_status':status,'control':control},scope,nonce,baseline)
+        _record(directory,captured.name,value,save,sync)
+        return value
+    except (OSError,ValueError,TypeError,KeyError,subprocess.SubprocessError):
+        return negative('uncertain')
+
+
 def finish(directory, marker, save, sync, *, current_boot_uuid, baseline_boot_argument_profile=None):
     data, preboot = _production_paths(directory, marker)
-    _, _, settings = _load(directory, marker, data, preboot)
+    _, _, settings, nonce = _load(directory, marker, data, preboot)
+    if nonce is not None:
+        if (type(current_boot_uuid) is not str or not UUID_RE.fullmatch(current_boot_uuid) or
+                current_boot_uuid.upper()==marker['baseline'].upper()): raise ValueError('boot_invalid')
+        capture=_bootmarker_capture(Path(directory),marker,current_boot_uuid,nonce,baseline_boot_argument_profile,save,sync)
+        result=finish_files(directory,marker,data,preboot,current_boot_uuid,capture['active_mask'],save,sync,active_status=capture['active_status'])
+        status=capture['active_status']
+        if status=='observed': status='observed_debug' if capture['active_mask']==0x102000 else 'observed_no_debug'
+        same_capture=result['active_debug_mask']==capture['active_mask'] and result['active_bootargs_status']==status
+        mismatch='uncertain' if result['active_bootargs_status']=='unavailable' else 'invalid'
+        result['boot_marker_control']=(capture['control'] if capture['control']['status']!='observed' or same_capture else {'status':mismatch})
+        return result
     if settings is not None:
         if (not isinstance(current_boot_uuid, str) or not UUID_RE.fullmatch(current_boot_uuid) or
                 current_boot_uuid.upper() == marker['baseline'].upper()): raise ValueError('boot_invalid')

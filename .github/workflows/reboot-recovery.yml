@@ -53,6 +53,7 @@ on:
           - panic-nonce-usdt-nvram-off
           - panic-nonce-syscall
           - kernel-state
+          - bootargs-marker
           - netdump-prime
           - panic-nonce-netdump
         default: none

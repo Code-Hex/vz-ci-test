@@ -15,6 +15,258 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def test_bootmarker_mode_is_nonfaulting_and_closed(self):
+        config, _saved, _b3 = self.syscall_fixture()
+        ctx = {**config['context'], 'after_debug_boot': 'bootargs-marker'}
+        self.assertTrue(r.valid_context(ctx, 'Darwin', 'x86_64', r.KERNEL_UUID))
+        self.assertEqual(r.expected_debug_mask(ctx), 0x102000)
+        self.assertFalse(r.panic_followup(ctx)); self.assertFalse(r.panic_mode(ctx))
+        self.assertFalse(r.report_required(ctx)); self.assertFalse(r.certificate_required(ctx))
+        self.assertFalse(r.kernel_state_mode(ctx)); self.assertIsNone(r.netdump_mode(ctx))
+        for change in ({'trigger':'reboot'}, {'debug_source':'nvram'}, {'debug_boot':False},
+                       {'after_debug_boot':'bootargs-marker-extra'}):
+            self.assertFalse(r.valid_context({**ctx, **change}, 'Darwin', 'x86_64', r.KERNEL_UUID))
+
+    def bootmarker_fixture(self):
+        config, saved, _ = self.syscall_fixture()
+        config['context']['after_debug_boot'] = 'bootargs-marker'
+        config['cert_fingerprint'] = ''
+        config['check_id'] = 9
+        config['debug_boot'] = True
+        baseline = r.recovery_bootargs.boot_argument_profile(b'preempt=10')
+        config['initial_boot_argument_profile'] = baseline
+        token = 'vz_ci_nonce=' + config['nonce']
+        raw = ('preempt=10 debug=0x102000 ' + token).encode()
+        control = {'status':'observed', 'marker_sha256':r.hashlib.sha256(token.encode()).hexdigest(),
+                   'active_sha256':r.hashlib.sha256(raw).hexdigest(), 'active_byte_count':len(raw),
+                   'full_profile':r.recovery_bootargs.boot_argument_profile(raw),
+                   'remaining_profile':r.recovery_bootargs.boot_argument_profile(b'preempt=10 debug=0x102000')}
+        facts = {**saved['facts'], 'boot_marker_control':control,
+                 'boot_marker_source_identity':r.debug_source_identity()}
+        return config, facts, saved['scope']['debug_boot_uuid']
+
+    def test_bootmarker_controller_requires_independent_baseline_and_all_proofs(self):
+        config, facts, current = self.bootmarker_fixture(); ctx = config['context']
+        pending = {'nonce':config['nonce'], 'baseline_boot_uuid':config['baseline'], 'cert_fingerprint':'',
+                   'initial_boot_argument_profile':config['initial_boot_argument_profile']}
+        data = {'protocol':'vz-recovery-v1','phase':'boot_observed','binding':r.binding(ctx),
+                'nonce':config['nonce'],'baseline_boot_uuid':config['baseline'],'current_boot_uuid':current,
+                'trigger':'reboot-quick','debug_boot':True,'debug_source':'bootplist',
+                'after_debug_boot':'bootargs-marker','cert_fingerprint':'','debug_boot_facts':facts,'capture_state':'boot_only'}
+        self.assertTrue(r.boot_proof_matches(data,pending,ctx))
+        self.assertFalse(r.panic_envelope_matches(data,'',pending,ctx))
+        for change in ({'boot_marker_control':{'status':'invalid'}}, {'boot_marker_control':{'status':'uncertain'}},
+                       {'boot_marker_control':{**facts['boot_marker_control'],'extra':1}},
+                       {'boot_marker_control':{**facts['boot_marker_control'],'active_byte_count':True}},
+                       {'boot_marker_source_identity':'0'*64}, {'bootplist_restored':False},
+                       {'bootplist_restore':{**facts['bootplist_restore'],'data':{'bytes':1,'metadata':True,'timestamps':True}}},
+                       {'kernel_debug_state':{'debug_boot_arg':{'status':'observed','value':0}}},
+                       {'optional_inventory_status':'uncertain'}):
+            self.assertFalse(r.boot_proof_matches({**data,'debug_boot_facts':{**facts,**change}},pending,ctx))
+        for changed in ({k:v for k,v in pending.items() if k!='initial_boot_argument_profile'},
+                        {**pending,'initial_boot_argument_profile':r.recovery_bootargs.boot_argument_profile(b'foreign=1')},
+                        {**pending,'nonce':'b'*64}):
+            self.assertFalse(r.boot_proof_matches(data,changed,ctx))
+        self.assertFalse(r.boot_proof_matches(data,pending,{**ctx,'after_debug_boot':'kernel-state'}))
+        armed = {**data, 'phase':'armed', 'initial_boot_argument_profile':pending['initial_boot_argument_profile']}
+        self.assertTrue(r.armed_matches(armed,pending,ctx))
+        self.assertFalse(r.armed_matches({**armed,'initial_boot_argument_profile':{'status':'unavailable'}},pending,ctx))
+
+    def test_bootmarker_baseline_uses_one_strict_read_and_rejects_invalid(self):
+        ctx = {'after_debug_boot':'bootargs-marker'}; calls=[]
+        def read(argv, limit, **kwargs):
+            calls.append((argv,limit,kwargs)); return b'preempt=10\n'
+        def forbidden(*args,**kwargs): self.fail('legacy profile read used')
+        with patch.object(r.recovery_bootargs,'capture',read), patch.object(r,'observe_boot_argument_profile',forbidden):
+            self.assertEqual(r.observe_initial_boot_arguments(ctx),r.recovery_bootargs.boot_argument_profile(b'preempt=10'))
+        self.assertEqual(len(calls),1)
+        self.assertEqual(calls[0][0],['/usr/sbin/sysctl','-n','kern.bootargs'])
+        for raw in (b'preempt=10',b'preempt=10\n\n',b'preempt=10\r\n',b'debug=0x2000\n',b'vz_ci_nonce='+b'a'*64+b'\n'):
+            with patch.object(r.recovery_bootargs,'capture',lambda *args,**kwargs:raw):
+                with self.assertRaises(ValueError): r.observe_initial_boot_arguments(ctx)
+
+    def test_bootmarker_collect_observes_only_critical_once_and_never_fires(self):
+        for case in ('positive','mask_zero','marker_invalid','restore_failed','finish_error','budget','save_started','save_result','sync_result','restore_recovers','completion_save'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as tmp:
+                directory=Path(tmp);config,facts,current=self.bootmarker_fixture(); reads=[];reports=[];finishes=[];completion_patches=[]
+                facts.pop('optional_inventory_status',None);facts.pop('kernel_debug_state',None)
+                if case=='marker_invalid': facts['boot_marker_control']={'status':'invalid'}
+                if case=='restore_failed': facts['bootplist_restored']=False
+                r.private_write(directory/'token',b'token')
+                r.private_write(directory/'ready.json',r.json.dumps({'baseline':config['baseline'],'nonce':config['nonce'],'preboot_patch':True}).encode())
+                original_write=r.private_write; original_sync=r.sync_directory; save_errors=[]; sync_errors=[]
+                def save(path,data):
+                    if not save_errors and (case=='save_started' and path.name=='debug-boot-inventory-started.json' or
+                        case=='save_result' and path.name=='debug-boot-inventory-result.json'):
+                        save_errors.append(path.name)
+                        raise OSError('synthetic persistence failure')
+                    original_write(path,data)
+                def sync(path):
+                    if case=='sync_result' and not sync_errors and (directory/'debug-boot-inventory-result.json').exists():
+                        sync_errors.append(True)
+                        raise OSError('synthetic result sync failure')
+                    original_sync(path)
+                def finish(*args,**kwargs):
+                    finishes.append(True)
+                    if case=='finish_error' and len(finishes)==1: raise OSError('synthetic finish unavailable')
+                    self.assertEqual(kwargs['baseline_boot_argument_profile'],config['initial_boot_argument_profile'])
+                    value=copy.deepcopy(facts)
+                    if case=='restore_recovers' and len(finishes)==1: value['bootplist_restored']=False
+                    return value
+                def core(_d,_c,_b,value,_t):
+                    path=directory/'debug-boot-core.json'
+                    if not path.exists(): original_write(path,r.json.dumps({'facts':value}).encode())
+                    return r.json.loads(path.read_text())['facts']
+                def read(argv,limit,**kwargs):
+                    self.assertEqual(argv,['/usr/sbin/dtrace','-q','-x','errtags','-n',r.recovery_bootargs.kernel_field_program('debug_boot_arg')])
+                    self.assertEqual(kwargs,{'timeout':30,'capture_stderr':True});reads.append(argv)
+                    return ('VZKSTATE v1 debug_boot_arg u32 '+('0' if case=='mask_zero' else str(0x102000))+'\n\n').encode()
+                def forbidden(*args,**kwargs): self.fail('nonfaulting marker mode entered a panic or full inventory path')
+                original_complete=r.complete_recovery
+                def complete(_d,_c,_b,_t,output,successful,deadline):
+                    reports.append((output,successful,deadline))
+                    if case=='completion_save':
+                        expired=[]
+                        def completion_write(path,data):
+                            if path.name=='completed.json':
+                                expired.append(True)
+                                raise OSError('synthetic completion persistence failure')
+                            original_write(path,data)
+                        def completed_patch(method,_url,_token,payload,**kwargs):
+                            self.assertEqual(method,'PATCH');completion_patches.append(payload['conclusion'])
+                            return {}
+                        with patch.object(r,'api',completed_patch),patch.object(r,'private_write',completion_write), \
+                             patch.object(r.time,'monotonic',lambda:deadline+1 if expired else deadline-1), \
+                             patch.object(r.time,'sleep',lambda _:None):
+                            original_complete(_d,_c,_b,_t,output,successful,deadline)
+                # One clock value for the collect deadline, then an exhausted budget at the read boundary.
+                times=iter((100,260,400,560))
+                with contextlib.ExitStack() as stack:
+                    for owner,name,value in ((r,'load_config',lambda _:config),(r,'boot_uuid',lambda:current),
+                        (r.recovery_bootplist,'finish',finish),(r,'publish_debug_core',core),(r,'private_write',save),
+                        (r.recovery_bootargs,'capture',read),(r,'complete_recovery',complete),(r,'sync_directory',sync),
+                        (r,'followup_start',forbidden),(r,'start_runtime_watch',forbidden),
+                        (r,'postboot_argument_profiles',forbidden),(r.recovery_bootargs.MacPlatform,'inventory',forbidden),
+                        (r.recovery_panic_control,'build',forbidden),(r.recovery_panic_control,'prepare',forbidden),
+                        (r.recovery_panic_control,'fire',forbidden),(r.recovery_reboot_panic,'build',forbidden),
+                        (r.recovery_reboot_panic,'prepare',forbidden),(r.recovery_reboot_panic,'fire',forbidden)):
+                        stack.enter_context(patch.object(owner,name,value))
+                    if case=='budget': stack.enter_context(patch.object(r.time,'monotonic',lambda:next(times)))
+                    r.collect(directory)
+                    first_reads=len(reads)
+                    r.collect(directory)
+                self.assertEqual(len(reads),first_reads)
+                self.assertEqual(first_reads,0 if case in ('restore_failed','restore_recovers','finish_error','budget','save_started') else 1)
+                self.assertEqual([item[1] for item in reports],[case in ('positive','completion_save')])
+                self.assertEqual(len(finishes),2)
+                self.assertEqual(completion_patches,['success'] if case=='completion_save' else [])
+                for output,_successful,_deadline in reports:
+                    data=r.json.loads(output['summary'])
+                    self.assertEqual(data['capture_state'],'boot_only');self.assertNotIn('text',output)
+                    self.assertNotIn('panic_trigger',data)
+                    if case=='finish_error': self.assertEqual(data['debug_boot_facts']['boot_marker_control'],{'status':'unavailable'})
+                    self.assertEqual(output['title'],'Boot marker confirmed' if case in ('positive','completion_save') else 'Boot marker not confirmed')
+                if case=='budget': self.assertEqual(reports[0][2],280)
+
+    def test_bootmarker_b1_preparation_and_arming_preserve_baseline_without_panic_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=Path(tmp);directory=parent/'recovery';config,_facts,_current=self.bootmarker_fixture()
+            helper=parent/'recovery-quick-reboot';helper.write_bytes(b'never executed')
+            outputs=[];reads=[]
+            def api(method,_url,_token,payload=None,**kwargs):
+                self.assertIn(method,('POST','PATCH'));outputs.append(r.json.loads(payload['output']['summary']))
+                return {'id':9}
+            def read(argv,limit,**kwargs):
+                self.assertEqual(argv,['/usr/sbin/sysctl','-n','kern.bootargs']);reads.append(argv)
+                return b'preempt=10\n'
+            def forbidden(*args,**kwargs): self.fail('nonfaulting preparation entered panic path')
+            with contextlib.ExitStack() as stack,contextlib.redirect_stdout(io.StringIO()):
+                for owner,name,value in ((r,'root_only',lambda:None),(r,'require_context',lambda *_:None),
+                    (r,'root_dir',lambda _:directory),(r,'boot_uuid',lambda:config['baseline']),
+                    (r,'api',api),(r,'diagnostic_sysctls',lambda:{}),(r.recovery_bootargs,'capture',read),
+                    (r.recovery_panic_control,'build',forbidden),(r.recovery_reboot_panic,'build',forbidden),
+                    (r.recovery_nvram_panic,'read_panic_info',forbidden),(r.recovery_reports,'encrypt_bundle',forbidden)):
+                    stack.enter_context(patch.object(owner,name,value))
+                r.prepare_root({'context':config['context'],'token':'token','quick_helper':str(helper),'report_cert':'ignored'})
+                actual=r.json.loads((directory/'config.json').read_text())
+                self.assertEqual(actual['initial_boot_argument_profile'],config['initial_boot_argument_profile'])
+                self.assertEqual(actual['cert_fingerprint'],'');self.assertFalse((directory/'report-cert.pem').exists())
+                r.private_write(directory/'token',b'token')
+                with patch.object(r,'load_config',lambda _:actual): r.collect(directory)
+            self.assertEqual(len(reads),1)
+            self.assertEqual([item['phase'] for item in outputs],['public_key','armed'])
+            for output in outputs:
+                self.assertEqual(output['initial_boot_argument_profile'],config['initial_boot_argument_profile'])
+            self.assertFalse((directory/'panic-control').exists());self.assertFalse((directory/'panic-followup-baseline.json').exists())
+
+    def test_bootmarker_controller_pins_b1_profile_before_accepting_b2(self):
+        for case in ('positive','changed_public','changed_b2','missing_public'):
+            with self.subTest(case=case):
+                config,facts,current=self.bootmarker_fixture();ctx=config['context']
+                public={'protocol':'vz-recovery-v1','phase':'public_key','binding':r.binding(ctx),
+                        'nonce':config['nonce'],'baseline_boot_uuid':config['baseline'],'public_key':'public',
+                        'cert_fingerprint':'','debug_boot':True,'debug_source':'bootplist',
+                        'after_debug_boot':'bootargs-marker','trigger':'reboot-quick',
+                        'initial_boot_argument_profile':config['initial_boot_argument_profile']}
+                foreign=r.recovery_bootargs.boot_argument_profile(b'foreign=1')
+                if case=='missing_public': public.pop('initial_boot_argument_profile')
+                final={**public,'phase':'boot_observed','current_boot_uuid':current,'debug_boot_facts':facts,'capture_state':'boot_only'}
+                if case=='changed_b2':
+                    # A B2 self-reported baseline cannot replace the pinned B1 profile.
+                    final['initial_boot_argument_profile']=foreign
+                    facts['boot_marker_control']['remaining_profile']={**foreign,'debug_mask':0x102000}
+                sequence=[{'id':9,'status':'in_progress','output':{'summary':r.json.dumps(public)}}]
+                if case=='changed_public': sequence.append({'id':9,'status':'in_progress','output':{'summary':r.json.dumps({**public,'initial_boot_argument_profile':foreign})}})
+                sequence.append({'id':9,'status':'completed','conclusion':'success','output':{'summary':r.json.dumps(final)}})
+                checks=iter(sequence);writes=[]
+                def api(method,_url,_token,payload=None,**kwargs):
+                    if method=='GET': return {'status':'completed'}
+                    writes.append(payload);return {}
+                with patch.object(r,'list_check',lambda *_:next(checks)),patch.object(r,'api',api), \
+                     patch.object(r,'encrypt_token',lambda *_:b'sealed'),patch.object(r.time,'sleep',lambda _:None), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    if case=='positive': r.controller(ctx,'token')
+                    else:
+                        with self.assertRaises(ValueError): r.controller(ctx,'token')
+                self.assertEqual(len(writes),0 if case=='missing_public' else 1)
+
+    def test_bootmarker_owner_passes_exact_nonce_and_preserves_quick_intent_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp);config,_facts,_current=self.bootmarker_fixture();calls=[]
+            r.debug_event(directory,config,'request',config['baseline'])
+            def stage(_directory,marker,_save,_sync,**options):
+                self.assertEqual(options,{'debug_mask':0x102000,'nvram_paniclog':None,'netdump_settings':None,'boot_marker_nonce':config['nonce']})
+                raw=r.plistlib.dumps({'Kernel Flags':'preempt=10'})
+                staged=r.recovery_bootplist.stage_content(raw,**options)
+                self.assertEqual(r.plistlib.loads(staged)['Kernel Flags'],'preempt=10 debug=0x102000 vz_ci_nonce='+config['nonce'])
+                calls.append(marker)
+                raise r.recovery_bootplist.WriteUncertain()
+            def forbidden(*args,**kwargs): self.fail('uncertain staging reached reboot or panic')
+            with patch.object(r.recovery_bootplist,'stage',stage),patch.object(r.recovery_bootargs,'csr_allowed',lambda:True), \
+                 patch.object(r,'quick_prepare',forbidden),patch.object(r,'quick_reboot_child',forbidden):
+                r.debug_owner(directory,config,config['baseline'])
+                r.debug_owner(directory,config,config['baseline'])
+            self.assertEqual(calls,[r.debug_boot_marker(config)])
+            for event in ('staged','intent'): r.debug_event(directory,config,event,config['baseline'])
+            r.debug_event(directory,config,'bootplist_staged',config['baseline'],
+                          bootplist_stage={'data':'staged','preboot':'staged','metadata_preserved':True})
+            r.private_write(directory/'token',b'token')
+            ctx=config['context']
+            prepared={'protocol':'vz-recovery-v1','phase':'quick_prepared','binding':r.binding(ctx),
+                      'nonce':config['nonce'],'baseline_boot_uuid':config['baseline'],'trigger':'reboot-quick',
+                      'debug_boot':True,'debug_source':'bootplist','after_debug_boot':'bootargs-marker',
+                      'cert_fingerprint':'','initial_boot_argument_profile':config['initial_boot_argument_profile']}
+            output={}
+            def api(method,_url,_token,payload=None,**kwargs):
+                if method=='PATCH': output.update(payload['output']);return {}
+                return {'id':9,'name':'Runner recovery '+ctx['run_id'],'head_sha':ctx['sha'],'external_id':r.binding(ctx),
+                        'details_url':'https://github.com/Code-Hex/vz-ci-test/runs/9','app':{'id':15368,'slug':'github-actions'},
+                        'status':'in_progress','conclusion':None,'output':output}
+            with patch.object(r,'api',api),patch.object(r,'boot_uuid',lambda:config['baseline']):
+                intent=r.quick_intent_ack(directory,config,prepared)
+            self.assertEqual(intent['initial_boot_argument_profile'],config['initial_boot_argument_profile'])
+            self.assertEqual(intent['phase'],'quick_intent')
+
     def syscall_fixture(self):
         config, saved, b3 = self.followup_fixture()
         config['context'].update(after_debug_boot='panic-nonce-syscall', actions='true', repo=r.REPO,

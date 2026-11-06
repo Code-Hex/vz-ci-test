@@ -22,6 +22,154 @@ def sync(path):
 
 
 class Transaction(unittest.TestCase):
+    def test_bootmarker_derivation_and_old_manifest_variant(self):
+        nonce='b'*64; original=plistlib.dumps({'Kernel Flags':'-v','other':'retained'})
+        staged=core.stage_content(original,0x102000,boot_marker_nonce=nonce)
+        self.assertEqual(plistlib.loads(staged),{'Kernel Flags':'-v debug=0x102000 vz_ci_nonce='+nonce,'other':'retained'})
+        for value in (True,'B'*64,'b'*63,'b'*65):
+            with self.subTest(value=value),self.assertRaises(ValueError): core.stage_content(original,0x102000,boot_marker_nonce=value)
+        for flags in ('vz_ci_nonce=old','-vz_ci_nonce=old','--vz_ci_nonce','vz_ci_nonce =old'):
+            with self.subTest(flags=flags),self.assertRaises(ValueError):
+                core.stage_content(plistlib.dumps({'Kernel Flags':flags}),0x102000,boot_marker_nonce=nonce)
+        with self.assertRaises(ValueError): core.stage_content(original,0x2000,boot_marker_nonce=nonce)
+        with self.assertRaises(ValueError): core.stage_content(original,0x102000,boot_marker_nonce=nonce,nvram_paniclog=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            data,preboot,directory,_,marker=self.fixture(Path(tmp).resolve())
+            core.stage_files(directory,marker,data,preboot,save,sync,owner_uid=os.geteuid())
+            self.assertNotIn('boot_marker_nonce',json.loads((directory/'bootplist-manifest.json').read_text()))
+
+    def test_bootmarker_single_capture_restores_bytes_metadata_and_replays_without_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data,preboot,directory,original,marker=self.fixture(Path(tmp).resolve());calls=[]
+            before={p:core.snapshot(p) for p in (data,preboot)}
+            baseline=core.boot.boot_argument_profile('-v')
+            core.stage_files(directory,marker,data,preboot,save,sync,owner_uid=os.geteuid(),debug_mask=0x102000,boot_marker_nonce=marker['nonce'])
+            self.assertEqual(json.loads((directory/'bootplist-manifest.json').read_text())['boot_marker_nonce'],marker['nonce'])
+            raw=('-v debug=0x102000 vz_ci_nonce='+marker['nonce']+'\n').encode();actual=core.boot.capture
+            def read(argv,limit,timeout):
+                if argv!=['/usr/sbin/sysctl','-n','kern.bootargs']: return actual(argv,limit,timeout)
+                self.assertEqual((argv,limit,timeout),(['/usr/sbin/sysctl','-n','kern.bootargs'],1025,8))
+                self.assertEqual(core.flags(data.read_bytes(),allow_debug=True),raw[:-1].decode())
+                calls.append(1)
+                import sys
+                return actual([sys.executable,'-c','import sys;sys.stdout.buffer.write('+repr(raw)+')'],limit,timeout)
+            with patch.object(core,'_production_paths',return_value=(data,preboot)),patch.object(core.boot,'capture',read):
+                first=core.finish(directory,marker,save,sync,current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',baseline_boot_argument_profile=baseline)
+            self.assertTrue(first['bootplist_restored']);self.assertTrue(core.boot.bootmarker_proven(first['boot_marker_control'],marker['nonce'],baseline))
+            for path in (data,preboot):
+                self.assertEqual(path.read_bytes(),original)
+                after=core.snapshot(path)
+                for key in ('dev','ino','uid','gid','mode','flags','mtime_ns','xattr_count','xattr_sha256'):
+                    self.assertEqual(after[key],before[path][key])
+            with patch.object(core,'_production_paths',return_value=(data,preboot)),patch.object(core.boot,'capture',lambda argv,*a,**k: actual(argv,*a,**k) if argv!=['/usr/sbin/sysctl','-n','kern.bootargs'] else self.fail('repeat read')):
+                self.assertEqual(core.finish(directory,marker,save,sync,current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',baseline_boot_argument_profile=baseline),first)
+            self.assertEqual(calls,[1])
+
+    def test_bootmarker_negative_and_capture_storage_failure_still_restore_and_never_recapture(self):
+        for case in ('invalid','io','started_save','final_save','started_sync','final_sync'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as tmp:
+                data,preboot,directory,original,marker=self.fixture(Path(tmp).resolve());calls=[];actual=core.boot.capture
+                baseline=core.boot.boot_argument_profile('-v')
+                core.stage_files(directory,marker,data,preboot,save,sync,owner_uid=os.geteuid(),debug_mask=0x102000,boot_marker_nonce=marker['nonce'])
+                def read(argv,*args,**kwargs):
+                    if argv!=['/usr/sbin/sysctl','-n','kern.bootargs']: return actual(argv,*args,**kwargs)
+                    calls.append(1)
+                    if case=='io': raise OSError('synthetic getter failure')
+                    return b'-v debug=0x102000\n' if case=='invalid' else ('-v debug=0x102000 vz_ci_nonce='+marker['nonce']+'\n').encode()
+                failures=[]
+                def flush(path):
+                    target='boot-marker-started.json' if case=='started_sync' else 'boot-marker-observation.json'
+                    if case in ('started_sync','final_sync') and not failures and (path/target).exists():
+                        failures.append(True); raise OSError('synthetic journal fsync failure')
+                    sync(path)
+                def store(path,raw):
+                    if path.name=={'started_save':'boot-marker-started.json','final_save':'boot-marker-observation.json'}.get(case):
+                        raise OSError('synthetic journal failure')
+                    save(path,raw)
+                with patch.object(core,'_production_paths',return_value=(data,preboot)),patch.object(core.boot,'capture',read):
+                    first=core.finish(directory,marker,store,flush,current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',baseline_boot_argument_profile=baseline)
+                self.assertTrue(first['bootplist_restored']);self.assertEqual((data.read_bytes(),preboot.read_bytes()),(original,original))
+                expected={'invalid':'invalid','io':'unavailable','started_save':'uncertain','final_save':'uncertain','started_sync':'uncertain','final_sync':'uncertain'}[case]
+                self.assertEqual(first['boot_marker_control'],{'status':expected})
+                with patch.object(core,'_production_paths',return_value=(data,preboot)),patch.object(core.boot,'capture',lambda argv,*a,**k: actual(argv,*a,**k) if argv!=['/usr/sbin/sysctl','-n','kern.bootargs'] else self.fail('repeat read')):
+                    again=core.finish(directory,marker,save,sync,current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',baseline_boot_argument_profile=baseline)
+                self.assertEqual(again['boot_marker_control'],first['boot_marker_control'])
+                self.assertEqual(len(calls),0 if case in ('started_save','started_sync') else 1)
+
+    def test_bootmarker_manifest_and_scope_tampering_fail_closed(self):
+        for mutation in ('nonce','none','extra','scope'):
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as tmp:
+                data,preboot,directory,_,marker=self.fixture(Path(tmp).resolve())
+                core.stage_files(directory,marker,data,preboot,save,sync,owner_uid=os.geteuid(),debug_mask=0x102000,boot_marker_nonce=marker['nonce'])
+                path=directory/'bootplist-manifest.json';manifest=json.loads(path.read_text())
+                if mutation=='nonce': manifest['boot_marker_nonce']='e'*64
+                elif mutation=='none': manifest['boot_marker_nonce']=None
+                elif mutation=='extra': manifest['extra']='private'
+                else: manifest['marker']['nonce']='d'*64
+                path.write_text(json.dumps(manifest));before=data.read_bytes(),preboot.read_bytes()
+                with self.assertRaises(ValueError):
+                    core.finish_files(directory,marker,data,preboot,'BBBBBBBB-2222-2222-2222-222222222222',0x102000,save,sync)
+                self.assertEqual((data.read_bytes(),preboot.read_bytes()),before)
+
+    def test_bootmarker_cached_facts_are_strict_and_never_recaptured(self):
+        for mutation in ('extra','count_bool','scope','started_only','restored_without_new_journals','baseline'):
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as tmp:
+                data,preboot,directory,_,marker=self.fixture(Path(tmp).resolve());baseline=core.boot.boot_argument_profile('-v');actual=core.boot.capture
+                core.stage_files(directory,marker,data,preboot,save,sync,owner_uid=os.geteuid(),debug_mask=0x102000,boot_marker_nonce=marker['nonce'])
+                raw=('-v debug=0x102000 vz_ci_nonce='+marker['nonce']+'\n').encode()
+                def read(argv,*a,**k): return raw if argv==['/usr/sbin/sysctl','-n','kern.bootargs'] else actual(argv,*a,**k)
+                with patch.object(core,'_production_paths',return_value=(data,preboot)),patch.object(core.boot,'capture',read):
+                    first=core.finish(directory,marker,save,sync,current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',baseline_boot_argument_profile=baseline)
+                self.assertEqual(first['boot_marker_control']['status'],'observed')
+                path=directory/'boot-marker-observation.json';cache=json.loads(path.read_text())
+                if mutation=='extra': cache['private']='unowned'
+                elif mutation=='count_bool': cache['control']['active_byte_count']=True
+                elif mutation=='scope': cache['scope']['current_boot_uuid']='CCCCCCCC-3333-3333-3333-333333333333'
+                elif mutation=='baseline': baseline=core.boot.boot_argument_profile('-v other=1')
+                if mutation in ('started_only','restored_without_new_journals'):
+                    path.unlink()
+                    if mutation=='restored_without_new_journals': (directory/'boot-marker-started.json').unlink()
+                else: path.write_text(json.dumps(cache))
+                def no_read(argv,*a,**k):
+                    if argv==['/usr/sbin/sysctl','-n','kern.bootargs']: self.fail('bad cache caused recapture')
+                    return actual(argv,*a,**k)
+                with patch.object(core,'_production_paths',return_value=(data,preboot)),patch.object(core.boot,'capture',no_read):
+                    again=core.finish(directory,marker,save,sync,current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',baseline_boot_argument_profile=baseline)
+                self.assertTrue(again['bootplist_restored'])
+                self.assertEqual(again['boot_marker_control'],{'status':'uncertain' if mutation in ('started_only','restored_without_new_journals') else 'invalid'})
+
+    def test_bootmarker_non_b2_scope_never_captures_or_restores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data,preboot,directory,_,marker=self.fixture(Path(tmp).resolve())
+            core.stage_files(directory,marker,data,preboot,save,sync,owner_uid=os.geteuid(),debug_mask=0x102000,boot_marker_nonce=marker['nonce'])
+            staged=data.read_bytes(),preboot.read_bytes()
+            for current in (marker['baseline'],'invalid',True):
+                with self.subTest(current=current),patch.object(core,'_production_paths',return_value=(data,preboot)), \
+                     patch.object(core.boot,'capture',side_effect=AssertionError('non B2 capture')):
+                    with self.assertRaises(ValueError):
+                        core.finish(directory,marker,save,sync,current_boot_uuid=current,baseline_boot_argument_profile=core.boot.boot_argument_profile('-v'))
+                self.assertEqual((data.read_bytes(),preboot.read_bytes()),staged)
+                self.assertFalse((directory/'boot-marker-started.json').exists())
+
+    def test_bootmarker_preexisting_debug_core_prevents_capture_but_restores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data,preboot,directory,original,marker=self.fixture(Path(tmp).resolve());actual=core.boot.capture
+            core.stage_files(directory,marker,data,preboot,save,sync,owner_uid=os.geteuid(),debug_mask=0x102000,boot_marker_nonce=marker['nonce'])
+            save(directory/'debug-boot-core.json',b'{"status":"prior-negative-core"}')
+            self.assertFalse((directory/'boot-marker-started.json').exists())
+            self.assertFalse((directory/'bootplist-observation.json').exists())
+            self.assertFalse((directory/'bootplist-restored.json').exists())
+            def no_read(argv,*args,**kwargs):
+                if argv==['/usr/sbin/sysctl','-n','kern.bootargs']: self.fail('saved core caused raw recapture')
+                return actual(argv,*args,**kwargs)
+            with patch.object(core,'_production_paths',return_value=(data,preboot)),patch.object(core.boot,'capture',no_read):
+                result=core.finish(directory,marker,save,sync,current_boot_uuid='BBBBBBBB-2222-2222-2222-222222222222',
+                                   baseline_boot_argument_profile=core.boot.boot_argument_profile('-v'))
+            self.assertTrue(result['bootplist_restored'])
+            self.assertEqual(result['boot_marker_control'],{'status':'uncertain'})
+            self.assertEqual((data.read_bytes(),preboot.read_bytes()),(original,original))
+            self.assertFalse((directory/'boot-marker-started.json').exists())
+
     def netdump_settings(self):
         from recovery_netdump_settings import NetdumpSettings
         return NetdumpSettings('8.8.8.8', '192.168.64.1', 10248, 'vz1234567890abcd')

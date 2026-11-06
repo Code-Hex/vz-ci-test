@@ -46,7 +46,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
-              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "panic-nonce-syscall", "kernel-state", "netdump-prime", "panic-nonce-netdump") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "panic-nonce-syscall", "kernel-state", "bootargs-marker", "netdump-prime", "panic-nonce-netdump") and
               (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
@@ -92,6 +92,21 @@ def panic_trigger_valid(trigger, scope, control_kind):
             all(type(trigger[name]) is int and 0 < trigger[name] < 2**31 for name in pids))
 
 
+def bootmarker_mode(ctx):
+    return ctx.get('after_debug_boot') == 'bootargs-marker'
+
+
+def bootmarker_proven(facts, nonce, baseline):
+    restored = facts.get('bootplist_restore') if type(facts) is dict else None
+    if (type(restored) is not dict or set(restored) != {'data', 'preboot'} or
+            any(type(item) is not dict or set(item) != {'bytes', 'metadata', 'timestamps'} or
+                any(value is not True for value in item.values()) for item in restored.values())):
+        return False
+    return (debug_boot_proven(facts, 'bootplist', 0x102000) and kernel_state_proven(facts) and
+            facts.get('boot_marker_source_identity') == debug_source_identity() and
+            recovery_bootargs.bootmarker_proven(facts.get('boot_marker_control'), nonce, baseline))
+
+
 def kernel_state_mode(ctx):
     return ctx.get('after_debug_boot') == 'kernel-state'
 
@@ -131,7 +146,7 @@ def require_root_writer(directory, config):
 def expected_debug_mask(ctx):
     if netdump_mode(ctx):
         return recovery_netdump_settings.DEBUG_MASK
-    return 0x102000 if panic_followup(ctx) or kernel_state_mode(ctx) else 0x2000
+    return 0x102000 if panic_followup(ctx) or kernel_state_mode(ctx) or bootmarker_mode(ctx) else 0x2000
 
 
 def report_required(ctx):
@@ -256,6 +271,14 @@ def reboot_observed(before, after):
 
 
 def mode_matches(data, pending, ctx):
+    if bootmarker_mode(ctx) and data.get('phase') in ('public_key', 'armed', 'quick_prepared', 'quick_intent'):
+        try:
+            profile = checked_boot_argument_profile(data.get('initial_boot_argument_profile'))
+            if (profile.get('status') != 'observed' or profile['debug_mask'] is not None or
+                    profile != pending.get('initial_boot_argument_profile')):
+                return False
+        except ValueError:
+            return False
     return (data.get("debug_source") in ("nvram", "bootplist") and data.get("debug_source") == ctx.get("debug_source") and
             data.get("after_debug_boot", "none") == ctx.get("after_debug_boot", "none") and
             data.get("trigger", "reboot") == ctx.get("trigger", "reboot") and
@@ -282,6 +305,8 @@ def debug_lineage_matches(data, pending, ctx):
     if not debug_boot_proven(facts, ctx["debug_source"], expected_debug_mask(ctx)):
         return False
     if (kernel_state_mode(ctx) or panic_control_kind(ctx) in ('usdt-v1', 'reboot-panic-v1')) and not kernel_state_proven(facts):
+        return False
+    if bootmarker_mode(ctx) and not bootmarker_proven(facts, pending["nonce"], pending.get("initial_boot_argument_profile")):
         return False
     if nvram_off_control(ctx) and not nvram_off_control_proven(facts):
         return False
@@ -494,6 +519,15 @@ def checked_boot_argument_profile(value):
     return dict(value)
 
 
+def observe_initial_boot_arguments(ctx):
+    if bootmarker_mode(ctx):
+        value = checked_boot_argument_profile(recovery_bootargs.observe_bootmarker_baseline())
+        if value.get('status') != 'observed' or value['debug_mask'] is not None:
+            raise ValueError('boot marker baseline unavailable')
+        return value
+    return observe_boot_argument_profile() if panic_followup(ctx) or netdump_mode(ctx) else {'status': 'unavailable'}
+
+
 def observe_boot_argument_profile():
     try:
         return recovery_bootargs.boot_argument_profile(recovery_bootargs.MacPlatform().active())
@@ -687,7 +721,7 @@ def prepare_root(payload):
     baseline = boot_uuid()
     if not baseline:
         raise ValueError("empty boot session")
-    initial_boot_argument_profile = observe_boot_argument_profile() if panic_followup(ctx) or netdump_mode(ctx) else {"status": "unavailable"}
+    initial_boot_argument_profile = observe_initial_boot_arguments(ctx)
     plan = None
     if netdump_mode(ctx):
         baseline_fact = recovery_netdump.BootBaseline.from_profile(baseline, initial_boot_argument_profile)
@@ -707,6 +741,8 @@ def prepare_root(payload):
     summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "public_key", "binding": binding(ctx),
                           "nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public,
                           "trigger": ctx.get("trigger", "reboot"), "debug_boot": ctx.get("debug_boot", False), "debug_source": ctx["debug_source"], "after_debug_boot": ctx.get("after_debug_boot", "none"), "cert_fingerprint": fingerprint})
+    if bootmarker_mode(ctx):
+        summary = json.dumps({**json.loads(summary), "initial_boot_argument_profile": initial_boot_argument_profile})
     check = api("POST", CHECKS, token, {"name": "Runner recovery " + ctx["run_id"], "head_sha": ctx["sha"],
                 "external_id": binding(ctx), "status": "in_progress",
                 "output": {"title": "Awaiting controller", "summary": summary}})
@@ -1165,7 +1201,8 @@ def debug_owner(directory, config, current):
             debug_event(directory, config, "bootplist_inflight", current)
             fact = recovery_bootplist.stage(directory, marker, private_write, sync_directory, debug_mask=expected_debug_mask(config["context"]),
                                                nvram_paniclog=0 if nvram_off_control(config["context"]) else None,
-                                               netdump_settings=netdump_plan(config).settings if netdump_mode(config['context']) else None)
+                                               netdump_settings=netdump_plan(config).settings if netdump_mode(config['context']) else None,
+                                               **({'boot_marker_nonce': config['nonce']} if bootmarker_mode(config['context']) else {}))
             debug_event(directory, config, "bootplist_staged", current, bootplist_stage=fact)
         else:
             recovery_bootargs.stage(directory, marker, platform, private_write, sync_directory)
@@ -2128,6 +2165,7 @@ def complete_recovery(directory, config, current, token, output, successful, dea
 
 def collect(directory):
     config = load_config(directory)
+    marker_core_preexisting = bootmarker_mode(config["context"]) and (directory / "debug-boot-core.json").exists()
     if (directory / "completed.json").exists():
         return
     if netdump_capture(config['context']) and any((directory / name).exists() for name in ('panic-followup-debug.json', 'capture-handoff-started.json')):
@@ -2151,12 +2189,14 @@ def collect(directory):
                 debug_facts = recovery_bootplist.finish(directory, debug_boot_marker(config), private_write, sync_directory,
                                                         current_boot_uuid=current,
                                                         baseline_boot_argument_profile=config.get('initial_boot_argument_profile')
-                                                        if netdump_mode(config['context']) else None)
+                                                        if netdump_mode(config['context']) or bootmarker_mode(config['context']) else None)
             else:
                 debug_facts = recovery_bootargs.finish(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(), private_write, sync_directory,
                                                        current_boot_uuid=current, inventory=False)
         except (OSError, ValueError, subprocess.SubprocessError, recovery_bootplist.WriteUncertain):
             debug_facts = {"active_debug_mask": None, "active_bootargs_status": "unavailable", "current_boot_uuid": current}
+            if bootmarker_mode(config['context']):
+                debug_facts['boot_marker_control'] = {'status': 'unavailable'}
             if config["context"]["debug_source"] == "bootplist":
                 debug_facts.update({"bootplist_restored": False, "bootplist_restore": {},
                                     "bootplist_file_states": {"data": "unavailable", "preboot": "unavailable"}})
@@ -2170,6 +2210,8 @@ def collect(directory):
             debug_facts["boot_argument_profiles"] = argument_profiles
         if paniclog_control is not None:
             debug_facts["nvram_paniclog_control"] = paniclog_control
+        if bootmarker_mode(config['context']):
+            debug_facts['boot_marker_source_identity'] = debug_source_identity()
         debug_facts["owner_events"] = []
         for event in DEBUG_EVENTS:
             if (directory / ("debug-reboot-" + event + ".json")).exists():
@@ -2180,6 +2222,8 @@ def collect(directory):
     elif config.get("debug_boot", False) and (directory / "debug-reboot-request.json").exists():
         debug_owner(directory, config, current)
         return
+    if marker_core_preexisting:
+        return
     token = (directory / "token").read_text()
     if not reboot_observed(config["baseline"], current):
         if not (directory / "ready.json").exists():
@@ -2188,6 +2232,8 @@ def collect(directory):
                                   "trigger": config["context"].get("trigger", "reboot"),
                                   "debug_boot": config.get("debug_boot", False), "debug_source": config["context"]["debug_source"], "after_debug_boot": config["context"].get("after_debug_boot", "none"),
                                   "cert_fingerprint": config.get("cert_fingerprint", "")})
+            if bootmarker_mode(config["context"]):
+                summary = json.dumps({**json.loads(summary), "initial_boot_argument_profile": config["initial_boot_argument_profile"]})
             api("PATCH", CHECKS + "/" + str(config["check_id"]), token,
                 {"output": {"title": "Recovery daemon ready", "summary": summary}})
             private_write(directory / "ready.json", json.dumps({"baseline": config["baseline"], "nonce": config["nonce"],
@@ -2215,8 +2261,20 @@ def collect(directory):
             debug_facts['optional_inventory_status'] = 'skipped_netdump_control'
         elif debug_restored(debug_facts, config["context"]["debug_source"]):
             try:
-                optional = recovery_bootargs.observe_once(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(),
-                                                          private_write, sync_directory, current_boot_uuid=current)
+                if bootmarker_mode(config['context']):
+                    def read_mask(argv, limit, **options):
+                        if deadline - time.monotonic() < 32:
+                            raise RuntimeError('boot marker mask budget unavailable')
+                        return recovery_bootargs.capture(argv, limit, **options)
+                    platform = recovery_bootargs.KernelMaskInventory(read=read_mask)
+                    try:
+                        optional = recovery_bootargs.observe_once(directory, debug_boot_marker(config), platform,
+                                                                  private_write, sync_directory, current_boot_uuid=current)
+                    except RuntimeError:
+                        optional = {'optional_inventory_status': 'uncertain'}
+                else:
+                    optional = recovery_bootargs.observe_once(directory, debug_boot_marker(config), recovery_bootargs.MacPlatform(),
+                                                              private_write, sync_directory, current_boot_uuid=current)
             except (OSError, ValueError, subprocess.SubprocessError):
                 optional = {"optional_inventory_status": "uncertain"}
             debug_facts.update(optional)
@@ -2246,9 +2304,13 @@ def collect(directory):
         successful = successful and debug_facts.get('netdump_prime', {}).get('status') == 'verified'
     if kernel_state_mode(config['context']):
         successful = successful and kernel_state_proven(debug_facts)
+    if bootmarker_mode(config['context']):
+        successful = successful and bootmarker_proven(debug_facts, config['nonce'], config.get('initial_boot_argument_profile'))
     output = {"title": "Recovery observed" if successful else "Panic report unavailable", "summary": summary}
     if kernel_state_mode(config['context']):
         output['title'] = 'Kernel runtime mask confirmed' if successful else 'Kernel runtime mask not confirmed'
+    if bootmarker_mode(config['context']):
+        output['title'] = 'Boot marker confirmed' if successful else 'Boot marker not confirmed'
     if envelope:
         output["text"] = envelope["ciphertext"]
     if len(json.dumps(output).encode()) > 58000:
@@ -2411,11 +2473,20 @@ def controller(ctx, token):
                             raise ValueError("certificate fingerprint invalid")
                         if not certificate_required(ctx) and fingerprint:
                             raise ValueError("unexpected certificate fingerprint")
+                        initial_profile = None
+                        if bootmarker_mode(ctx):
+                            initial_profile = checked_boot_argument_profile(data.get('initial_boot_argument_profile'))
+                            if initial_profile.get('status') != 'observed' or initial_profile['debug_mask'] is not None:
+                                raise ValueError('boot marker baseline invalid')
                         if pending is None:
                             ciphertext = encrypt_token(public.encode(), token)
                             pending = {"nonce": nonce, "baseline_boot_uuid": baseline, "public_key": public,
                                        "ciphertext": base64.b64encode(ciphertext).decode(), "cert_fingerprint": fingerprint,
                                        "check_id": check_id}
+                            if bootmarker_mode(ctx):
+                                pending['initial_boot_argument_profile'] = initial_profile
+                        if bootmarker_mode(ctx) and pending.get('initial_boot_argument_profile') != initial_profile:
+                            raise ValueError('boot marker baseline changed')
                         if (nonce, baseline, public, fingerprint) != (pending["nonce"], pending["baseline_boot_uuid"], pending["public_key"], pending["cert_fingerprint"]):
                             raise ValueError("public key metadata changed")
                         sealed_summary = json.dumps({"protocol": "vz-recovery-v1", "phase": "sealed_token", "binding": binding(ctx),

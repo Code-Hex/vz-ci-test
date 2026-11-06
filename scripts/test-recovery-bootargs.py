@@ -40,6 +40,57 @@ class Platform:
         return {"debugger_count": None, "virtio_network_classes": [], "nic_inventory_status": "unsupported"}
 
 
+class BootMarker(unittest.TestCase):
+    def test_strict_raw_stdout_and_255_byte_whole_args_boundary(self):
+        self.assertEqual(b.decode_bootmarker_stdout(b'alpha=1\n'), b'alpha=1')
+        for raw in (b'alpha=1', b'alpha=1\n\n', b'alpha=1\r\n', b'alpha\t1\n', b'alpha\0\n', b'\xff\n', 'alpha=1\n'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError): b.decode_bootmarker_stdout(raw)
+        nonce='b'*64; token='vz_ci_nonce='+nonce
+        args=('x'* (255-len(token)-len(' debug=0x102000 ')))+' debug=0x102000 '+token
+        self.assertEqual(len(args),255)
+        baseline=b.boot_argument_profile(args.split(' ')[0])
+        result=b.bootmarker_control((args+'\n').encode(),nonce,baseline)
+        self.assertEqual(set(result),{'status','marker_sha256','active_sha256','active_byte_count','full_profile','remaining_profile'})
+        self.assertEqual(result['active_byte_count'],255)
+        self.assertTrue(b.bootmarker_proven(result,nonce,baseline))
+        with self.assertRaises(ValueError): b.bootmarker_control((args+' \n').encode(),nonce,baseline)
+
+    def test_complete_token_profiles_and_strict_record_variants(self):
+        nonce='b'*64; token='vz_ci_nonce='+nonce; baseline=b.boot_argument_profile('alpha=1 beta=2')
+        raw=('alpha=1 beta=2 debug=0x102000 '+token+'\n').encode()
+        fact=b.bootmarker_control(raw,nonce,baseline)
+        self.assertEqual(b.checked_bootmarker_control(fact,nonce,baseline),fact)
+        for args in ('alpha=1 beta=2 debug=0x102000', 'alpha=1 beta=2 debug=0x102000 -'+token,
+                     'alpha=1 beta=2 debug=0x102000 '+token+' '+token,
+                     'alpha=1 beta=2 debug=0x102000 '+token+'0',
+                     'beta=2 alpha=1 debug=0x102000 '+token,
+                     'alpha=1 beta=2 other=1 debug=0x102000 '+token):
+            with self.subTest(args=args),self.assertRaises(ValueError): b.bootmarker_control((args+'\n').encode(),nonce,baseline)
+        for changed in ({**fact,'active_byte_count':True},{**fact,'extra':'secret'},{**fact,'marker_sha256':'c'*64},
+                        {**fact,'remaining_profile':{**fact['remaining_profile'],'nondebug_token_count':True}},
+                        {'status':'observed'},{'status':'invalid','raw':'secret'}):
+            self.assertFalse(b.bootmarker_proven(changed,nonce,baseline))
+        for status in ('invalid','unavailable','uncertain'):
+            self.assertEqual(b.checked_bootmarker_control({'status':status},nonce,baseline),{'status':status})
+            self.assertFalse(b.bootmarker_proven({'status':status},nonce,baseline))
+
+    def test_baseline_rejects_preexisting_owned_marker_aliases(self):
+        for args in ('vz_ci_nonce=old','-vz_ci_nonce=old','--vz_ci_nonce','vz_ci_nonce =old','vz_ci_nonce=one vz_ci_nonce=two'):
+            with self.subTest(args=args):
+                self.assertEqual(b.observe_bootmarker_baseline(read=lambda *_a,**_k:(args+'\n').encode()),{'status':'invalid'})
+
+    def test_baseline_fixed_read_uses_raw_output_and_native_child_seam(self):
+        calls=[]; actual=b.capture
+        def read(argv,limit,timeout):
+            calls.append((argv,limit,timeout))
+            return actual([sys.executable,'-c',"print('alpha=1')"],limit,timeout)
+        self.assertEqual(b.observe_bootmarker_baseline(read=read),b.boot_argument_profile('alpha=1'))
+        self.assertEqual(calls,[(['/usr/sbin/sysctl','-n','kern.bootargs'],1025,8)])
+        self.assertEqual(b.observe_bootmarker_baseline(read=lambda *_a,**_k:b'alpha=1\n\n'),{'status':'invalid'})
+        def failed(*_a,**_k): raise OSError('synthetic getter failure')
+        self.assertEqual(b.observe_bootmarker_baseline(read=failed),{'status':'unavailable'})
+
+
 class BootArgumentProfile(unittest.TestCase):
     def test_optional_registry_summary_rejects_unknown_public_fields(self):
         snapshot = {'scope': 'current_registered_services_not_polled_io_proof', 'queries': {

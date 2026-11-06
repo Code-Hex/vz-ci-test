@@ -120,6 +120,78 @@ def boot_argument_profile(value):
             'nondebug_sha256': hashlib.sha256(canonical).hexdigest()}
 
 
+def decode_bootmarker_stdout(raw):
+    if (type(raw) is not bytes or not raw.endswith(b'\n') or len(raw)>1024 or
+            any(byte<32 or byte>126 for byte in raw[:-1])):
+        raise ValueError('boot_marker_stdout_invalid')
+    return raw[:-1]
+
+
+def _bootmarker_nonce(nonce):
+    if type(nonce) is not str or not re.fullmatch(r'[0-9a-f]{64}',nonce):
+        raise ValueError('boot_marker_nonce_invalid')
+    return 'vz_ci_nonce='+nonce
+
+
+def _bootmarker_profile(value, mask):
+    if (type(value) is not dict or set(value)!={'status','debug_mask','nondebug_token_count','nondebug_sha256'} or
+            value['status']!='observed' or type(value['debug_mask']) is not type(mask) or value['debug_mask']!=mask or
+            type(value['nondebug_token_count']) is not int or not 0<=value['nondebug_token_count']<=512 or
+            type(value['nondebug_sha256']) is not str or not re.fullmatch(r'[0-9a-f]{64}',value['nondebug_sha256'])):
+        raise ValueError('boot_marker_profile_invalid')
+    return dict(value)
+
+
+def checked_bootmarker_control(value, nonce, baseline_profile):
+    token=_bootmarker_nonce(nonce)
+    if type(value) is not dict: raise ValueError('boot_marker_control_invalid')
+    if value.get('status') in ('invalid','unavailable','uncertain'):
+        if set(value)!={'status'}: raise ValueError('boot_marker_control_invalid')
+        return dict(value)
+    baseline=_bootmarker_profile(baseline_profile,None)
+    if (set(value)!={'status','marker_sha256','active_sha256','active_byte_count','full_profile','remaining_profile'} or
+            value.get('status')!='observed' or value['marker_sha256']!=hashlib.sha256(token.encode()).hexdigest() or
+            type(value['active_byte_count']) is not int or not len(token)<=value['active_byte_count']<=255 or
+            type(value['active_sha256']) is not str or not re.fullmatch(r'[0-9a-f]{64}',value['active_sha256'])):
+        raise ValueError('boot_marker_control_invalid')
+    full=_bootmarker_profile(value['full_profile'],0x102000)
+    remaining=_bootmarker_profile(value['remaining_profile'],0x102000)
+    if (full['nondebug_token_count']!=remaining['nondebug_token_count']+1 or
+            any(remaining[k]!=baseline[k] for k in ('nondebug_token_count','nondebug_sha256'))):
+        raise ValueError('boot_marker_profile_mismatch')
+    return dict(value)
+
+
+def bootmarker_proven(value, nonce, baseline_profile):
+    try: return checked_bootmarker_control(value,nonce,baseline_profile)['status']=='observed'
+    except (ValueError,TypeError,KeyError): return False
+
+
+def bootmarker_control(raw_stdout, nonce, baseline_profile):
+    token=_bootmarker_nonce(nonce); body=decode_bootmarker_stdout(raw_stdout)
+    if len(body)>255: raise ValueError('boot_marker_arguments_too_long')
+    args=body.decode('ascii'); tokens=args.split()
+    candidates=[i for i,t in enumerate(tokens) if t.partition('=')[0].lstrip('-')=='vz_ci_nonce']
+    if len(candidates)!=1 or tokens[candidates[0]]!=token: raise ValueError('boot_marker_token_invalid')
+    remaining=' '.join(t for i,t in enumerate(tokens) if i!=candidates[0])
+    value={'status':'observed','marker_sha256':hashlib.sha256(token.encode()).hexdigest(),
+           'active_sha256':hashlib.sha256(body).hexdigest(),'active_byte_count':len(body),
+           'full_profile':boot_argument_profile(args),'remaining_profile':boot_argument_profile(remaining)}
+    return checked_bootmarker_control(value,nonce,baseline_profile)
+
+
+def observe_bootmarker_baseline(*, read=None):
+    read=capture if read is None else read
+    try:
+        raw=read(['/usr/sbin/sysctl','-n','kern.bootargs'],1025,timeout=8)
+        body=decode_bootmarker_stdout(raw)
+        if any(t.partition(b'=')[0].lstrip(b'-')==b'vz_ci_nonce' for t in body.split()):
+            raise ValueError('existing_boot_marker')
+        return _bootmarker_profile(boot_argument_profile(body),None)
+    except ValueError: return {'status':'invalid'}
+    except (OSError,subprocess.SubprocessError): return {'status':'unavailable'}
+
+
 class CaptureLimit(ValueError):
     def __init__(self, output, stderr):
         super().__init__("platform response oversized")
