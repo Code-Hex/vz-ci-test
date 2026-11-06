@@ -2752,6 +2752,11 @@ def controller(ctx, token):
                     pass
 
 
+def hold_runner_for_recovery():
+    while True:
+        time.sleep(30)
+
+
 def main():
     if len(sys.argv) < 2:
         raise ValueError("usage: reboot-recovery.py prepare|arm|trigger|reboot|controller|cleanup")
@@ -2800,7 +2805,7 @@ def main():
             if ctx.get("debug_boot", False):
                 print(sudo_call("verify-root", {"context": ctx}), end="", flush=True)
                 print(sudo_call("debug-request-root", {"context": ctx}), end="", flush=True)
-                time.sleep(90)
+                hold_runner_for_recovery()
             else:
                 print(sudo_call("quick-execute-root", {"context": ctx}, timeout=90), end="", flush=True)
         else:
@@ -2809,10 +2814,10 @@ def main():
             print(sudo_call("verify-root", {"context": ctx}), end="", flush=True)
             if ctx.get("debug_boot", False):
                 print(sudo_call("debug-request-root", {"context": ctx}), end="", flush=True)
-                time.sleep(90)
-                return
-            os.sync()
-            subprocess.run(["/usr/bin/sudo", "-n", "/sbin/reboot"], check=True, timeout=15)
+                hold_runner_for_recovery()
+            else:
+                os.sync()
+                subprocess.run(["/usr/bin/sudo", "-n", "/sbin/reboot"], check=True, timeout=15)
     elif op in ("prepare-root", "arm-root", "verify-root", "panic-preflight-root", "panic-execute-root", "force-preflight-root", "force-execute-root", "debug-request-root", "quick-execute-root") and len(sys.argv) == 2:
         {"prepare-root": prepare_root, "arm-root": arm_root, "verify-root": verify_root, "panic-preflight-root": panic_preflight_root, "panic-execute-root": panic_execute_root,
          "force-preflight-root": force_preflight_root, "force-execute-root": force_execute_root,

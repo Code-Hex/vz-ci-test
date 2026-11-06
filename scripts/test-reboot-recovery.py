@@ -2103,15 +2103,18 @@ class Recovery(unittest.TestCase):
         def sudo(operation, *_args, **_kwargs):
             calls.append(operation)
             return ""
+        def tick(seconds):
+            calls.append('wait')
+            if calls.count('wait')==4:raise KeyboardInterrupt()
         def forbidden(*_args, **_kwargs):
             self.fail("debug quick parent directly executed reset")
         with patch.object(r.sys, "argv", ["reboot-recovery.py", "trigger"]), \
                 patch.object(r, "context_from_env", lambda: {"debug_source": "nvram", "trigger": "reboot-quick", "debug_boot": True}), \
                 patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
                 patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), \
-                patch.object(r.time, "sleep", lambda seconds: calls.append(("wait", seconds))), contextlib.redirect_stdout(io.StringIO()):
-            r.main()
-        self.assertEqual(calls, ["verify-root", "debug-request-root", ("wait", 90)])
+                patch.object(r.time, "sleep", tick), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):r.main()
+        self.assertEqual(calls, ["verify-root", "debug-request-root", "wait", "wait", "wait", "wait"])
 
     def test_quick_prepared_ack_precedes_execute_and_return_completes_failure(self):
         for acknowledged in (True, False):
@@ -2253,15 +2256,18 @@ class Recovery(unittest.TestCase):
         def sudo(operation, *_args, **_kwargs):
             calls.append(operation)
             return "ready"
+        def tick(seconds):
+            calls.append('wait')
+            if calls.count('wait')==4:raise KeyboardInterrupt()
         def forbidden(*_args, **_kwargs):
             self.fail("runner parent mutated debug state")
         with patch.object(r.sys, "argv", ["reboot-recovery.py", "reboot"]), \
                 patch.object(r, "context_from_env", lambda: {"debug_source": "nvram", "trigger": "reboot", "debug_boot": True}), \
                 patch.object(r, "require_context", lambda *_: None), patch.object(r, "sudo_call", sudo), \
                 patch.object(r.os, "sync", forbidden), patch.object(r.subprocess, "run", forbidden), \
-                patch.object(r.time, "sleep", lambda seconds: calls.append(("wait", seconds))), contextlib.redirect_stdout(io.StringIO()):
-            r.main()
-        self.assertEqual(calls, ["verify-root", "debug-request-root", ("wait", 90)])
+                patch.object(r.time, "sleep", tick), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):r.main()
+        self.assertEqual(calls, ["verify-root", "debug-request-root", "wait", "wait", "wait", "wait"])
 
     def test_bootplist_proof_requires_file_restoration(self):
         facts = {"active_debug_mask": 0x2000, "active_bootargs_status": "observed_debug",
