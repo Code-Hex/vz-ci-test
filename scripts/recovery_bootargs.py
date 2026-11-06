@@ -198,7 +198,7 @@ class CaptureLimit(ValueError):
         self.output, self.stderr = output, stderr
 
 
-def capture(argv, limit=4_000_000, timeout=8, *, capture_stderr=False):
+def capture(argv, limit=4_000_000, timeout=8, *, capture_stderr=False, on_timeout=None):
     child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL, bufsize=0)
     selector = selectors.DefaultSelector()
     buffers = {'stdout': bytearray(), 'stderr': bytearray()}
@@ -237,6 +237,14 @@ def capture(argv, limit=4_000_000, timeout=8, *, capture_stderr=False):
                 output=bytes(buffers['stdout']) if capture_stderr else None,
                 stderr=bytes(buffers['stderr']) if capture_stderr else None)
         return bytes(buffers['stdout'])
+    except subprocess.TimeoutExpired as error:
+        frozen={'timeout_seconds':error.timeout,
+                'stdout':bytes(error.output) if type(error.output) is bytes else None,
+                'stderr':bytes(error.stderr) if type(error.stderr) is bytes else None}
+        if on_timeout is not None and child.returncode is None:
+            try: on_timeout(child.pid,dict(frozen))
+            except BaseException: pass
+        raise
     finally:
         selector.close()
         if child.poll() is None:

@@ -54,6 +54,7 @@ on:
           - panic-nonce-syscall
           - kernel-state
           - bootargs-marker
+          - bootargs-marker-sample
           - netdump-prime
           - panic-nonce-netdump
         default: none

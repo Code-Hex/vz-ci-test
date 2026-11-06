@@ -91,6 +91,44 @@ class BootMarker(unittest.TestCase):
         self.assertEqual(b.observe_bootmarker_baseline(read=failed),{'status':'unavailable'})
 
 
+class CaptureTimeoutObserver(unittest.TestCase):
+    def test_observer_sees_owned_unreaped_pid_and_cannot_promote_late_value(self):
+        import os,subprocess,time
+        seen=[]
+        def observer(pid,frozen):
+            os.kill(pid,0);seen.append(pid)
+            self.assertEqual(frozen,{'timeout_seconds':.02,'stdout':b'','stderr':b''})
+            frozen['stdout']=b'changed observer copy'
+            time.sleep(.12)
+        program='import time;time.sleep(.06);print("VZKSTATE v1 debug_boot_arg u32 1056768\\n")'
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            b.capture([sys.executable,'-c',program],4096,timeout=.02,capture_stderr=True,on_timeout=observer)
+        self.assertEqual((caught.exception.timeout,caught.exception.output,caught.exception.stderr),(.02,b'',b''))
+        self.assertEqual(len(seen),1)
+        with self.assertRaises(ProcessLookupError): os.kill(seen[0],0)
+
+    def test_observer_failure_does_not_replace_original_timeout_or_skip_cleanup(self):
+        import os,subprocess
+        for error in (OSError('private diagnostic failure'),KeyboardInterrupt(),subprocess.TimeoutExpired(['sampler'],8)):
+            with self.subTest(kind=type(error).__name__):
+                seen=[]
+                def observer(pid,frozen): seen.append(pid);raise error
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    b.capture([sys.executable,'-c','import time;time.sleep(10)'],4096,timeout=.02,capture_stderr=True,on_timeout=observer)
+                self.assertEqual((caught.exception.timeout,caught.exception.output),(.02,b''))
+                self.assertEqual(len(seen),1)
+                with self.assertRaises(ProcessLookupError): os.kill(seen[0],0)
+
+    def test_other_capture_outcomes_do_not_observe(self):
+        import subprocess
+        def forbidden(*_): self.fail('non timeout invoked sampler')
+        self.assertEqual(b.capture([sys.executable,'-c','print("ok")'],4096,1,on_timeout=forbidden),b'ok\n')
+        with self.assertRaises(subprocess.CalledProcessError):
+            b.capture([sys.executable,'-c','raise SystemExit(1)'],4096,1,on_timeout=forbidden)
+        with self.assertRaises(ValueError):
+            b.capture([sys.executable,'-c','print("overflow")'],2,1,on_timeout=forbidden)
+
+
 class BootArgumentProfile(unittest.TestCase):
     def test_optional_registry_summary_rejects_unknown_public_fields(self):
         snapshot = {'scope': 'current_registered_services_not_polled_io_proof', 'queries': {

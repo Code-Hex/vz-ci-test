@@ -15,6 +15,165 @@ spec.loader.exec_module(r)
 
 
 class Recovery(unittest.TestCase):
+    def test_reader_sample_mode_is_closed_nonpanic_and_requires_only_transport_cert(self):
+        config, _facts, _current = self.bootmarker_fixture()
+        ctx = {**config['context'], 'after_debug_boot':'bootargs-marker-sample'}
+        self.assertTrue(r.valid_context(ctx,'Darwin','x86_64',r.KERNEL_UUID))
+        self.assertTrue(r.bootmarker_mode(ctx)); self.assertTrue(r.certificate_required(ctx))
+        self.assertFalse(r.panic_followup(ctx)); self.assertFalse(r.report_required(ctx)); self.assertFalse(r.panic_mode(ctx))
+        self.assertEqual(r.expected_debug_mask(ctx),0x102000);self.assertIsNone(r.netdump_mode(ctx))
+        for change in ({'trigger':'reboot'},{'debug_boot':False},{'debug_source':'nvram'},{'after_debug_boot':'bootargs-marker-sample-extra'}):
+            self.assertFalse(r.valid_context({**ctx,**change},'Darwin','x86_64',r.KERNEL_UUID))
+        self.assertFalse(r.certificate_required(config['context']))
+
+    def test_reader_sample_publication_is_bounded_separate_and_canonical(self):
+        for case in ('success','budget','crypto','post','get','wrong_app','wrong_text','wrong_id','wrong_origin'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                directory=Path(tmp);config,facts,current=self.bootmarker_fixture()
+                config['context']['after_debug_boot']='bootargs-marker-sample';config['cert_fingerprint']='a'*64
+                scope={**r.debug_boot_marker(config),'debug_boot_uuid':current}
+                sampler=r.recovery_kernel_sample.Sampler(scope,deadline=r.time.monotonic()+180,
+                    read=lambda *a,**kw:b'private stack fragment')
+                sampler(123,{'timeout_seconds':30,'stdout':b'','stderr':b''})
+                facts['kernel_debug_state']={'debug_boot_arg':{'status':'unavailable',
+                    'error':r.recovery_bootargs.kernel_failure('timeout',subprocess.TimeoutExpired('owned',30,output=b'',stderr=b''))}}
+                if case=='wrong_origin': facts['kernel_debug_state']['debug_boot_arg']['error']['output_bytes']=1
+                r.private_write(directory/'report-cert.pem',b'certificate boundary')
+                calls=[];encrypted=[];canonical={}
+                def encrypt(cert,metadata,raw):
+                    encrypted.append((metadata,raw));self.assertEqual(cert,b'certificate boundary')
+                    self.assertEqual(metadata['scope'],scope)
+                    payload=r.json.loads(raw);self.assertEqual(r.base64.b64decode(payload['stdout']),b'private stack fragment')
+                    self.assertEqual(r.base64.b64decode(payload['stderr']),b'')
+                    if case=='crypto': raise ValueError('private failure text')
+                    return {'cert_fingerprint':'a'*64,'cipher_sha256':'b'*64,'ciphertext':'CMS_ONLY'}
+                def api(method,url,token,payload=None,**kwargs):
+                    calls.append(method);self.assertEqual(token,'token')
+                    self.assertNotIn('private stack fragment',r.json.dumps(payload))
+                    if method=='POST':
+                        if case=='post': raise OSError('private API failure')
+                        canonical.update(payload);canonical.update(id=99,app={'id':15368,'slug':'github-actions'})
+                        return copy.deepcopy(canonical)
+                    if case=='get': raise OSError('private GET failure')
+                    value=copy.deepcopy(canonical)
+                    if case=='wrong_app':value['app']['id']=1
+                    if case=='wrong_text':value['output']['text']='changed'
+                    if case=='wrong_id':value['id']=True
+                    return value
+                before=copy.deepcopy(facts)
+                with patch.object(r.recovery_reports,'encrypt_bundle',encrypt),patch.object(r,'api',api):
+                    result=r.publish_kernel_sample(directory,config,current,sampler,facts,'token',
+                        r.time.monotonic()+(99 if case=='budget' else 180))
+                self.assertEqual(facts,before)
+                self.assertEqual(result['publication'],'acknowledged' if case=='success' else 'no_budget' if case=='budget' else 'failed')
+                self.assertEqual(result['check_id'],99 if case in ('success','get','wrong_app','wrong_text','wrong_id') else None)
+                self.assertEqual(len(encrypted),0 if case in ('budget','wrong_origin') else 1)
+                if case=='success':
+                    self.assertEqual(calls,['POST','GET']);self.assertEqual(canonical['conclusion'],'neutral')
+                    self.assertEqual(canonical['output']['text'],'CMS_ONLY')
+                    self.assertTrue(canonical['external_id'].startswith(r.binding(config['context'])+'/reader-sample/'))
+                    self.assertEqual(r.json.loads(canonical['output']['summary'])['sample'],sampler.public_fact())
+
+    def test_reader_sample_collect_preserves_primary_outcome_cleanup_order_and_once(self):
+        for case in ('observed','timeout','late_value','observer_error','budget','crypto','post','no_publish_budget','restore_failed'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as tmp:
+                directory=Path(tmp);config,facts,current=self.bootmarker_fixture()
+                config['context']['after_debug_boot']='bootargs-marker-sample';config['cert_fingerprint']='a'*64
+                facts.pop('optional_inventory_status');facts.pop('kernel_debug_state')
+                if case=='restore_failed':facts['bootplist_restored']=False
+                for name,data in (('token',b'token'),('report-cert.pem',b'certificate boundary'),
+                    ('ready.json',r.json.dumps({'baseline':config['baseline'],'nonce':config['nonce'],'preboot_patch':True}).encode())):
+                    r.private_write(directory/name,data)
+                clock=[0];reads=[];samples=[];reports=[];calls=[];encrypted=[];reaped=[];checks={}
+                def core(_d,_c,_b,value,_t):
+                    path=directory/'debug-boot-core.json'
+                    if not path.exists():r.private_write(path,r.json.dumps({'facts':value}).encode())
+                    if case=='budget':clock[0]=140
+                    return r.json.loads(path.read_text())['facts']
+                def read(argv,limit,**options):
+                    if argv[0]=='/usr/bin/sample':
+                        self.assertFalse(reaped);samples.append(argv)
+                        if case=='observer_error':raise OSError('owned observer failed')
+                        return b'private native stack prefix'
+                    reads.append(argv)
+                    self.assertEqual(options['timeout'],30);self.assertIn('on_timeout',options)
+                    if case=='observed':return b'VZKSTATE v1 debug_boot_arg u32 1056768\n\n'
+                    if case=='no_publish_budget':clock[0]=90
+                    options['on_timeout'](123,{'timeout_seconds':30,'stdout':b'','stderr':b''})
+                    # The capture owner has frozen timeout before an optional late return and reaped before returning.
+                    if case=='late_value': self.assertFalse(reaped)
+                    reaped.append(True)
+                    raise subprocess.TimeoutExpired(argv,30,output=b'',stderr=b'')
+                def encrypt(cert,metadata,raw):
+                    self.assertEqual(reaped,[True]);encrypted.append(raw)
+                    if case=='crypto':raise ValueError('private crypto failure')
+                    return {'cert_fingerprint':'a'*64,'cipher_sha256':'b'*64,'ciphertext':'CMS_ONLY'}
+                def api(method,url,token,payload=None,**options):
+                    self.assertEqual(reaped,[True]);calls.append(method)
+                    if case=='post':raise OSError('private API failure')
+                    if method=='POST':checks.update(payload,id=99,app={'id':15368,'slug':'github-actions'})
+                    return copy.deepcopy(checks)
+                def forbidden(*a,**kw):self.fail('nonfaulting sample mode entered a panic or full inventory path')
+                with contextlib.ExitStack() as stack:
+                    for owner,name,value in ((r,'load_config',lambda _:config),(r,'boot_uuid',lambda:current),
+                        (r.recovery_bootplist,'finish',lambda *a,**kw:copy.deepcopy(facts)),(r,'publish_debug_core',core),
+                        (r.recovery_bootargs,'capture',read),(r.recovery_reports,'encrypt_bundle',encrypt),(r,'api',api),
+                        (r,'complete_recovery',lambda _d,_c,_b,_t,o,s,d:reports.append((o,s,d))),
+                        (r.time,'monotonic',lambda:clock[0]),(r,'followup_start',forbidden),(r,'start_runtime_watch',forbidden),
+                        (r.recovery_bootargs.MacPlatform,'inventory',forbidden),(r.recovery_panic_control,'build',forbidden),
+                        (r.recovery_panic_control,'prepare',forbidden),(r.recovery_panic_control,'fire',forbidden)):
+                        stack.enter_context(patch.object(owner,name,value))
+                    r.collect(directory);r.collect(directory)
+                self.assertEqual(len(reports),1);output,success,deadline=reports[0]
+                self.assertEqual(success,case=='observed');self.assertEqual(deadline,180)
+                summary=r.json.loads(output['summary']);self.assertEqual(summary['capture_state'],'boot_only');self.assertNotIn('text',output)
+                self.assertEqual(len(reads),0 if case in ('budget','restore_failed') else 1)
+                self.assertEqual(len(samples),0 if case in ('observed','budget','restore_failed') else 1)
+                actual=summary['debug_boot_facts']
+                if case not in ('observed','budget','restore_failed'):
+                    self.assertEqual(actual['kernel_debug_state']['debug_boot_arg']['error']['reason'],'timeout')
+                    publication=actual['kernel_reader_sample']['publication']
+                    self.assertEqual(publication,'no_budget' if case=='no_publish_budget' else 'failed' if case in ('crypto','post') else 'acknowledged')
+                if case in ('observed','budget','restore_failed','no_publish_budget'):self.assertFalse(encrypted);self.assertFalse(calls)
+
+    def test_reader_sample_maximum_prefix_is_encrypted_and_decrypts_with_exact_scope(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp);config,facts,current=self.bootmarker_fixture()
+            config['context']['after_debug_boot']='bootargs-marker-sample'
+            key=directory/'recipient.key';cert=directory/'report-cert.pem'
+            subprocess.run(['/usr/bin/openssl','req','-new','-x509','-newkey','rsa:4096','-nodes',
+                '-keyout',str(key),'-out',str(cert),'-subj','/CN=local-test','-days','1'],
+                check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+            config['cert_fingerprint']=r.recovery_reports.cert_fingerprint(cert.read_bytes())
+            scope={**r.debug_boot_marker(config),'debug_boot_uuid':current}
+            out=os.urandom(22528);err=os.urandom(2048)
+            def read(*a,**kw):raise subprocess.CalledProcessError(1,'sample',output=out,stderr=err)
+            sampler=r.recovery_kernel_sample.Sampler(scope,deadline=r.time.monotonic()+180,read=read)
+            sampler(123,{'timeout_seconds':30,'stdout':b'','stderr':b''})
+            facts['kernel_debug_state']={'debug_boot_arg':{'status':'unavailable','error':
+                r.recovery_bootargs.kernel_failure('timeout',subprocess.TimeoutExpired('owned',30,output=b'',stderr=b''))}}
+            check={}
+            def api(method,url,token,payload=None,**kw):
+                if method=='POST':check.update(payload,id=99,app={'id':15368,'slug':'github-actions'})
+                return copy.deepcopy(check)
+            with patch.object(r,'api',api):
+                result=r.publish_kernel_sample(directory,config,current,sampler,facts,'token',r.time.monotonic()+180)
+            self.assertEqual(result['publication'],'acknowledged')
+            encoded=check['output']['text'];self.assertLessEqual(len(encoded),58000)
+            encrypted=r.base64.b64decode(encoded,validate=True)
+            summary=r.json.loads(check['output']['summary'])
+            self.assertEqual(summary['cipher_sha256'],r.hashlib.sha256(encrypted).hexdigest())
+            compressed=subprocess.run(['/usr/bin/openssl','cms','-decrypt','-inform','DER','-binary',
+                '-recip',str(cert),'-inkey',str(key)],input=encrypted,stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,check=True,timeout=10).stdout
+            bundle=r.json.loads(gzip.decompress(compressed));raw=r.base64.b64decode(bundle['report_base64'])
+            self.assertEqual(bundle['metadata']['scope'],scope);self.assertEqual(bundle['metadata']['sample'],sampler.public_fact())
+            self.assertEqual(bundle['report_sha256'],r.hashlib.sha256(raw).hexdigest())
+            fragments=r.json.loads(raw)
+            self.assertEqual(r.base64.b64decode(fragments['stdout']),out)
+            self.assertEqual(r.base64.b64decode(fragments['stderr']),err)
+
     def test_bootmarker_mode_is_nonfaulting_and_closed(self):
         config, _saved, _b3 = self.syscall_fixture()
         ctx = {**config['context'], 'after_debug_boot': 'bootargs-marker'}
@@ -169,8 +328,15 @@ class Recovery(unittest.TestCase):
                 if case=='budget': self.assertEqual(reports[0][2],280)
 
     def test_bootmarker_b1_preparation_and_arming_preserve_baseline_without_panic_build(self):
+        self.assert_bootmarker_b1_preparation(False)
+
+    def test_reader_sample_b1_requires_transport_certificate_without_panic_build(self):
+        self.assert_bootmarker_b1_preparation(True)
+
+    def assert_bootmarker_b1_preparation(self, sample):
         with tempfile.TemporaryDirectory() as tmp:
             parent=Path(tmp);directory=parent/'recovery';config,_facts,_current=self.bootmarker_fixture()
+            if sample: config['context']['after_debug_boot']='bootargs-marker-sample'
             helper=parent/'recovery-quick-reboot';helper.write_bytes(b'never executed')
             outputs=[];reads=[]
             def api(method,_url,_token,payload=None,**kwargs):
@@ -180,17 +346,22 @@ class Recovery(unittest.TestCase):
                 self.assertEqual(argv,['/usr/sbin/sysctl','-n','kern.bootargs']);reads.append(argv)
                 return b'preempt=10\n'
             def forbidden(*args,**kwargs): self.fail('nonfaulting preparation entered panic path')
+            def encrypt(cert,metadata,raw):
+                self.assertTrue(sample);self.assertEqual(cert,b'certificate boundary')
+                self.assertEqual(metadata,{'preflight':True});self.assertEqual(raw,b'synthetic')
+                return {'cert_fingerprint':'a'*64}
             with contextlib.ExitStack() as stack,contextlib.redirect_stdout(io.StringIO()):
                 for owner,name,value in ((r,'root_only',lambda:None),(r,'require_context',lambda *_:None),
                     (r,'root_dir',lambda _:directory),(r,'boot_uuid',lambda:config['baseline']),
                     (r,'api',api),(r,'diagnostic_sysctls',lambda:{}),(r.recovery_bootargs,'capture',read),
                     (r.recovery_panic_control,'build',forbidden),(r.recovery_reboot_panic,'build',forbidden),
-                    (r.recovery_nvram_panic,'read_panic_info',forbidden),(r.recovery_reports,'encrypt_bundle',forbidden)):
+                    (r.recovery_nvram_panic,'read_panic_info',forbidden),(r.recovery_reports,'encrypt_bundle',encrypt if sample else forbidden)):
                     stack.enter_context(patch.object(owner,name,value))
-                r.prepare_root({'context':config['context'],'token':'token','quick_helper':str(helper),'report_cert':'ignored'})
+                r.prepare_root({'context':config['context'],'token':'token','quick_helper':str(helper),'report_cert':'certificate boundary' if sample else 'ignored'})
                 actual=r.json.loads((directory/'config.json').read_text())
                 self.assertEqual(actual['initial_boot_argument_profile'],config['initial_boot_argument_profile'])
-                self.assertEqual(actual['cert_fingerprint'],'');self.assertFalse((directory/'report-cert.pem').exists())
+                self.assertEqual(actual['cert_fingerprint'],'a'*64 if sample else '')
+                self.assertEqual((directory/'report-cert.pem').exists(),sample)
                 r.private_write(directory/'token',b'token')
                 with patch.object(r,'load_config',lambda _:actual): r.collect(directory)
             self.assertEqual(len(reads),1)
@@ -200,13 +371,17 @@ class Recovery(unittest.TestCase):
             self.assertFalse((directory/'panic-control').exists());self.assertFalse((directory/'panic-followup-baseline.json').exists())
 
     def test_bootmarker_controller_pins_b1_profile_before_accepting_b2(self):
-        for case in ('positive','changed_public','changed_b2','missing_public'):
+        for case in ('positive','changed_public','changed_b2','missing_public','sample_positive','sample_mask_missing'):
             with self.subTest(case=case):
                 config,facts,current=self.bootmarker_fixture();ctx=config['context']
+                if case.startswith('sample_'):
+                    ctx['after_debug_boot']='bootargs-marker-sample';config['cert_fingerprint']='a'*64
+                if case=='sample_mask_missing':
+                    facts.pop('kernel_debug_state');facts['kernel_reader_sample']={'publication':'acknowledged'}
                 public={'protocol':'vz-recovery-v1','phase':'public_key','binding':r.binding(ctx),
                         'nonce':config['nonce'],'baseline_boot_uuid':config['baseline'],'public_key':'public',
-                        'cert_fingerprint':'','debug_boot':True,'debug_source':'bootplist',
-                        'after_debug_boot':'bootargs-marker','trigger':'reboot-quick',
+                        'cert_fingerprint':config['cert_fingerprint'],'debug_boot':True,'debug_source':'bootplist',
+                        'after_debug_boot':ctx['after_debug_boot'],'trigger':'reboot-quick',
                         'initial_boot_argument_profile':config['initial_boot_argument_profile']}
                 foreign=r.recovery_bootargs.boot_argument_profile(b'foreign=1')
                 if case=='missing_public': public.pop('initial_boot_argument_profile')
@@ -225,7 +400,7 @@ class Recovery(unittest.TestCase):
                 with patch.object(r,'list_check',lambda *_:next(checks)),patch.object(r,'api',api), \
                      patch.object(r,'encrypt_token',lambda *_:b'sealed'),patch.object(r.time,'sleep',lambda _:None), \
                      contextlib.redirect_stdout(io.StringIO()):
-                    if case=='positive': r.controller(ctx,'token')
+                    if case in ('positive','sample_positive'): r.controller(ctx,'token')
                     else:
                         with self.assertRaises(ValueError): r.controller(ctx,'token')
                 self.assertEqual(len(writes),0 if case=='missing_public' else 1)

@@ -8,6 +8,7 @@ import recovery_bootplist
 import recovery_nvram_panic
 import recovery_panic_control
 import recovery_reboot_panic
+import recovery_kernel_sample
 import recovery_arrival
 import recovery_sources
 import recovery_netdump_settings
@@ -46,7 +47,7 @@ def valid_context(ctx, system, machine, kernel_uuid=None):
               bool(re.fullmatch(r"[0-9a-f]{40}", str(ctx.get("sha", "")))) and
               ctx.get("debug_source") in ("nvram", "bootplist") and
               (ctx.get("debug_source") != "bootplist" or ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
-              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "panic-nonce-syscall", "kernel-state", "bootargs-marker", "netdump-prime", "panic-nonce-netdump") and
+              ctx.get("after_debug_boot", "none") in ("none", "panic-nonce", "panic-nonce-nvram-off", "panic-nonce-usdt", "panic-nonce-usdt-nvram-off", "panic-nonce-syscall", "kernel-state", "bootargs-marker", "bootargs-marker-sample", "netdump-prime", "panic-nonce-netdump") and
               (ctx.get("after_debug_boot", "none") == "none" or ctx.get("debug_source") == "bootplist" and ctx.get("debug_boot") is True and ctx.get("trigger") == "reboot-quick") and
               type(ctx.get("debug_boot", False)) is bool and
               (not ctx.get("debug_boot", False) or ctx.get("trigger", "reboot") in ("reboot", "reboot-quick")))
@@ -93,7 +94,11 @@ def panic_trigger_valid(trigger, scope, control_kind):
 
 
 def bootmarker_mode(ctx):
-    return ctx.get('after_debug_boot') == 'bootargs-marker'
+    return ctx.get('after_debug_boot') in ('bootargs-marker', 'bootargs-marker-sample')
+
+
+def kernel_sample_mode(ctx):
+    return ctx.get('after_debug_boot') == 'bootargs-marker-sample'
 
 
 def bootmarker_proven(facts, nonce, baseline):
@@ -154,7 +159,7 @@ def report_required(ctx):
 
 
 def certificate_required(ctx):
-    return report_required(ctx) or netdump_mode(ctx) is not None
+    return report_required(ctx) or netdump_mode(ctx) is not None or kernel_sample_mode(ctx)
 
 
 def netdump_context(ctx):
@@ -2163,6 +2168,75 @@ def complete_recovery(directory, config, current, token, output, successful, dea
 
 
 
+def publish_kernel_sample(directory, config, current, sampler, facts, token, deadline):
+    fact = sampler.public_fact()
+    result = {'sample': fact, 'publication': 'not_requested', 'check_id': None}
+    if fact['status'] == 'not_requested':
+        return result
+    result['publication'] = 'failed'
+    try:
+        scope = {**debug_boot_marker(config), 'debug_boot_uuid': current}
+        error = facts.get('kernel_debug_state', {}).get('debug_boot_arg', {})
+        if (not kernel_sample_mode(config['context']) or fact['scope'] != scope or
+                error.get('status') != 'unavailable' or type(error.get('error')) is not dict):
+            raise ValueError('sample origin invalid')
+        error = recovery_bootargs.kernel_error_summary(error['error'])
+        if (error['reason'] != 'timeout' or fact['original_timeout_seconds'] != 30 or
+                error['output_bytes'] != fact['original_output_bytes'] or
+                error['output_sha256'] != fact['original_output_sha256']):
+            raise ValueError('sample timeout mismatch')
+        if deadline - time.monotonic() < 100:
+            result['publication'] = 'no_budget'
+            return result
+        fragments = sampler.private_fragments()
+        if (set(fragments) != {'stdout', 'stderr'} or
+                any(type(value) is not bytes for value in fragments.values()) or
+                len(fragments['stdout']) > 22528 or len(fragments['stderr']) > 2048):
+            raise ValueError('sample fragments invalid')
+        prefix = fragments['stdout'] + fragments['stderr']
+        if len(prefix) != fact['prefix_bytes'] or hashlib.sha256(prefix).hexdigest() != fact['prefix_sha256']:
+            raise ValueError('sample fragment digest mismatch')
+        metadata = {'protocol': 'kernel-reader-sample-v1', 'scope': scope,
+                    'context': config['context'], 'sample': fact}
+        raw = json.dumps({key: base64.b64encode(value).decode('ascii') for key, value in fragments.items()},
+                         separators=(',', ':')).encode()
+        envelope = recovery_reports.encrypt_bundle((directory / 'report-cert.pem').read_bytes(), metadata, raw)
+        if envelope['cert_fingerprint'] != config['cert_fingerprint']:
+            raise ValueError('sample recipient mismatch')
+        if deadline - time.monotonic() < 50:
+            result['publication'] = 'no_budget'
+            return result
+        scope_sha = hashlib.sha256(json.dumps(scope, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        name = 'Kernel reader sample ' + config['context']['run_id']
+        external = binding(config['context']) + '/reader-sample/' + scope_sha
+        output = {'title': 'Kernel reader sample',
+                  'summary': json.dumps({**metadata, 'cert_fingerprint': envelope['cert_fingerprint'],
+                                         'cipher_sha256': envelope['cipher_sha256']}, sort_keys=True, separators=(',', ':')),
+                  'text': envelope['ciphertext']}
+        payload = {'name': name, 'head_sha': config['context']['sha'], 'external_id': external,
+                   'status': 'completed', 'conclusion': 'neutral', 'output': output}
+        def checked(check):
+            if (type(check) is not dict or type(check.get('id')) is not int or check['id'] <= 0 or
+                    type(check.get('app')) is not dict or type(check['app'].get('id')) is not int or
+                    check['app']['id'] != 15368 or check['app'].get('slug') != 'github-actions' or
+                    any(check.get(key) != payload[key] for key in ('name', 'head_sha', 'external_id', 'status', 'conclusion')) or
+                    type(check.get('output')) is not dict or
+                    any(check['output'].get(key) != value for key, value in output.items())):
+                raise ValueError('sample Check mismatch')
+            return check['id']
+        check_id = checked(api('POST', CHECKS, token, payload))
+        result['check_id'] = check_id
+        if deadline - time.monotonic() < 40:
+            result['publication'] = 'no_budget'
+            return result
+        if checked(api('GET', CHECKS + '/' + str(check_id), token)) != check_id:
+            raise ValueError('sample Check identity changed')
+        result['publication'] = 'acknowledged'
+    except (OSError, ValueError, subprocess.SubprocessError, urllib.error.URLError):
+        pass
+    return result
+
+
 def collect(directory):
     config = load_config(directory)
     marker_core_preexisting = bootmarker_mode(config["context"]) and (directory / "debug-boot-core.json").exists()
@@ -2260,11 +2334,16 @@ def collect(directory):
         if netdump_mode(config['context']):
             debug_facts['optional_inventory_status'] = 'skipped_netdump_control'
         elif debug_restored(debug_facts, config["context"]["debug_source"]):
+            sampler = None
             try:
                 if bootmarker_mode(config['context']):
+                    if kernel_sample_mode(config['context']):
+                        sampler = recovery_kernel_sample.Sampler({**debug_boot_marker(config), 'debug_boot_uuid': current}, deadline=deadline)
                     def read_mask(argv, limit, **options):
-                        if deadline - time.monotonic() < 32:
+                        if deadline - time.monotonic() < (44 if sampler is not None else 32):
                             raise RuntimeError('boot marker mask budget unavailable')
+                        if sampler is not None:
+                            options['on_timeout'] = sampler
                         return recovery_bootargs.capture(argv, limit, **options)
                     platform = recovery_bootargs.KernelMaskInventory(read=read_mask)
                     try:
@@ -2278,6 +2357,8 @@ def collect(directory):
             except (OSError, ValueError, subprocess.SubprocessError):
                 optional = {"optional_inventory_status": "uncertain"}
             debug_facts.update(optional)
+            if sampler is not None:
+                debug_facts['kernel_reader_sample'] = publish_kernel_sample(directory, config, current, sampler, debug_facts, token, deadline)
         else:
             debug_facts["optional_inventory_status"] = "skipped_restore_failure"
     envelope = None
